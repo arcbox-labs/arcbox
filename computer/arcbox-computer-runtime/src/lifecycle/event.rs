@@ -108,7 +108,7 @@ pub(super) enum Event {
     /// leaves the retained pause state intact and parks back at `Paused`; one
     /// that did not leaves a half-allocated computer, and recording that as
     /// cleanly `Paused` would have the restart sweep `Reinstate` it as
-    /// resumable and drop its journal as a stale pause. `resume_sandbox`
+    /// resumable and drop its journal as a stale pause. `resume_computer`
     /// has always been two-valued here (`ResumeFailure::unwound`); the
     /// vocabulary now is too.
     Stranded,

@@ -80,7 +80,7 @@ impl std::fmt::Display for ComputerState {
     }
 }
 
-// Spec types (input to SandboxManager methods)
+// Spec types (input to ComputerManager methods)
 
 /// What happens when a sandbox's idle timeout expires (CORE-21).
 ///
@@ -340,4 +340,4 @@ pub struct CheckpointSummary {
     pub created_at: String,
 }
 
-// SandboxManager
+// ComputerManager

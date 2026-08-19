@@ -352,7 +352,7 @@ fn a_user_checkpoint_holds_ready_and_writes_no_record() {
     }
 
     // A recoverable failure returns to Ready without a record write, exactly
-    // as `checkpoint_sandbox` does today — with the idle window restarted,
+    // as `checkpoint_computer` does today — with the idle window restarted,
     // since the expiry swallowed above consumed a one-shot timer.
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
     assert_eq!(state.to_public(), ComputerState::Ready);
@@ -563,7 +563,7 @@ fn a_released_claim_reopens_the_computer_and_balances_its_running() {
     assert!(effects.contains(&Effect::ArmTimer(Timer::Idle)));
 }
 
-/// Only a stop that has a workload to drain asks for one. `stop_sandbox`
+/// Only a stop that has a workload to drain asks for one. `stop_computer`
 /// polls for the workload's exit within the budget and skips that poll
 /// entirely when nothing is running — a computer that is merely `Ready`
 /// would otherwise spend the whole budget waiting for an exit that cannot

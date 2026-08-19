@@ -467,7 +467,7 @@ async fn a_force_remove_preempts_a_boot_that_has_handed_its_resources_over() {
 #[tokio::test(start_paused = true)]
 async fn a_teardown_stalls_until_the_boot_hands_its_resources_over() {
     // Aborting before the handoff would strand whatever the task still owns,
-    // so the teardown re-parks the task and retries — `expire_sandbox`'s
+    // so the teardown re-parks the task and retries — `expire_computer`'s
     // backoff loop, collapsed into the actor.
     let handoff_at = Duration::from_secs(25);
     let mut harness = Harness::start(Boot::HandsOffAfter(handoff_at), no_deadlines()).await;
@@ -519,7 +519,7 @@ async fn a_superseded_tasks_completion_cannot_drive_the_machine() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stop_during_a_launch_is_served_once_the_launch_lands() {
-    // Today's `stop_sandbox` answers WrongState here; the actor defers it,
+    // Today's `stop_computer` answers WrongState here; the actor defers it,
     // which is what stops a stop from racing a boot mid-acquisition.
     let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
     let created = harness.send(|reply| Command::Provision {
@@ -584,7 +584,7 @@ async fn the_idle_window_is_the_actors_own_timer() {
 async fn a_failure_keeps_its_crash_journal_when_the_release_fails() {
     // The journal names exactly the resources a restart would have to
     // reclaim, so it may only go once the release that frees them has
-    // *finished* — `fail_live_sandbox` gates on the write being confirmed
+    // *finished* — `fail_live_computer` gates on the write being confirmed
     // AND the cleanup completing, and so must this.
     let mut harness = Harness::journalled(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
@@ -617,7 +617,7 @@ async fn a_failure_drops_its_crash_journal_once_the_release_is_done() {
 #[tokio::test(start_paused = true)]
 async fn a_removal_whose_release_fails_answers_its_caller() {
     // `removing` coalesces the failure, so nothing else ever will — and
-    // `remove_sandbox_impl` hands the release error straight back today.
+    // `remove_computer_impl` hands the release error straight back today.
     let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
     harness.script.release_fails.store(true, Ordering::SeqCst);
@@ -658,7 +658,7 @@ async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
         .error()
         .await;
     assert!(error.to_string().contains("panicked"), "{error}");
-    // The teardown stopped where `remove_sandbox_impl` stops — no release —
+    // The teardown stopped where `remove_computer_impl` stops — no release —
     // so the record and its crash journal survive for the startup sweep.
     assert!(!harness.script.calls().contains(&"release"));
 
@@ -830,7 +830,7 @@ async fn a_failed_restore_answers_only_once_its_teardown_has_freed_the_id() {
 /// A paused computer records what it retained where its readers look.
 ///
 /// `Inspect` and `List` size the checkpoint and the disk overlay from the
-/// runtime, and a resume finds its checkpoint there — `pause_sandbox` wrote
+/// runtime, and a resume finds its checkpoint there — `pause_computer` wrote
 /// both at the `Paused` commit, and nothing else does.
 #[tokio::test(start_paused = true)]
 async fn a_paused_computer_records_what_it_retained() {
@@ -890,7 +890,7 @@ async fn an_idle_pause_says_so_on_its_event() {
 /// A record that will not delete stalls the teardown instead of reporting it
 /// done.
 ///
-/// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it drops
+/// `remove_computer_impl` propagates a failed `finish_remove` *before* it drops
 /// its map entry: the record still owns the id, and only a retry that re-runs
 /// the deletion can free it. Unregistering and announcing REMOVED anyway
 /// would leave that id un-creatable — `cancel_pending_or_missing` refuses

@@ -158,7 +158,7 @@ impl Effects {
         self.emit(Effect::SpawnRelease { scope });
     }
 
-    /// The graceful stop: `stop_sandbox`. `drain` says whether a workload is
+    /// The graceful stop: `stop_computer`. `drain` says whether a workload is
     /// running and owed the budget to finish first — the machine knows,
     /// because it is the state the stop came from.
     pub(super) fn stop(&mut self, budget_ms: u64, drain: bool) {
@@ -168,7 +168,7 @@ impl Effects {
         self.emit(Effect::SpawnStop { budget_ms, drain });
     }
 
-    /// Shared teardown: what `remove_sandbox_impl` does once its busy gate has
+    /// Shared teardown: what `remove_computer_impl` does once its busy gate has
     /// passed. The bounded handoff wait lives inside `AbortInflight`.
     pub(super) fn removal(&mut self) {
         self.emit(Effect::AbortInflight);
@@ -178,7 +178,7 @@ impl Effects {
         self.release(ReleaseScope::Full);
     }
 
-    /// Shared failure: `sandbox::boot::fail_live_sandbox` — persist `Failed`,
+    /// Shared failure: `sandbox::boot::fail_live_computer` — persist `Failed`,
     /// release the runtime, clear the journal behind both, drop the timers,
     /// publish FAILED. The journal clear is gated on the write being
     /// confirmed *and* the release completing: what it records is the

@@ -22,8 +22,8 @@ use arcbox_computer_runtime::config::{JailerConfig, RuntimeConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
-    ComputerEvent, ComputerId, ComputerSpec, ComputerState, NodeEnvironment, OutputChunk,
-    SandboxManager,
+    ComputerEvent, ComputerId, ComputerManager, ComputerSpec, ComputerState, NodeEnvironment,
+    OutputChunk,
 };
 use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
 use tokio::sync::broadcast;
@@ -37,7 +37,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// tidiness. A sandbox id has to fit what AF_UNIX leaves of the jail's
 /// socket paths, and macOS's per-user `$TMPDIR` (`/var/folders/../T/`)
 /// spends ~50 bytes of that on its own — enough to take the budget to
-/// zero, so every `create_sandbox` would be refused at id validation
+/// zero, so every `create_computer` would be refused at id validation
 /// before reaching anything it meant to exercise. A short root is also
 /// what a real node's jail base is.
 ///
@@ -151,8 +151,8 @@ struct Ports {
 }
 
 impl Ports {
-    async fn manager(&self, config: &RuntimeConfig) -> Arc<SandboxManager> {
-        let manager = SandboxManager::new(
+    async fn manager(&self, config: &RuntimeConfig) -> Arc<ComputerManager> {
+        let manager = ComputerManager::new(
             config.clone(),
             NodeEnvironment {
                 // The fixture's own clones, so a restart hands its
@@ -186,7 +186,7 @@ impl Ports {
 /// A manager over the fakes, with the handles a test scripts and asserts
 /// through.
 pub struct Fixture {
-    pub manager: Arc<SandboxManager>,
+    pub manager: Arc<ComputerManager>,
     ports: Ports,
     config: RuntimeConfig,
     /// The data dir, kept alive for the fixture's life.
@@ -280,7 +280,7 @@ impl Fixture {
         let mut events = self.manager.subscribe_events();
         let (id, _ip) = self
             .manager
-            .create_sandbox(spec)
+            .create_computer(spec)
             .await
             .expect("the create is accepted");
         await_action(&mut events, &id, action::READY).await;
@@ -295,7 +295,7 @@ impl Fixture {
     pub async fn await_state(&self, id: &ComputerId, state: ComputerState) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
         loop {
-            let seen = self.manager.inspect_sandbox(id);
+            let seen = self.manager.inspect_computer(id);
             match &seen {
                 Ok(info) if info.state == state => return,
                 _ if tokio::time::Instant::now() >= deadline => panic!(
@@ -313,7 +313,7 @@ impl Fixture {
     /// Wait until `id` is no longer registered, or fail the test.
     pub async fn await_gone(&self, id: &ComputerId) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
-        while self.manager.inspect_sandbox(id).is_ok() {
+        while self.manager.inspect_computer(id).is_ok() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "{id} is still registered"
@@ -354,7 +354,7 @@ impl Fixture {
     pub async fn run(&self, id: &ComputerId, cmd: &[&str]) -> Vec<u8> {
         let mut output = self
             .manager
-            .run_in_sandbox(
+            .run_in_computer(
                 id,
                 cmd.iter().map(|arg| (*arg).to_owned()).collect(),
                 HashMap::new(),
@@ -378,7 +378,7 @@ impl Fixture {
 
 /// Play the host's half of the network-cleanup ticket protocol for every
 /// quarantined address, and answer with the ids it settled.
-pub async fn settle_network_cleanups(manager: &SandboxManager) -> Vec<String> {
+pub async fn settle_network_cleanups(manager: &ComputerManager) -> Vec<String> {
     let pending = manager.pending_network_cleanups().await.unwrap();
     for (id, token) in &pending {
         manager

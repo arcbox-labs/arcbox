@@ -1,4 +1,4 @@
-//! End-to-end smoke test for [`SandboxManager`], over the environment this
+//! End-to-end smoke test for [`ComputerManager`], over the environment this
 //! crate composes for the System VM.
 //!
 //! ## Usage
@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use arcbox_computer_runtime::{
-    ComputerEvent, ComputerSpec, ComputerState, RestoreComputerSpec, SandboxManager,
+    ComputerEvent, ComputerManager, ComputerSpec, ComputerState, RestoreComputerSpec,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     let environment =
         arcbox_agent::sandbox::node_environment(&config, arcbox_agent::sandbox::block_tools())?;
     let manager =
-        SandboxManager::new(config.runtime, environment).context("SandboxManager::new")?;
+        ComputerManager::new(config.runtime, environment).context("ComputerManager::new")?;
 
     // Phase 1 — Core lifecycle
     println!("\n=== Phase 1: Core lifecycle ===");
@@ -91,18 +91,18 @@ async fn main() -> anyhow::Result<()> {
 
     let t0 = Instant::now();
     let (id, ip) = manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("smoke-1".into()),
             ..Default::default()
         })
         .await
-        .context("create_sandbox")?;
+        .context("create_computer")?;
     println!("  [create]  id={id} ip={ip}");
 
     wait_for_ready(&manager, &id, &mut events, 60).await?;
     println!("  [ready]   boot={}ms", t0.elapsed().as_millis());
 
-    let info = manager.inspect_sandbox(&id).context("inspect_sandbox")?;
+    let info = manager.inspect_computer(&id).context("inspect_computer")?;
     println!(
         "  [inspect] state={} vcpus={} mem={}MiB ip={}",
         info.state,
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let list = manager
-        .list_sandboxes(None, &HashMap::new())
+        .list_computers(None, &HashMap::new())
         .context("list sandboxes")?;
     println!("  [list]    {} sandbox(es):", list.len());
     for s in &list {
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut events_n = manager.subscribe_events();
         let (id2, ip2) = manager
-            .create_sandbox(ComputerSpec {
+            .create_computer(ComputerSpec {
                 id: Some("smoke-net-2".into()),
                 ..Default::default()
             })
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
 
         if ip == ip2 {
             // Clean up before bailing.
-            let _ = manager.remove_sandbox(&id2, true).await;
+            let _ = manager.remove_computer(&id2, true).await;
             bail!("duplicate IP {ip2} assigned to two concurrent sandboxes");
         }
         println!("  [net.3]  IPs are distinct ({ip} ≠ {ip2}) ✓");
@@ -176,17 +176,17 @@ async fn main() -> anyhow::Result<()> {
 
         // Capture TAP name before destroying the sandbox.
         let tap2 = manager
-            .inspect_sandbox(&id2)
+            .inspect_computer(&id2)
             .ok()
             .and_then(|i| i.network)
             .and_then(|n| tap_name_for(&n.ip_address));
 
         manager
-            .stop_sandbox(&id2, 10)
+            .stop_computer(&id2, 10)
             .await
             .context("stop smoke-net-2")?;
         manager
-            .remove_sandbox(&id2, false)
+            .remove_computer(&id2, false)
             .await
             .context("remove smoke-net-2")?;
         println!("  [net.3]  smoke-net-2 removed");
@@ -281,9 +281,9 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_id_opt: Option<String> = if run_phase3 {
         println!("\n=== Phase 3: Checkpoint ===");
         let ck = manager
-            .checkpoint_sandbox(&id, "smoke-test".into(), HashMap::new())
+            .checkpoint_computer(&id, "smoke-test".into(), HashMap::new())
             .await
-            .context("checkpoint_sandbox")?;
+            .context("checkpoint_computer")?;
         println!("  [checkpoint] snapshot_id={}", ck.snapshot_id);
         println!("               dir={}", ck.snapshot_dir);
         Some(ck.snapshot_id)
@@ -293,14 +293,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 1 cleanup
     manager
-        .stop_sandbox(&id, 30)
+        .stop_computer(&id, 30)
         .await
-        .context("stop_sandbox")?;
+        .context("stop_computer")?;
     println!("\n  [stop]   done");
     manager
-        .remove_sandbox(&id, false)
+        .remove_computer(&id, false)
         .await
-        .context("remove_sandbox")?;
+        .context("remove_computer")?;
     println!("  [remove] done");
 
     // Phase 3 (cont) — Restore
@@ -309,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
 
         let mut events2 = manager.subscribe_events();
         let (rid, rip) = manager
-            .restore_sandbox(RestoreComputerSpec {
+            .restore_computer(RestoreComputerSpec {
                 id: Some("smoke-restored".into()),
                 snapshot_id,
                 labels: HashMap::new(),
@@ -317,12 +317,12 @@ async fn main() -> anyhow::Result<()> {
                 ttl_seconds: 0,
             })
             .await
-            .context("restore_sandbox")?;
+            .context("restore_computer")?;
         println!("  [restore] id={rid} ip={rip}");
 
         wait_for_ready(&manager, &rid, &mut events2, 30).await?;
 
-        let rinfo = manager.inspect_sandbox(&rid).context("inspect restored")?;
+        let rinfo = manager.inspect_computer(&rid).context("inspect restored")?;
         println!(
             "  [inspect] state={} ip={}",
             rinfo.state,
@@ -333,11 +333,11 @@ async fn main() -> anyhow::Result<()> {
         );
 
         manager
-            .stop_sandbox(&rid, 30)
+            .stop_computer(&rid, 30)
             .await
             .context("stop restored")?;
         manager
-            .remove_sandbox(&rid, false)
+            .remove_computer(&rid, false)
             .await
             .context("remove restored")?;
         println!("  [cleanup] restored sandbox removed");
@@ -353,14 +353,14 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Prints a one-line summary with exit code and trimmed output.
 async fn run_cmd(
-    manager: &SandboxManager,
+    manager: &ComputerManager,
     id: &str,
     cmd: &[&str],
     timeout_secs: u32,
 ) -> anyhow::Result<String> {
     let label = cmd.join(" ");
     let mut rx = manager
-        .run_in_sandbox(
+        .run_in_computer(
             &id.to_owned(),
             cmd.iter().map(|s| s.to_string()).collect(),
             HashMap::new(),
@@ -371,7 +371,7 @@ async fn run_cmd(
             timeout_secs,
         )
         .await
-        .with_context(|| format!("run_in_sandbox: {label}"))?;
+        .with_context(|| format!("run_in_computer: {label}"))?;
 
     let mut stdout = Vec::new();
     let mut exit_code = 0;
@@ -401,12 +401,12 @@ async fn run_cmd(
 /// Checks current state first (fast path for snapshot restores that complete
 /// synchronously), then falls back to watching the event broadcast channel.
 async fn wait_for_ready(
-    manager: &SandboxManager,
+    manager: &ComputerManager,
     id: &str,
     events: &mut broadcast::Receiver<ComputerEvent>,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    if let Ok(info) = manager.inspect_sandbox(&id.to_string()) {
+    if let Ok(info) = manager.inspect_computer(&id.to_string()) {
         match info.state {
             ComputerState::Ready => return Ok(()),
             ComputerState::Failed => bail!(

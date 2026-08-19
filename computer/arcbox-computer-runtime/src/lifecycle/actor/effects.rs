@@ -195,8 +195,8 @@ impl ComputerActor {
             // What that costs depends on what the phase was for. A phase the
             // flow is *about to act on* — `Stopping` before a shutdown,
             // `Removing` before a release, `Resuming` before a resume — must
-            // stop it, which is what `stop_sandbox`, `begin_removal` and
-            // `resume_sandbox` do with their `?`. A phase that only records
+            // stop it, which is what `stop_computer`, `begin_removal` and
+            // `resume_computer` do with their `?`. A phase that only records
             // where the computer *ended up* must not: `persist_boot_failure`
             // reports the failure and lets the release run, keeping the
             // crash journal — which is exactly what `GateJournal` means.
@@ -295,7 +295,7 @@ impl ComputerActor {
     /// id.
     ///
     /// A refusal stalls the teardown rather than continuing past it:
-    /// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it
+    /// `remove_computer_impl` propagates a failed `finish_remove` *before* it
     /// drops its map entry, because the record still owns the id and only a
     /// retry that re-runs the deletion can free it. Reporting the removal
     /// done here would leave that id un-creatable until the next startup
@@ -314,7 +314,7 @@ impl ComputerActor {
                 if let Some(error) = commit.durability_error {
                     self.unconfirmed = Some(error);
                 }
-                // Before REMOVED is announced, as `remove_sandbox_impl` drops
+                // Before REMOVED is announced, as `remove_computer_impl` drops
                 // its map entry before broadcasting: a reader that acts on
                 // the event must not still find the computer.
                 (self.unregister)();

@@ -90,7 +90,7 @@ impl ComputerActor {
             Err(_) => return self.stall(task),
             // A cancelled task is what we asked for. A panicked one is not:
             // `cancel_and_join_boot` maps it onto an error that leaves
-            // `remove_sandbox_impl` through `?`, so the release and the
+            // `remove_computer_impl` through `?`, so the release and the
             // record unlink never run — the record and its journal survive
             // for the startup sweep, and a retry (whose join is clean)
             // finishes the job. Carrying on would delete both while whatever
@@ -145,7 +145,7 @@ impl ComputerActor {
 
     /// Re-drives a teardown that stopped rather than finished — its release
     /// failed, a durable write was refused, or a panicked sub-task abandoned
-    /// it. Today's equivalent is a retried `remove_sandbox_impl`, which
+    /// it. Today's equivalent is a retried `remove_computer_impl`, which
     /// re-runs the whole teardown including the `Removing` write.
     pub(super) async fn restart_teardown(&mut self, state: State) {
         if self.stalled.is_some() {
@@ -272,7 +272,7 @@ impl ComputerActor {
                 if matches!(machine.state(), State::Removing {}) {
                     // The removal's own release: `removing` coalesces the
                     // failure, so nothing else will ever answer its caller —
-                    // and `remove_sandbox_impl` hands this error straight back
+                    // and `remove_computer_impl` hands this error straight back
                     // today. A flow whose *own* failure started this removal
                     // has its error parked, and the two are composed.
                     let error = match self.unwinding.take() {

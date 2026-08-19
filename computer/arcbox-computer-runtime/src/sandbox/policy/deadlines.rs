@@ -64,7 +64,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_terminal_sandbox_drops_its_ttl() {
+    fn only_a_terminal_computer_drops_its_ttl() {
         let deadline = at(1_700_000_000);
         for state in ALL_STATES {
             let terminal = matches!(state, ComputerState::Stopped | ComputerState::Failed);
@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_ready_sandbox_with_a_timeout_goes_idle() {
+    fn only_a_ready_computer_with_a_timeout_goes_idle() {
         for state in ALL_STATES {
             let ready = state == ComputerState::Ready;
             assert_eq!(

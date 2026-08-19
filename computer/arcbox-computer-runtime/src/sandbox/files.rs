@@ -10,15 +10,15 @@ use super::*;
 use crate::agent::DirWatch;
 use crate::file_proto::FileStatDto;
 
-impl SandboxManager {
+impl ComputerManager {
     /// Read a file from inside an alive sandbox.
-    pub async fn read_sandbox_file(&self, id: &ComputerId, path: &str) -> Result<Vec<u8>> {
+    pub async fn read_computer_file(&self, id: &ComputerId, path: &str) -> Result<Vec<u8>> {
         let agent = self.require_alive_agent(id)?;
         agent.files().read(path).await
     }
 
     /// Write a file into an alive sandbox.
-    pub async fn write_sandbox_file(
+    pub async fn write_computer_file(
         &self,
         id: &ComputerId,
         path: &str,
@@ -31,14 +31,14 @@ impl SandboxManager {
 
     /// Stat one path inside an alive sandbox (symlinks reported, not
     /// followed).
-    pub async fn stat_sandbox_path(&self, id: &ComputerId, path: &str) -> Result<FileStatDto> {
+    pub async fn stat_computer_path(&self, id: &ComputerId, path: &str) -> Result<FileStatDto> {
         let agent = self.require_alive_agent(id)?;
         agent.files().stat(path).await
     }
 
     /// List a directory inside an alive sandbox, non-recursively, with full
     /// per-entry metadata.
-    pub async fn list_sandbox_dir(&self, id: &ComputerId, path: &str) -> Result<Vec<FileStatDto>> {
+    pub async fn list_computer_dir(&self, id: &ComputerId, path: &str) -> Result<Vec<FileStatDto>> {
         let agent = self.require_alive_agent(id)?;
         agent.files().list(path).await
     }
@@ -46,14 +46,14 @@ impl SandboxManager {
     /// Create a directory (and missing parents) inside an alive sandbox.
     /// Succeeds when the directory already exists. `mode` must already be
     /// defaulted by the caller.
-    pub async fn make_sandbox_dir(&self, id: &ComputerId, path: &str, mode: u32) -> Result<()> {
+    pub async fn make_computer_dir(&self, id: &ComputerId, path: &str, mode: u32) -> Result<()> {
         let agent = self.require_alive_agent(id)?;
         agent.files().make_dir(path, mode).await
     }
 
     /// Remove a file, symlink, or directory inside an alive sandbox. A
     /// non-empty directory requires `recursive`.
-    pub async fn remove_sandbox_path(
+    pub async fn remove_computer_path(
         &self,
         id: &ComputerId,
         path: &str,
@@ -64,14 +64,14 @@ impl SandboxManager {
     }
 
     /// Rename / move an entry within an alive sandbox.
-    pub async fn move_sandbox_path(&self, id: &ComputerId, from: &str, to: &str) -> Result<()> {
+    pub async fn move_computer_path(&self, id: &ComputerId, from: &str, to: &str) -> Result<()> {
         let agent = self.require_alive_agent(id)?;
         agent.files().rename(from, to).await
     }
 
     /// Open a directory watch inside an alive sandbox. The returned stream
     /// ends cleanly when the sandbox stops; dropping it cancels the watch.
-    pub async fn watch_sandbox_dir(
+    pub async fn watch_computer_dir(
         &self,
         id: &ComputerId,
         path: &str,

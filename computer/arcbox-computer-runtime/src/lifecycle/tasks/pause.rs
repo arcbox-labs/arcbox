@@ -104,7 +104,7 @@ pub async fn release_for_pause(
         }
     }
 
-    super::release::kill_sandbox_process(id, arc).await?;
+    super::release::kill_computer_process(id, arc).await?;
     let owner = super::release::resource_owner(id, arc);
 
     // Disk: detach the overlay but keep its COW file.

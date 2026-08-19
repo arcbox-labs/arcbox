@@ -24,7 +24,7 @@
 
 use super::*;
 
-impl SandboxManager {
+impl ComputerManager {
     /// Replace a computer's lifecycle deadlines (CORE-60).
     ///
     /// `ttl_seconds` re-arms the hard cap from *now* (0 removes it);
@@ -32,7 +32,7 @@ impl SandboxManager {
     /// timer; `on_idle` replaces the policy. `None` fields are unchanged.
     /// Allowed in any non-terminal state — a paused computer keeps honoring
     /// its (re-armed) TTL, and new idle knobs apply on the next `Ready`.
-    pub async fn set_sandbox_lifecycle(
+    pub async fn set_computer_lifecycle(
         &self,
         id: &ComputerId,
         update: LifecycleUpdate,

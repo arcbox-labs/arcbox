@@ -1,7 +1,7 @@
 //! VMM configuration loading for the guest agent.
 //!
 //! One TOML file, read into the two halves that consume it: the
-//! [`RuntimeConfig`] the embedded [`SandboxManager`] runs on, and the
+//! [`RuntimeConfig`] the embedded [`ComputerManager`] runs on, and the
 //! [`AdapterConfig`] this crate builds the VMM driver and the sandbox
 //! network from. The load priority is:
 //!

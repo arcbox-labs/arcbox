@@ -70,7 +70,7 @@ impl ComputerActor {
                 }
                 // A stop asked for during a launch is deferred until the
                 // launch resolves, rather than refused as today's
-                // `stop_sandbox` does: the alternative is a stop racing a
+                // `stop_computer` does: the alternative is a stop racing a
                 // boot that is still acquiring resources.
                 if launching(*machine.state()) {
                     self.pending_stop.get_or_insert(budget);
@@ -79,7 +79,7 @@ impl ComputerActor {
                 }
                 match self.public() {
                     ComputerState::Stopping => self.park(Answer::Stopped, reply),
-                    // `stop_sandbox`'s retry. A `Stopped` write that was
+                    // `stop_computer`'s retry. A `Stopped` write that was
                     // visible but not confirmed kept the crash journal, and
                     // a second stop is the only thing that finishes it —
                     // answering `Ok` would leave a journal naming resources
@@ -106,7 +106,7 @@ impl ComputerActor {
                     // release that failed, a panicked sub-task — is re-driven
                     // instead: `removing` swallows the retry, so nothing else
                     // would ever answer it, and a retried
-                    // `remove_sandbox_impl` re-runs the teardown today.
+                    // `remove_computer_impl` re-runs the teardown today.
                     State::Removing {} => {
                         if self.inflight.is_none() && self.retry.is_none() {
                             self.restart_teardown(*machine.state()).await;
@@ -160,7 +160,7 @@ impl ComputerActor {
                 self.dispatch(machine, Event::WorkloadReleased).await;
             }
             Command::SetLifecycle { update, reply } => {
-                // `set_sandbox_lifecycle` refuses a computer on its way out:
+                // `set_computer_lifecycle` refuses a computer on its way out:
                 // nothing is left for a deadline to fire on, and the record
                 // it would persist to is about to be a tombstone.
                 if matches!(
@@ -194,7 +194,7 @@ impl ComputerActor {
                 }
                 // The timers live in this task; the record is what a restart
                 // re-arms them from, so an acknowledged change has to be on
-                // disk as well (`set_sandbox_lifecycle` today).
+                // disk as well (`set_computer_lifecycle` today).
                 let persisted = self.persist_lifecycle();
                 self.rearm(*machine.state());
                 // `Inspect` reports the deadlines, so the read view has to

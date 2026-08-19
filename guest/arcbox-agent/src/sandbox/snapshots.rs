@@ -18,7 +18,7 @@ impl SandboxService {
         let _operation = self.operations.lock(&req.sandbox_id).await;
         let info = self
             .manager
-            .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels.into_iter().collect())
+            .checkpoint_computer(&req.sandbox_id, req.name, req.labels.into_iter().collect())
             .await
             .map_err(SandboxError::from)?;
         Ok(convert::checkpoint_to_proto(info))
@@ -50,10 +50,10 @@ impl SandboxService {
         };
         let (id, ip_address) = self
             .manager
-            .restore_sandbox_keyed(spec, &restore_key)
+            .restore_computer_keyed(spec, &restore_key)
             .await
             .map_err(SandboxError::from)?;
-        let live = self.manager.inspect_sandbox(&id).is_ok_and(|info| {
+        let live = self.manager.inspect_computer(&id).is_ok_and(|info| {
             matches!(
                 info.state,
                 ComputerState::Starting | ComputerState::Ready | ComputerState::Running

@@ -115,7 +115,7 @@ impl ComputerFlows {
                 )
                 .await
             }
-            // Unreachable: `pause_sandbox` refuses direct mode before it
+            // Unreachable: `pause_computer` refuses direct mode before it
             // claims anything, because a direct-mode vmstate pins origin
             // paths and could never resume.
             ReleaseScope::KeepDisk if services.config.firecracker.jailer.is_none() => {

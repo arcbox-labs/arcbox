@@ -4,7 +4,7 @@
 //! Moved here from `sandbox::boot` by R3 PR-F1b, unchanged: these are the
 //! bodies `Effect::SpawnBoot` and `Effect::SpawnGate` name, and the actor
 //! will run them through [`ComputerTasks`](super::ComputerTasks) once PR-F2
-//! flips the manager. Until then `sandbox::boot::boot_sandbox` is still the
+//! flips the manager. Until then `sandbox::boot::boot_computer` is still the
 //! caller.
 
 use std::path::{Path, PathBuf};

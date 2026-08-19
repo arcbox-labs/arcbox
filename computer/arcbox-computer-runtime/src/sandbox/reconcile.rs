@@ -1,6 +1,6 @@
 //! Crash-recovery reconciliation for sandbox runtime state.
 //!
-//! `SandboxManager` state is in-memory; if the agent restarts (crash,
+//! `ComputerManager` state is in-memory; if the agent restarts (crash,
 //! supervision respawn) the VMM processes, TAP devices, dm-snapshot
 //! devices, and jailer chroots of running sandboxes are left with no owner,
 //! and fresh IP allocations can collide with orphaned TAPs. To recover,
@@ -1954,7 +1954,7 @@ mod tests {
         let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
-        let manager = super::super::SandboxManager::new(config, environment).unwrap();
+        let manager = super::super::ComputerManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
 
         assert!(!vm_dir.join(STATE_FILE).exists());
@@ -2021,7 +2021,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2157,7 +2157,7 @@ mod tests {
         unjournaled: &[(&str, PersistPhase)],
     ) -> (
         Box<dyn VmHandle>,
-        super::super::SandboxManager,
+        super::super::ComputerManager,
         std::sync::Arc<arcbox_vm_driver::testkit::FakeNetwork>,
         Result<()>,
     ) {
@@ -2206,7 +2206,7 @@ mod tests {
         if !case.network_adopts {
             network.fail_adopt_once();
         }
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2222,7 +2222,7 @@ mod tests {
     /// The payload: a `Ready` sandbox whose VM outlived its agent comes back
     /// with everything it was running on, and its journal stays where it is.
     #[tokio::test]
-    async fn a_live_ready_sandbox_is_reclaimed_rather_than_killed() {
+    async fn a_live_ready_computer_is_reclaimed_rather_than_killed() {
         let data_dir = tempfile::tempdir().unwrap();
         let (vm, manager, network, reconciled) =
             sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
@@ -2544,7 +2544,7 @@ mod tests {
         record_in_phase(&store, "keeper", PersistPhase::Ready);
         drop(store);
 
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2637,7 +2637,7 @@ mod tests {
         let lease = network
             .reserve(
                 &VmId::new("stuck").unwrap(),
-                super::super::sandbox_network_policy(),
+                super::super::computer_network_policy(),
             )
             .await
             .unwrap();

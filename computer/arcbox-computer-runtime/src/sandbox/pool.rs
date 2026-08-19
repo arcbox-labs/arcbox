@@ -371,7 +371,7 @@ pub fn spawn_pool_refill(
     }
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Tear down pooled slots: all of them, or those staged from one
     /// snapshot.
     pub(super) async fn drain_pool(&self, snapshot_id: Option<&str>) {

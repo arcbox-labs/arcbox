@@ -43,7 +43,7 @@ pub async fn release_runtime_resources(
     network: &Arc<dyn GuestNetwork>,
     cow_manager: &Arc<CowManager>,
 ) -> Result<()> {
-    kill_sandbox_process(id, arc).await?;
+    kill_computer_process(id, arc).await?;
 
     // Teardown dm-snapshot CoW device (must happen after the VMM exits
     // because it holds the block device open).
@@ -104,7 +104,7 @@ pub fn resource_owner(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> String {
 /// bounded wait elapsed) restores whichever grip it took, and keeps the
 /// handle, so a retry can finish the job. Idempotent — both are `take()`n,
 /// and killing an exited VM just reports its status.
-pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> Result<()> {
+pub async fn kill_computer_process(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -> Result<()> {
     let (prepared, handle) = {
         let mut inst = arc.lock().unwrap();
         let prepared = inst.prepared.take();

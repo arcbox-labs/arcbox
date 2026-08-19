@@ -12,7 +12,7 @@ use crate::error::{ComputerError, Result};
 /// Synchronise the guest clock to the current host time.
 ///
 /// Sends [`MSG_CLOCK_SYNC`] to the exec channel (vsock port 52) and waits for
-/// `MSG_EXIT`.  Called immediately after `restore_sandbox()` completes so
+/// `MSG_EXIT`.  Called immediately after `restore_computer()` completes so
 /// the guest does not run with a stale timestamp from snapshot creation time,
 /// and by the cold-boot path as the agent-readiness gate. `Err` means the
 /// round trip itself failed (connect, transport, malformed reply); an agent

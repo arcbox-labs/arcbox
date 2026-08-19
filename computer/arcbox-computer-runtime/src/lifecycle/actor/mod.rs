@@ -336,7 +336,7 @@ enum StalledStep {
     /// The in-flight sub-task has not handed its resources over.
     Handoff,
     /// The durable record would not delete. Until it does, the id is still
-    /// owned — `remove_sandbox_impl` propagates that failure rather than
+    /// owned — `remove_computer_impl` propagates that failure rather than
     /// dropping its map entry, because only a retry can free the id.
     Record(RecordEnd),
 }
@@ -362,7 +362,7 @@ pub struct ComputerActor {
     /// read snapshot from it.
     runtime: Arc<Mutex<ComputerRuntime>>,
     /// Drops this computer's registry entry. Called when the record is
-    /// forgotten, before REMOVED is announced — `remove_sandbox_impl`'s own
+    /// forgotten, before REMOVED is announced — `remove_computer_impl`'s own
     /// order — and again when the actor stops for any other reason.
     unregister: Arc<dyn Fn() + Send + Sync>,
     /// The durable record's generation, `None` for a computer with no record
@@ -385,14 +385,14 @@ pub struct ComputerActor {
     waiters: Vec<(Answer, Reply)>,
     capture_reply: Option<oneshot::Sender<Result<CheckpointInfo>>>,
     /// A graceful stop asked for while a launch was in flight, dispatched as
-    /// soon as the launch resolves. Today's `stop_sandbox` answers
+    /// soon as the launch resolves. Today's `stop_computer` answers
     /// `WrongState` there; deferring is what the engine's actor does and what
     /// the R3 plan specifies (§B.3).
     pending_stop: Option<Duration>,
     inflight: Option<Preemptible>,
     epoch: u64,
     /// The teardown parked on a step it could not finish, replayed when a
-    /// retry takes it. This is `cleanup::expire_sandbox`'s retry loop,
+    /// retry takes it. This is `cleanup::expire_computer`'s retry loop,
     /// collapsed into the actor.
     stalled: Option<Stalled>,
     /// What the step currently being applied stalled on, read by
@@ -434,7 +434,7 @@ pub struct ComputerActor {
     idle: Option<Pin<Box<tokio::time::Sleep>>>,
     retry: Option<Pin<Box<tokio::time::Sleep>>>,
     /// `false` keeps both deadline timers unarmed: a manager that was never
-    /// shared (`SandboxManager::into_shared`) fires no timers, which unit
+    /// shared (`ComputerManager::into_shared`) fires no timers, which unit
     /// tests of unrelated surfaces rely on.
     timers_enabled: watch::Receiver<bool>,
 }

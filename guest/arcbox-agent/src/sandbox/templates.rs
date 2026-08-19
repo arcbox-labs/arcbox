@@ -1,7 +1,7 @@
 //! Template catalog handlers (CORE-107).
 //!
 //! Decode → manager → encode glue over the catalog surface on
-//! [`SandboxManager`](arcbox_computer_runtime::SandboxManager), plus the Build
+//! [`ComputerManager`](arcbox_computer_runtime::ComputerManager), plus the Build
 //! orchestrator, which drives the existing rootfs pipeline (`template.rs`
 //! export + `RootfsBuilder` conversion) and registers the result as the
 //! catalog draft. `template.rs` (singular) is the

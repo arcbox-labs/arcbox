@@ -1,7 +1,7 @@
 //! The cold-boot flows: bringing the VM up, and the readiness gate READY is
 //! withheld for.
 //!
-//! `boot_sandbox`'s two halves, split where the machine splits them. What was
+//! `boot_computer`'s two halves, split where the machine splits them. What was
 //! the tail's own bookkeeping — the generation re-checks, the `Ready` /
 //! `Starting` assignment, the durable `Ready` write, the READY event and the
 //! failure handling — belongs to the actor now; what is left is the work.
@@ -56,7 +56,7 @@ impl ComputerFlows {
             Ok(booted) => booted,
             // Whatever the boot had not yet handed over goes onto the
             // computer, so the release the failure spawns finds it. This is
-            // `boot_sandbox`'s `updated_current` branch, reached without the
+            // `boot_computer`'s `updated_current` branch, reached without the
             // generation check the actor makes redundant.
             Err(failure) => {
                 let mut computer = self.computer.lock().unwrap();

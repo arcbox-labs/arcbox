@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_paused_sandbox_retains_its_disk_state() {
+    fn only_a_paused_computer_retains_its_disk_state() {
         let retained = retained_ids([
             ("paused", PersistPhase::Paused),
             ("ready", PersistPhase::Ready),
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_sandboxs_journal_is_stale_and_every_other_one_is_an_orphan() {
+    fn a_retained_computers_journal_is_stale_and_every_other_one_is_an_orphan() {
         let retained = HashSet::from(["paused".to_owned()]);
         assert_eq!(
             sweep_action("paused", &retained),

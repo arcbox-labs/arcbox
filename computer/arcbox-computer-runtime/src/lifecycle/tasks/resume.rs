@@ -66,7 +66,7 @@ pub async fn restore_paused(
         if networked {
             lease = Some(
                 network
-                    .reserve(&VmId::new(id.as_str())?, sandbox::sandbox_network_policy())
+                    .reserve(&VmId::new(id.as_str())?, sandbox::computer_network_policy())
                     .await?,
             );
         }

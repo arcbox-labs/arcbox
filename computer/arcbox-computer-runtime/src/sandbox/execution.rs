@@ -54,7 +54,7 @@ pub struct ExecutionSpec {
     pub tty_size: Option<(u16, u16)>,
     /// Kill the process after this many seconds (0 = no timeout).
     pub timeout_seconds: u32,
-    /// Keep stdin open for [`SandboxManager::write_stdin`]. When false the
+    /// Keep stdin open for [`ComputerManager::write_stdin`]. When false the
     /// process starts with stdin already at EOF (run semantics).
     pub stdin: bool,
 }
@@ -298,7 +298,7 @@ impl Execution {
         (snapshot, rx)
     }
 
-    /// Offset-idempotent stdin write; see [`SandboxManager::write_stdin`].
+    /// Offset-idempotent stdin write; see [`ComputerManager::write_stdin`].
     async fn write_stdin(&self, offset: u64, data: &[u8], eof: bool) -> Result<StdinState> {
         if eof && self.tty {
             return Err(ComputerError::Config(
@@ -560,7 +560,7 @@ impl ExecutionRegistry {
     /// parked attach/wait subscribers resolve. Entries stay registered —
     /// their buffered output remains readable until the per-execution
     /// retention GC drops them.
-    fn interrupt_sandbox(&self, computer_id: &str) {
+    fn interrupt_computer(&self, computer_id: &str) {
         let executions: Vec<Arc<Execution>> = {
             let inner = self.inner.lock().unwrap();
             inner
@@ -587,7 +587,7 @@ pub(super) fn spawn_teardown_purge(
         loop {
             match events.recv().await {
                 Ok(ev) if ev.is_terminal() => {
-                    registry.interrupt_sandbox(&ev.computer_id);
+                    registry.interrupt_computer(&ev.computer_id);
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -637,7 +637,7 @@ async fn run_session(
     registry.remove_generation(&exec);
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Start an execution inside a `Ready` sandbox.
     ///
     /// The execution id (caller-supplied or generated) addresses the process
@@ -740,7 +740,7 @@ impl SandboxManager {
     /// retained byte if retention already dropped the requested offset), then
     /// live output, and closes once the execution has exited and both
     /// channels are drained. Read the final state with
-    /// [`SandboxManager::wait_execution`] afterwards.
+    /// [`ComputerManager::wait_execution`] afterwards.
     pub fn attach_execution(
         &self,
         computer_id: &str,
@@ -846,7 +846,7 @@ impl SandboxManager {
     /// The vm-agent watches the guest's own listen table in-process — no
     /// connect probes that would perturb the workload with spurious
     /// accepted connections.
-    pub async fn wait_sandbox_port(
+    pub async fn wait_computer_port(
         &self,
         id: &ComputerId,
         port: u16,
@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_sandbox_marks_running_executions_but_keeps_them_readable() {
+    async fn interrupt_computer_marks_running_executions_but_keeps_them_readable() {
         let registry = Arc::new(ExecutionRegistry::default());
         let (exec, _rx) = test_execution(&stdin_spec());
         registry
@@ -1128,7 +1128,7 @@ mod tests {
             .live
             .insert(("sandbox-1".into(), "exec-1".into()), Arc::clone(&exec));
 
-        registry.interrupt_sandbox("sandbox-1");
+        registry.interrupt_computer("sandbox-1");
         // Still registered: buffered output stays readable until the
         // retention GC, but the execution is resolved as torn down.
         assert!(registry.get("sandbox-1", "exec-1").is_ok());
@@ -1145,7 +1145,7 @@ mod tests {
             .unwrap()
             .live
             .insert(("sandbox-1".into(), "exec-2".into()), Arc::clone(&done));
-        registry.interrupt_sandbox("sandbox-1");
+        registry.interrupt_computer("sandbox-1");
         assert_eq!(done.snapshot().exit_status, Some(ExitStatus::Code(3)));
     }
 

@@ -1,6 +1,6 @@
 //! Sandbox service for the guest agent.
 //!
-//! Wraps [`SandboxManager`] from `arcbox-computer-runtime` and translates
+//! Wraps [`ComputerManager`] from `arcbox-computer-runtime` and translates
 //! between the `sandbox_v1` protobuf types (from `arcbox-connect`) and the
 //! native Rust types used by `arcbox-computer-runtime`. Lifecycle CRUD
 //! lives here; executions, events, file I/O, and snapshots live in the
@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    ComputerError, ComputerMountSpec, ComputerNetworkSpec, ComputerSpec, ComputerState,
-    NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager,
+    ComputerError, ComputerManager, ComputerMountSpec, ComputerNetworkSpec, ComputerSpec,
+    ComputerState, NodeEnvironment, RootfsBuilder, RootfsPaths,
 };
 use arcbox_connect::sandbox_v1;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
@@ -61,9 +61,9 @@ pub fn probe_kvm() -> Result<(), String> {
     }
 }
 
-/// Thin wrapper around [`SandboxManager`] for use in the agent's RPC layer.
+/// Thin wrapper around [`ComputerManager`] for use in the agent's RPC layer.
 pub struct SandboxService {
-    manager: Arc<SandboxManager>,
+    manager: Arc<ComputerManager>,
     creates: Arc<CreateRegistry>,
     operations: SandboxOperationLocks,
     /// Template names with a Build in flight; a second Build on a busy name
@@ -112,7 +112,7 @@ pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
 }
 
 /// The environment-specific components the sandbox stack runs on inside
-/// the System VM. This is where they are built: `SandboxManager::new`
+/// the System VM. This is where they are built: `ComputerManager::new`
 /// builds none of them, so the choice of VMM is made here.
 ///
 /// Four components, out of the two halves of `config`:
@@ -186,7 +186,7 @@ impl SandboxService {
     }
 
     pub(crate) fn is_terminal_or_absent(&self, id: &str) -> bool {
-        match self.manager.inspect_sandbox(&id.to_owned()) {
+        match self.manager.inspect_computer(&id.to_owned()) {
             Ok(info) => matches!(info.state, ComputerState::Stopped | ComputerState::Failed),
             Err(ComputerError::NotFound(_)) => true,
             Err(_) => false,
@@ -203,7 +203,7 @@ impl SandboxService {
         let environment = node_environment(&config, block_tools)?;
         // `into_shared` starts the lifecycle monitor driving the idle/TTL
         // expiry timers (CORE-21/60).
-        let manager = SandboxManager::new(config.runtime, environment)
+        let manager = ComputerManager::new(config.runtime, environment)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_shared();
         let creates = Arc::new(CreateRegistry::default());
@@ -305,7 +305,7 @@ impl SandboxService {
         if !request.id.is_empty()
             && let Some((id, ip_address)) = self
                 .manager
-                .replay_sandbox_create(&request.id, create_key)
+                .replay_computer_create(&request.id, create_key)
                 .await
                 .map_err(SandboxError::from)?
         {
@@ -355,7 +355,7 @@ impl SandboxService {
 
         let (id, ip_address) = self
             .manager
-            .create_sandbox_keyed(spec, create_key)
+            .create_computer_keyed(spec, create_key)
             .await
             .map_err(SandboxError::from)?;
         register_sandbox_dns(&id, &ip_address);
@@ -436,7 +436,7 @@ impl SandboxService {
         req: sandbox_v1::StopSandboxRequest,
     ) -> Result<(), SandboxError> {
         self.manager
-            .stop_sandbox(&req.id, req.timeout_seconds)
+            .stop_computer(&req.id, req.timeout_seconds)
             .await
             .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
@@ -451,7 +451,7 @@ impl SandboxService {
         req: sandbox_v1::PauseSandboxRequest,
     ) -> Result<(), SandboxError> {
         self.manager
-            .pause_sandbox(&req.id)
+            .pause_computer(&req.id)
             .await
             .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
@@ -474,7 +474,7 @@ impl SandboxService {
         };
         let ip_address = self
             .manager
-            .resume_sandbox(&req.id, reason)
+            .resume_computer(&req.id, reason)
             .await
             .map_err(SandboxError::from)?;
         if !ip_address.is_empty() {
@@ -501,7 +501,7 @@ impl SandboxService {
                 .map(|value| idle_action_to_spec(value.as_known().unwrap_or_default())),
         };
         self.manager
-            .set_sandbox_lifecycle(&req.id, update)
+            .set_computer_lifecycle(&req.id, update)
             .await
             .map_err(SandboxError::from)
     }
@@ -519,7 +519,7 @@ impl SandboxService {
         req: sandbox_v1::RemoveSandboxRequest,
     ) -> Result<(), SandboxError> {
         self.manager
-            .remove_sandbox(&req.id, req.force)
+            .remove_computer(&req.id, req.force)
             .await
             .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
@@ -533,7 +533,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let info = self
             .manager
-            .inspect_sandbox(&req.id)
+            .inspect_computer(&req.id)
             .map_err(SandboxError::from)?;
         Ok(convert::info_to_proto(info))
     }
@@ -546,7 +546,7 @@ impl SandboxService {
         let labels: std::collections::HashMap<String, String> = req.labels.into_iter().collect();
         let summaries = self
             .manager
-            .list_sandboxes(state_filter, &labels)
+            .list_computers(state_filter, &labels)
             .map_err(SandboxError::from)?;
         let (page, next_page_token) =
             convert::paginate(summaries, |s| &s.id, req.page_size, &req.page_token);
@@ -564,7 +564,7 @@ impl SandboxService {
         sandbox_id: &str,
     ) -> Result<arcbox_computer_runtime::ComputerNetworkIdentity, SandboxError> {
         self.manager
-            .sandbox_network_identity(sandbox_id)
+            .computer_network_identity(sandbox_id)
             .map_err(SandboxError::from)
     }
 
@@ -692,7 +692,7 @@ impl SandboxService {
         self.creates.clear_completed_if(id, || {
             completed_create_is_stale(
                 self.manager
-                    .inspect_sandbox(&id.to_owned())
+                    .inspect_computer(&id.to_owned())
                     .map(|info| info.state),
             )
         });

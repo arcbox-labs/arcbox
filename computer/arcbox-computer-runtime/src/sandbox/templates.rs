@@ -1,4 +1,4 @@
-//! Template-catalog surface on [`SandboxManager`] (CORE-107).
+//! Template-catalog surface on [`ComputerManager`] (CORE-107).
 //!
 //! Thin delegation to [`TemplateCatalog`](crate::template_catalog::TemplateCatalog)
 //! plus the artifact side effects the catalog itself never performs: draining
@@ -6,7 +6,7 @@
 //! Build orchestration (rootfs conversion, prewarm) lives in the guest agent
 //! and lands its results here via [`register_template_draft`].
 //!
-//! [`register_template_draft`]: SandboxManager::register_template_draft
+//! [`register_template_draft`]: ComputerManager::register_template_draft
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::SandboxManager;
+use super::ComputerManager;
 use super::types::{ComputerId, ComputerSpec, ComputerState};
 use crate::error::{ComputerError, Result};
 use crate::snapshot::{SnapshotDraft, SnapshotGeometry};
@@ -39,7 +39,7 @@ pub struct PromotedSnapshot {
     pub artifact_bytes: u64,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Resolve a `name[:version]` catalog reference.
     pub fn get_template(&self, reference: &str) -> Result<ResolvedTemplate> {
         self.templates.resolve(reference).map_err(Into::into)
@@ -176,7 +176,7 @@ impl SandboxManager {
             self.config.defaults.memory_mib
         };
         // Short id on purpose: it must fit the driver's own id budget
-        // (`VmDriver::id_budget`, enforced by `validate_new_sandbox_id`) —
+        // (`VmDriver::id_budget`, enforced by `validate_new_computer_id`) —
         // `template-build-<full uuid>` was 51 chars and overflowed AF_UNIX's
         // `sun_path`, failing the builder boot as an opaque socket timeout.
         // 16 hex chars keep collisions out of reach for an ephemeral,
@@ -195,7 +195,7 @@ impl SandboxManager {
             ..Default::default()
         };
         let (id, _ip) = self
-            .create_sandbox_inner(
+            .create_computer_inner(
                 spec,
                 &Uuid::new_v4().to_string(),
                 super::lifecycle::WarmPolicy::Disabled,
@@ -208,7 +208,7 @@ impl SandboxManager {
         // vCPUs/memory allocated. The fresh snapshot is dropped too — no
         // record references it yet — and the error names the builder id so
         // the operator can remove it and retry.
-        if let Err(remove_error) = self.remove_sandbox(&id, true).await {
+        if let Err(remove_error) = self.remove_computer(&id, true).await {
             if let Ok((snapshot_id, _)) = &checkpoint {
                 self.discard_promoted_snapshot(snapshot_id).await;
             }
@@ -237,7 +237,7 @@ impl SandboxManager {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECS);
         loop {
-            let info = self.inspect_sandbox(id)?;
+            let info = self.inspect_computer(id)?;
             match info.state {
                 ComputerState::Ready => break,
                 ComputerState::Failed => {
@@ -395,17 +395,17 @@ mod tests {
     use std::path::Path;
 
     use crate::config::RuntimeConfig;
-    use crate::sandbox::SandboxManager;
+    use crate::sandbox::ComputerManager;
     use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
     use crate::template_catalog::{
         TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry, WarmArtifact,
     };
 
-    async fn manager(data_dir: &Path) -> SandboxManager {
+    async fn manager(data_dir: &Path) -> ComputerManager {
         let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
-        let manager = SandboxManager::new(config, environment).unwrap();
+        let manager = ComputerManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
         manager
     }

@@ -1,5 +1,5 @@
 //! The rules that must hold in every state: recovery's seeding, and the gates
-//! `stop_sandbox`, `cleanup::begin_removal` and the two deadline timers apply.
+//! `stop_computer`, `cleanup::begin_removal` and the two deadline timers apply.
 
 use super::harness::{ALL_PHASES, BUDGET_MS, explore, ordinal, reach, ready_machine, step};
 use crate::lifecycle::effect::{
@@ -132,7 +132,7 @@ fn only_ready_and_the_gates_own_cmd_take_the_workload_slot() {
 /// Drives a cold create through to `ready`, discarding effects.
 #[test]
 fn a_stop_only_acts_while_the_guest_serves() {
-    // `stop_sandbox` accepts Ready/Running/Stopping (and retries idempotently
+    // `stop_computer` accepts Ready/Running/Stopping (and retries idempotently
     // from Stopped), answering WrongState elsewhere. Only the first two are a
     // state change, so re-entering `stopping` emits nothing; everything else
     // the machine swallows for the actor to answer.
@@ -290,7 +290,7 @@ fn the_idle_policy_only_fires_on_a_ready_computer() {
 
 /// An idle expiry can only reach a computer that is still idle.
 ///
-/// `expire_sandbox` took a `force` flag for exactly this: the TTL cap
+/// `expire_computer` took a `force` flag for exactly this: the TTL cap
 /// destroys regardless of activity, while the idle detector passed
 /// `force = false` so a non-forced removal would refuse a computer that had
 /// turned busy between the timer firing and the teardown claiming it. The

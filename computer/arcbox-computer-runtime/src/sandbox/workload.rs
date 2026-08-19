@@ -92,7 +92,7 @@ pub async fn start_run_workload(
     Ok(spawn_exit_watcher(inner_rx, slot))
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// This computer's workload slot: its actor, behind the seam.
     pub(super) fn workload_slot(&self, id: &ComputerId) -> Result<Arc<dyn WorkloadSlot>> {
         Ok(Arc::new(crate::lifecycle::flows::ActorSlot {
@@ -105,7 +105,7 @@ impl SandboxManager {
         clippy::too_many_arguments,
         reason = "public API mirrors workload request"
     )]
-    pub async fn run_in_sandbox(
+    pub async fn run_in_computer(
         &self,
         id: &ComputerId,
         cmd: Vec<String>,

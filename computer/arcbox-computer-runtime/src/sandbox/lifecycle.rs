@@ -12,9 +12,9 @@ pub(super) enum WarmPolicy {
     Disabled,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Replay a durable Create outcome without resolving its template again.
-    pub async fn replay_sandbox_create(
+    pub async fn replay_computer_create(
         &self,
         id: &str,
         request_key: &str,
@@ -25,18 +25,18 @@ impl SandboxManager {
             .map(|outcome| outcome.map(|outcome| (id.to_owned(), outcome.ip_address)))
     }
 
-    pub async fn create_sandbox(&self, spec: ComputerSpec) -> Result<(ComputerId, String)> {
-        self.create_sandbox_keyed(spec, &Uuid::new_v4().to_string())
+    pub async fn create_computer(&self, spec: ComputerSpec) -> Result<(ComputerId, String)> {
+        self.create_computer_keyed(spec, &Uuid::new_v4().to_string())
             .await
     }
 
     /// Create a sandbox with a stable key for durable request replay.
-    pub async fn create_sandbox_keyed(
+    pub async fn create_computer_keyed(
         &self,
         spec: ComputerSpec,
         request_key: &str,
     ) -> Result<(ComputerId, String)> {
-        self.create_sandbox_inner(spec, request_key, WarmPolicy::Auto)
+        self.create_computer_inner(spec, request_key, WarmPolicy::Auto)
             .await
     }
 
@@ -74,12 +74,12 @@ impl SandboxManager {
         }
     }
 
-    /// [`Self::create_sandbox_keyed`] with explicit warm behaviour: the
+    /// [`Self::create_computer_keyed`] with explicit warm behaviour: the
     /// prewarm builder (CORE-107) passes [`WarmPolicy::Disabled`] so its own
     /// boot neither restores from a warm source nor publishes into the
     /// warm-cache LRU (which would burn one of the `MAX_WARM_KEYS` slots on
     /// a duplicate full-memory snapshot).
-    pub(super) async fn create_sandbox_inner(
+    pub(super) async fn create_computer_inner(
         &self,
         mut spec: ComputerSpec,
         request_key: &str,
@@ -123,7 +123,7 @@ impl SandboxManager {
         // Hold a caller-supplied id to what the driver can actually run it
         // as — its VM identity and its socket-path budget. Auto-generated
         // UUIDs pass unchanged.
-        super::validate_new_sandbox_id(&id, &*self.services.driver, &self.config)?;
+        super::validate_new_computer_id(&id, &*self.services.driver, &self.config)?;
         spec.id = Some(id.clone());
 
         // Template warm-restore (CORE-107): a catalog template carrying a
@@ -340,7 +340,7 @@ impl SandboxManager {
                 lease = Some(
                     self.services
                         .network
-                        .reserve(&VmId::new(&id)?, super::sandbox_network_policy())
+                        .reserve(&VmId::new(&id)?, super::computer_network_policy())
                         .await?,
                 );
             }
@@ -518,7 +518,7 @@ impl SandboxManager {
     /// outlives the remaining budget. All runtime resources (TAP + IP,
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
-    pub async fn stop_sandbox(&self, id: &ComputerId, timeout_seconds: u32) -> Result<()> {
+    pub async fn stop_computer(&self, id: &ComputerId, timeout_seconds: u32) -> Result<()> {
         self.await_reconcile().await?;
         let budget = Duration::from_secs(u64::from(if timeout_seconds > 0 {
             timeout_seconds
@@ -576,7 +576,7 @@ impl SandboxManager {
     }
 
     /// Forcibly destroy a sandbox and release all resources immediately.
-    pub async fn remove_sandbox(&self, id: &ComputerId, force: bool) -> Result<()> {
+    pub async fn remove_computer(&self, id: &ComputerId, force: bool) -> Result<()> {
         self.await_reconcile().await?;
         let mailbox = match self.mailbox(id) {
             Ok(mailbox) => mailbox,
@@ -641,7 +641,7 @@ impl SandboxManager {
     }
 
     /// Return the current state and metadata of a sandbox.
-    pub fn inspect_sandbox(&self, id: &ComputerId) -> Result<ComputerInfo> {
+    pub fn inspect_computer(&self, id: &ComputerId) -> Result<ComputerInfo> {
         let snapshot = self.snapshot(id)?;
         // Size the retained artifacts after the read: the sizing stats files
         // and scans the catalog, and the snapshot is a borrow of a `watch`
@@ -656,7 +656,7 @@ impl SandboxManager {
     }
 
     /// List sandboxes, optionally filtered by state string and/or labels.
-    pub fn list_sandboxes(
+    pub fn list_computers(
         &self,
         state_filter: Option<&str>,
         label_filter: &HashMap<String, String>,
@@ -810,7 +810,7 @@ fn snapshot_to_info(id: &ComputerId, snapshot: &ComputerSnapshot) -> ComputerInf
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.
 ///
-/// The listing counterpart of [`SandboxManager::checkpoint_paths`]: it reads
+/// The listing counterpart of [`ComputerManager::checkpoint_paths`]: it reads
 /// an already-loaded [`SnapshotInfo`] so a multi-sandbox response pays one
 /// catalog scan rather than one per paused sandbox.
 fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
@@ -837,7 +837,7 @@ mod tests {
                 ..arcbox_vm_driver::testkit::FakeDriver::new().capabilities()
             })
             .build();
-        SandboxManager::new(
+        ComputerManager::new(
             config.clone(),
             NodeEnvironment {
                 driver: Arc::new(driver),

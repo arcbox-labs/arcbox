@@ -91,7 +91,7 @@ pub struct ResumeFailure {
     pub unwound: bool,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Pause a `Ready` sandbox: checkpoint it, then release its runtime
     /// resources while keeping the record, checkpoint, and disk overlay
     /// under the same id.
@@ -99,14 +99,14 @@ impl SandboxManager {
     /// Idempotent: pausing a `Paused` sandbox is a no-op. Any other state
     /// answers `WrongState` — an active execution must finish (or be
     /// stopped) first, matching the contract's "requires READY".
-    pub async fn pause_sandbox(&self, id: &ComputerId) -> Result<()> {
-        self.pause_sandbox_with_reason(id, PauseReason::Requested)
+    pub async fn pause_computer(&self, id: &ComputerId) -> Result<()> {
+        self.pause_computer_with_reason(id, PauseReason::Requested)
             .await
     }
 
-    /// [`Self::pause_sandbox`] with an explicit PAUSING-event reason —
+    /// [`Self::pause_computer`] with an explicit PAUSING-event reason —
     /// the idle detector reports `idle_timeout` (see [`reason`]).
-    pub(super) async fn pause_sandbox_with_reason(
+    pub(super) async fn pause_computer_with_reason(
         &self,
         id: &ComputerId,
         reason: PauseReason,
@@ -140,7 +140,7 @@ impl SandboxManager {
     /// "reason" attribute (see [`reason`]).
     ///
     /// Returns the sandbox's (fresh) IP address, empty without networking.
-    pub async fn resume_sandbox(&self, id: &ComputerId, resume_reason: &str) -> Result<String> {
+    pub async fn resume_computer(&self, id: &ComputerId, resume_reason: &str) -> Result<String> {
         self.await_reconcile().await?;
         let computer = self.computer(id)?;
         computer

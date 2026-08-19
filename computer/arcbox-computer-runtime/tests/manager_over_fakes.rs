@@ -1,6 +1,6 @@
 //! The manager's own flows, driven end to end over the fakes.
 //!
-//! One computer per test, created through `create_sandbox` and reached
+//! One computer per test, created through `create_computer` and reached
 //! only through the public API — so what these assert is what a caller
 //! gets, and no test can reach a state a real flow does not produce.
 //!
@@ -42,7 +42,7 @@ async fn a_create_boots_to_ready_and_serves_exec_and_files() {
 
     let (id, ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("booted".into()),
             cmd: vec!["/bin/hello".into()],
             ..ComputerSpec::default()
@@ -84,24 +84,24 @@ async fn a_create_boots_to_ready_and_serves_exec_and_files() {
     // The file verbs reach the guest through the port.
     fixture
         .manager
-        .write_sandbox_file(&id, "/tmp/note", 0o644, b"written")
+        .write_computer_file(&id, "/tmp/note", 0o644, b"written")
         .await
         .unwrap();
     assert_eq!(
         fixture
             .manager
-            .read_sandbox_file(&id, "/tmp/note")
+            .read_computer_file(&id, "/tmp/note")
             .await
             .unwrap(),
         b"written"
     );
     fixture
         .manager
-        .move_sandbox_path(&id, "/tmp/note", "/tmp/moved")
+        .move_computer_path(&id, "/tmp/note", "/tmp/moved")
         .await
         .unwrap();
     assert!(matches!(
-        fixture.manager.stat_sandbox_path(&id, "/tmp/note").await,
+        fixture.manager.stat_computer_path(&id, "/tmp/note").await,
         Err(ComputerError::PathNotFound(_))
     ));
 
@@ -109,7 +109,7 @@ async fn a_create_boots_to_ready_and_serves_exec_and_files() {
     // guest side emits arrives through it whatever the transport.
     let mut watch = fixture
         .manager
-        .watch_sandbox_dir(&id, "/tmp/moved", false)
+        .watch_computer_dir(&id, "/tmp/moved", false)
         .await
         .unwrap();
     fixture
@@ -143,7 +143,7 @@ async fn a_cmd_carrying_boot_announces_its_workload_around_ready() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("noisy".into()),
             cmd: vec!["/bin/hello".into()],
             ..ComputerSpec::default()
@@ -184,7 +184,7 @@ async fn a_ready_probe_command_that_never_exits_fails_the_boot() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("wedged".into()),
             ready_probe: Some(
                 arcbox_computer_runtime::template_catalog::ReadyProbeSpec::Command {
@@ -218,7 +218,7 @@ async fn a_boot_whose_cmd_exits_while_the_gate_runs_still_reaches_ready() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("gated".into()),
             cmd: vec!["/bin/cmd".into()],
             ready_probe: Some(
@@ -262,7 +262,7 @@ async fn a_boot_the_driver_refuses_fails_and_releases_the_computer() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("doomed".into()),
             ..ComputerSpec::default()
         })
@@ -293,7 +293,7 @@ async fn a_create_that_fails_before_activation_hands_the_address_back() {
 
     fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("doomed".into()),
             ..ComputerSpec::default()
         })
@@ -313,7 +313,7 @@ async fn a_create_that_fails_before_activation_hands_the_address_back() {
     );
     let (_id, reused) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("next".into()),
             ..ComputerSpec::default()
         })
@@ -374,7 +374,7 @@ async fn an_idle_computer_pauses_and_says_the_timer_did_it() {
     );
     fixture.await_state(&id, ComputerState::Paused).await;
     assert!(
-        fixture.manager.inspect_sandbox(&id).is_ok(),
+        fixture.manager.inspect_computer(&id).is_ok(),
         "the PAUSE policy never removes the computer"
     );
 }
@@ -393,7 +393,7 @@ async fn a_ttl_expiry_removes_even_a_busy_computer() {
     // the boot: under a paused clock every await advances virtual time.
     fixture
         .manager
-        .set_sandbox_lifecycle(
+        .set_computer_lifecycle(
             &id,
             LifecycleUpdate {
                 ttl_seconds: Some(2),
@@ -418,7 +418,7 @@ async fn set_lifecycle_rearms_the_ttl_and_replaces_only_what_it_names() {
     let before = chrono::Utc::now();
     fixture
         .manager
-        .set_sandbox_lifecycle(
+        .set_computer_lifecycle(
             &id,
             LifecycleUpdate {
                 ttl_seconds: Some(600),
@@ -429,7 +429,7 @@ async fn set_lifecycle_rearms_the_ttl_and_replaces_only_what_it_names() {
         .await
         .unwrap();
 
-    let info = fixture.manager.inspect_sandbox(&id).unwrap();
+    let info = fixture.manager.inspect_computer(&id).unwrap();
     let deadline = info.ttl_deadline.expect("ttl deadline armed");
     assert!(deadline >= before + chrono::Duration::seconds(600));
     assert!(deadline <= chrono::Utc::now() + chrono::Duration::seconds(600));
@@ -439,7 +439,7 @@ async fn set_lifecycle_rearms_the_ttl_and_replaces_only_what_it_names() {
     // Absent fields are unchanged; ttl 0 removes the cap.
     fixture
         .manager
-        .set_sandbox_lifecycle(
+        .set_computer_lifecycle(
             &id,
             LifecycleUpdate {
                 ttl_seconds: Some(0),
@@ -448,7 +448,7 @@ async fn set_lifecycle_rearms_the_ttl_and_replaces_only_what_it_names() {
         )
         .await
         .unwrap();
-    let info = fixture.manager.inspect_sandbox(&id).unwrap();
+    let info = fixture.manager.inspect_computer(&id).unwrap();
     assert_eq!(info.ttl_deadline, None);
     assert_eq!(info.idle_timeout_seconds, 30);
     assert_eq!(info.on_idle, IdleAction::Pause);
@@ -461,31 +461,31 @@ async fn set_lifecycle_rejects_terminal_states_and_missing_ids() {
     assert!(matches!(
         fixture
             .manager
-            .set_sandbox_lifecycle(&"ghost".to_owned(), LifecycleUpdate::default())
+            .set_computer_lifecycle(&"ghost".to_owned(), LifecycleUpdate::default())
             .await,
         Err(ComputerError::NotFound(_))
     ));
 
     let stopped = fixture.ready("halted").await;
     let mut events = fixture.manager.subscribe_events();
-    fixture.manager.stop_sandbox(&stopped, 1).await.unwrap();
+    fixture.manager.stop_computer(&stopped, 1).await.unwrap();
     await_action(&mut events, &stopped, action::STOPPED).await;
     fixture.await_state(&stopped, ComputerState::Stopped).await;
     assert!(matches!(
         fixture
             .manager
-            .set_sandbox_lifecycle(&stopped, LifecycleUpdate::default())
+            .set_computer_lifecycle(&stopped, LifecycleUpdate::default())
             .await,
         Err(ComputerError::WrongState { .. })
     ));
 
     // Paused computers accept updates: the TTL keeps applying to them.
     let paused = fixture.ready("asleep").await;
-    fixture.manager.pause_sandbox(&paused).await.unwrap();
+    fixture.manager.pause_computer(&paused).await.unwrap();
     fixture.await_state(&paused, ComputerState::Paused).await;
     fixture
         .manager
-        .set_sandbox_lifecycle(
+        .set_computer_lifecycle(
             &paused,
             LifecycleUpdate {
                 ttl_seconds: Some(120),
@@ -510,7 +510,7 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
     let id = fixture.ready("nap").await;
     let mut events = fixture.manager.subscribe_events();
 
-    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.manager.pause_computer(&id).await.unwrap();
     fixture.await_state(&id, ComputerState::Paused).await;
     let pausing = await_action(&mut events, &id, action::PAUSING).await;
     assert_eq!(
@@ -519,7 +519,7 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
     );
     await_action(&mut events, &id, action::PAUSED).await;
 
-    let info = fixture.manager.inspect_sandbox(&id).unwrap();
+    let info = fixture.manager.inspect_computer(&id).unwrap();
     assert!(info.paused_at.is_some(), "the pause records when it froze");
     assert!(
         info.storage_bytes > 0,
@@ -527,7 +527,7 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
     );
     let listed = fixture
         .manager
-        .list_sandboxes(None, &HashMap::new())
+        .list_computers(None, &HashMap::new())
         .unwrap();
     let summary = listed.iter().find(|entry| entry.id == id).unwrap();
     assert_eq!(
@@ -549,7 +549,7 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
     fixture.settle_network_cleanups().await;
     let ip = fixture
         .manager
-        .resume_sandbox(&id, pause_reason::RESUME)
+        .resume_computer(&id, pause_reason::RESUME)
         .await
         .unwrap();
     assert!(!ip.is_empty(), "a resume answers with its fresh address");
@@ -573,23 +573,23 @@ async fn pause_is_idempotent_and_gates_on_state() {
     fixture.agent().on(&["/bin/wedged"], Reply::NeverExits);
 
     assert!(matches!(
-        fixture.manager.pause_sandbox(&"missing".to_owned()).await,
+        fixture.manager.pause_computer(&"missing".to_owned()).await,
         Err(ComputerError::NotFound(_))
     ));
 
     let asleep = fixture.ready("asleep").await;
-    fixture.manager.pause_sandbox(&asleep).await.unwrap();
+    fixture.manager.pause_computer(&asleep).await.unwrap();
     fixture.await_state(&asleep, ComputerState::Paused).await;
     fixture
         .manager
-        .pause_sandbox(&asleep)
+        .pause_computer(&asleep)
         .await
         .expect("pausing a paused computer is a no-op");
 
     let busy = fixture.booted(never_exits("busy")).await;
     fixture.await_state(&busy, ComputerState::Running).await;
     assert!(matches!(
-        fixture.manager.pause_sandbox(&busy).await,
+        fixture.manager.pause_computer(&busy).await,
         Err(ComputerError::WrongState { .. })
     ));
 }
@@ -601,11 +601,11 @@ async fn a_direct_mode_pause_is_refused_before_it_freezes_anything() {
     let fixture = Fixture::direct().await;
     let id = fixture.ready("plain").await;
 
-    let error = fixture.manager.pause_sandbox(&id).await.unwrap_err();
+    let error = fixture.manager.pause_computer(&id).await.unwrap_err();
     assert!(matches!(error, ComputerError::Config(_)), "{error}");
     assert!(error.to_string().contains("jailer"), "{error}");
     assert_eq!(
-        fixture.manager.inspect_sandbox(&id).unwrap().state,
+        fixture.manager.inspect_computer(&id).unwrap().state,
         ComputerState::Ready,
         "the refused pause left the computer alone"
     );
@@ -621,7 +621,7 @@ async fn resume_is_a_noop_on_live_states_and_refuses_terminal_ones() {
     let ready = fixture.ready("awake").await;
     let address = fixture
         .manager
-        .inspect_sandbox(&ready)
+        .inspect_computer(&ready)
         .unwrap()
         .network
         .expect("a networked computer")
@@ -629,7 +629,7 @@ async fn resume_is_a_noop_on_live_states_and_refuses_terminal_ones() {
     assert_eq!(
         fixture
             .manager
-            .resume_sandbox(&ready, pause_reason::RESUME)
+            .resume_computer(&ready, pause_reason::RESUME)
             .await
             .unwrap(),
         address,
@@ -640,17 +640,17 @@ async fn resume_is_a_noop_on_live_states_and_refuses_terminal_ones() {
     fixture.await_state(&running, ComputerState::Running).await;
     fixture
         .manager
-        .resume_sandbox(&running, pause_reason::RESUME)
+        .resume_computer(&running, pause_reason::RESUME)
         .await
         .expect("resuming a busy computer is a no-op");
 
     let stopped = fixture.ready("halted").await;
-    fixture.manager.stop_sandbox(&stopped, 1).await.unwrap();
+    fixture.manager.stop_computer(&stopped, 1).await.unwrap();
     fixture.await_state(&stopped, ComputerState::Stopped).await;
     assert!(matches!(
         fixture
             .manager
-            .resume_sandbox(&stopped, pause_reason::RESUME)
+            .resume_computer(&stopped, pause_reason::RESUME)
             .await,
         Err(ComputerError::WrongState { .. })
     ));
@@ -666,7 +666,7 @@ async fn a_pause_that_leaves_the_guest_frozen_fails_and_releases_the_computer() 
     fixture.driver().freeze_next_checkpoint();
     let mut events = fixture.manager.subscribe_events();
 
-    let error = fixture.manager.pause_sandbox(&id).await.unwrap_err();
+    let error = fixture.manager.pause_computer(&id).await.unwrap_err();
     assert!(
         !matches!(error, ComputerError::WrongState { .. }),
         "the capture failure is the reported error: {error}"
@@ -685,7 +685,7 @@ async fn a_pause_that_leaves_the_guest_frozen_fails_and_releases_the_computer() 
     assert!(matches!(
         fixture
             .manager
-            .resume_sandbox(&id, pause_reason::RESUME)
+            .resume_computer(&id, pause_reason::RESUME)
             .await,
         Err(ComputerError::WrongState { .. })
     ));
@@ -698,17 +698,17 @@ async fn a_pause_that_leaves_the_guest_frozen_fails_and_releases_the_computer() 
 async fn the_data_plane_reports_a_paused_computer_readably() {
     let fixture = Fixture::jailed().await;
     let id = fixture.ready("asleep").await;
-    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.manager.pause_computer(&id).await.unwrap();
     fixture.await_state(&id, ComputerState::Paused).await;
 
     assert!(matches!(
-        fixture.manager.read_sandbox_file(&id, "/tmp/x").await,
+        fixture.manager.read_computer_file(&id, "/tmp/x").await,
         Err(ComputerError::Paused(paused)) if paused == id
     ));
     assert!(matches!(
         fixture
             .manager
-            .run_in_sandbox(
+            .run_in_computer(
                 &id,
                 vec!["/bin/anything".into()],
                 HashMap::new(),
@@ -738,7 +738,7 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
 
     let checkpoint = fixture
         .manager
-        .checkpoint_sandbox(&id, "user".into(), HashMap::new())
+        .checkpoint_computer(&id, "user".into(), HashMap::new())
         .await
         .unwrap();
     assert_eq!(
@@ -752,14 +752,14 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
         vec![checkpoint.snapshot_id.clone()]
     );
     assert_eq!(
-        fixture.manager.inspect_sandbox(&id).unwrap().state,
+        fixture.manager.inspect_computer(&id).unwrap().state,
         ComputerState::Ready,
         "the origin keeps running: the capture resumed it"
     );
 
     let (clone, clone_ip) = fixture
         .manager
-        .restore_sandbox(RestoreComputerSpec {
+        .restore_computer(RestoreComputerSpec {
             id: Some("clone".into()),
             snapshot_id: checkpoint.snapshot_id.clone(),
             network_override: true,
@@ -777,7 +777,7 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
         clone_ip,
         fixture
             .manager
-            .inspect_sandbox(&id)
+            .inspect_computer(&id)
             .unwrap()
             .network
             .unwrap()
@@ -797,12 +797,12 @@ async fn a_recoverable_checkpoint_failure_leaves_the_computer_ready() {
 
     fixture
         .manager
-        .checkpoint_sandbox(&id, "user".into(), HashMap::new())
+        .checkpoint_computer(&id, "user".into(), HashMap::new())
         .await
         .expect_err("a capture the driver refused");
 
     assert_eq!(
-        fixture.manager.inspect_sandbox(&id).unwrap().state,
+        fixture.manager.inspect_computer(&id).unwrap().state,
         ComputerState::Ready
     );
     assert!(
@@ -834,7 +834,7 @@ async fn a_checkpoint_that_leaves_the_guest_frozen_fails_and_releases_the_comput
 
     let error = fixture
         .manager
-        .checkpoint_sandbox(&id, "user".into(), HashMap::new())
+        .checkpoint_computer(&id, "user".into(), HashMap::new())
         .await
         .expect_err("a capture that froze the guest");
     assert!(
@@ -856,14 +856,14 @@ async fn a_failed_restore_frees_its_id_before_it_answers() {
     let origin = fixture.ready("origin").await;
     let checkpoint = fixture
         .manager
-        .checkpoint_sandbox(&origin, "user".into(), HashMap::new())
+        .checkpoint_computer(&origin, "user".into(), HashMap::new())
         .await
         .unwrap();
 
     fixture.driver().fail_next_boot();
     fixture
         .manager
-        .restore_sandbox(RestoreComputerSpec {
+        .restore_computer(RestoreComputerSpec {
             id: Some("second".into()),
             snapshot_id: checkpoint.snapshot_id.clone(),
             network_override: true,
@@ -877,7 +877,7 @@ async fn a_failed_restore_frees_its_id_before_it_answers() {
     fixture.settle_network_cleanups().await;
     let (again, _ip) = fixture
         .manager
-        .restore_sandbox(RestoreComputerSpec {
+        .restore_computer(RestoreComputerSpec {
             id: Some("second".into()),
             snapshot_id: checkpoint.snapshot_id,
             network_override: true,
@@ -909,7 +909,7 @@ async fn a_caller_cannot_squat_on_the_reserved_checkpoint_name_or_labels() {
     ] {
         let error = fixture
             .manager
-            .checkpoint_sandbox(&id, name.to_owned(), labels)
+            .checkpoint_computer(&id, name.to_owned(), labels)
             .await
             .expect_err("a reserved name or label is refused");
         assert!(matches!(error, ComputerError::Config(_)), "{error}");
@@ -928,14 +928,14 @@ async fn removing_a_paused_computer_takes_its_retained_checkpoint() {
         "nothing is pinned before there is a checkpoint"
     );
 
-    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.manager.pause_computer(&id).await.unwrap();
     fixture.await_state(&id, ComputerState::Paused).await;
     assert!(
         !fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
         "the pause checkpoint pins the rootfs it was captured from"
     );
 
-    fixture.manager.remove_sandbox(&id, false).await.unwrap();
+    fixture.manager.remove_computer(&id, false).await.unwrap();
     fixture.await_gone(&id).await;
     assert!(
         fixture.manager.pinned_rootfs_paths().unwrap().is_empty(),
@@ -986,7 +986,7 @@ async fn a_boot_whose_warm_publish_freezes_the_guest_fails() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("chilled".into()),
             ..ComputerSpec::default()
         })
@@ -1015,7 +1015,7 @@ async fn a_forced_remove_preempts_a_boot_in_flight() {
 
     let (id, _ip) = fixture
         .manager
-        .create_sandbox(ComputerSpec {
+        .create_computer(ComputerSpec {
             id: Some("wedged".into()),
             ready_probe: Some(
                 arcbox_computer_runtime::template_catalog::ReadyProbeSpec::Command {
@@ -1034,7 +1034,7 @@ async fn a_forced_remove_preempts_a_boot_in_flight() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        fixture.manager.remove_sandbox(&id, true),
+        fixture.manager.remove_computer(&id, true),
     )
     .await
     .expect("a forced remove must preempt the gate")
@@ -1056,10 +1056,10 @@ async fn remove_refuses_a_busy_computer_unless_forced() {
     let mut events = fixture.manager.subscribe_events();
 
     assert!(matches!(
-        fixture.manager.remove_sandbox(&id, false).await,
+        fixture.manager.remove_computer(&id, false).await,
         Err(ComputerError::WrongState { .. })
     ));
-    fixture.manager.remove_sandbox(&id, true).await.unwrap();
+    fixture.manager.remove_computer(&id, true).await.unwrap();
     await_action(&mut events, &id, action::REMOVED).await;
     fixture.await_gone(&id).await;
 }
@@ -1094,7 +1094,7 @@ async fn a_detached_computer_is_adopted_by_the_next_process_and_serves_an_exec()
     // running, after which the overlay and TAP are torn out from under a
     // live guest.
     let vm = arcbox_vm_driver::VmId::new(&id).unwrap();
-    fixture.manager.remove_sandbox(&id, false).await.unwrap();
+    fixture.manager.remove_computer(&id, false).await.unwrap();
     fixture.await_gone(&id).await;
     assert_eq!(
         fixture.driver().shutdowns(&vm),
@@ -1135,7 +1135,7 @@ async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
     fixture = fixture.restart().await;
     fixture.await_state(&id, ComputerState::Ready).await;
 
-    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.manager.pause_computer(&id).await.unwrap();
     fixture.await_state(&id, ComputerState::Paused).await;
     // The frozen on-disk name a resume reattaches from.
     let parked = fixture.vm_dir(&id).join("paused-rootfs.ext4");
@@ -1147,7 +1147,7 @@ async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
     fixture.settle_network_cleanups().await;
     let error = fixture
         .manager
-        .resume_sandbox(&id, pause_reason::RESUME)
+        .resume_computer(&id, pause_reason::RESUME)
         .await
         .expect_err("an adopted computer's checkpoint records no kernel to stage");
     assert!(
@@ -1178,10 +1178,10 @@ async fn a_computer_whose_vm_died_comes_back_failed() {
 
     let info = fixture
         .manager
-        .inspect_sandbox(&id)
+        .inspect_computer(&id)
         .expect("the sweep reinstated the computer");
     assert_eq!(info.state, ComputerState::Failed);
-    fixture.manager.remove_sandbox(&id, false).await.unwrap();
+    fixture.manager.remove_computer(&id, false).await.unwrap();
     fixture.await_gone(&id).await;
 }
 
@@ -1193,7 +1193,7 @@ async fn a_computer_whose_vm_died_comes_back_failed() {
 /// rather than building a second computer — the durable half of an
 /// at-least-once RPC.
 ///
-/// The replay is its own verb, and has to be: `create_sandbox_keyed`
+/// The replay is its own verb, and has to be: `create_computer_keyed`
 /// claims the id in memory *before* it consults the durable record, so
 /// while the computer is live the claim answers first. A caller that
 /// retries has to ask the record.
@@ -1206,7 +1206,7 @@ async fn a_create_replays_its_recorded_outcome_rather_than_building_a_second_com
     };
     let (id, ip) = fixture
         .manager
-        .create_sandbox_keyed(spec.clone(), "one-key")
+        .create_computer_keyed(spec.clone(), "one-key")
         .await
         .unwrap();
     fixture.await_state(&id, ComputerState::Ready).await;
@@ -1214,7 +1214,7 @@ async fn a_create_replays_its_recorded_outcome_rather_than_building_a_second_com
     assert_eq!(
         fixture
             .manager
-            .replay_sandbox_create(&id, "one-key")
+            .replay_computer_create(&id, "one-key")
             .await
             .unwrap(),
         Some((id.clone(), ip)),
@@ -1223,7 +1223,7 @@ async fn a_create_replays_its_recorded_outcome_rather_than_building_a_second_com
     assert_eq!(
         fixture
             .manager
-            .replay_sandbox_create("nobody", "one-key")
+            .replay_computer_create("nobody", "one-key")
             .await
             .unwrap(),
         None,
@@ -1233,20 +1233,20 @@ async fn a_create_replays_its_recorded_outcome_rather_than_building_a_second_com
         matches!(
             fixture
                 .manager
-                .replay_sandbox_create(&id, "another-key")
+                .replay_computer_create(&id, "another-key")
                 .await,
             Err(ComputerError::AlreadyExists(_))
         ),
         "the key that made the record owns it"
     );
     assert!(matches!(
-        fixture.manager.create_sandbox_keyed(spec, "one-key").await,
+        fixture.manager.create_computer_keyed(spec, "one-key").await,
         Err(ComputerError::AlreadyExists(_))
     ));
     assert_eq!(
         fixture
             .manager
-            .list_sandboxes(None, &HashMap::new())
+            .list_computers(None, &HashMap::new())
             .unwrap()
             .len(),
         1,
@@ -1265,22 +1265,22 @@ async fn a_create_of_a_live_id_under_another_key_is_refused() {
     };
     let (id, _ip) = fixture
         .manager
-        .create_sandbox_keyed(spec(), "mine")
+        .create_computer_keyed(spec(), "mine")
         .await
         .unwrap();
     fixture.await_state(&id, ComputerState::Ready).await;
 
     assert!(matches!(
-        fixture.manager.create_sandbox_keyed(spec(), "yours").await,
+        fixture.manager.create_computer_keyed(spec(), "yours").await,
         Err(ComputerError::AlreadyExists(_))
     ));
 
     // And a same-key retry after the computer has left its live phases is
     // refused too: its recorded outcome names an address it no longer has.
-    fixture.manager.stop_sandbox(&id, 1).await.unwrap();
+    fixture.manager.stop_computer(&id, 1).await.unwrap();
     fixture.await_state(&id, ComputerState::Stopped).await;
     assert!(matches!(
-        fixture.manager.create_sandbox_keyed(spec(), "mine").await,
+        fixture.manager.create_computer_keyed(spec(), "mine").await,
         Err(ComputerError::AlreadyExists(_))
     ));
 }
