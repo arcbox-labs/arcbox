@@ -43,7 +43,6 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use arcbox_computer_runtime::{
     RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState,
-    config::RuntimeConfig,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -71,18 +70,20 @@ async fn main() -> anyhow::Result<()> {
     let run_phase2 = std::env::var("ARCBOX_SMOKE_RUN").is_ok_and(|v| v == "1");
     let run_phase3 = std::env::var("ARCBOX_SMOKE_CHECKPOINT").is_ok_and(|v| v == "1");
 
-    let config = RuntimeConfig::from_file(&config_path)
+    let config = arcbox_agent::config::GuestConfig::from_file(&config_path)
+        .map_err(anyhow::Error::msg)
         .with_context(|| format!("load config from {config_path}"))?;
 
     // Save network config before consuming config.
-    let net_cidr = config.network.cidr.clone();
-    let net_gateway = config.network.gateway.clone();
+    let net_cidr = config.runtime.network.cidr.clone();
+    let net_gateway = config.runtime.network.gateway.clone();
 
     // The environment `SandboxService::new` composes, so the smoke test
     // exercises the real composition rather than one of its own.
     let environment =
         arcbox_agent::sandbox::node_environment(&config, arcbox_agent::sandbox::block_tools())?;
-    let manager = SandboxManager::new(config, environment).context("SandboxManager::new")?;
+    let manager =
+        SandboxManager::new(config.runtime, environment).context("SandboxManager::new")?;
 
     // Phase 1 — Core lifecycle
     println!("\n=== Phase 1: Core lifecycle ===");

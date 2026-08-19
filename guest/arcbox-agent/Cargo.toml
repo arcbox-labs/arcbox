@@ -64,11 +64,11 @@ tonic-prost.workspace = true
 tower.workspace = true
 http = "1"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+toml.workspace = true
 
 [dev-dependencies]
 arcbox-computer-runtime.workspace = true
 tempfile = "3"
-toml.workspace = true
 
 [features]
 default = []

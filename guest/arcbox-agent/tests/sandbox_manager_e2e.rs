@@ -43,6 +43,7 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxEvent,
@@ -53,23 +54,15 @@ use arcbox_computer_runtime::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a RuntimeConfig from env vars. Returns `None` to skip the test.
-fn try_config(data_dir: &str) -> Option<RuntimeConfig> {
+/// Build a GuestConfig from env vars. Returns `None` to skip the test.
+fn try_config(data_dir: &str) -> Option<GuestConfig> {
     let binary = std::env::var("FC_BINARY").ok()?;
     let kernel = std::env::var("FC_KERNEL").ok()?;
     let rootfs = std::env::var("FC_ROOTFS").ok()?;
-    Some(RuntimeConfig {
+    let runtime = RuntimeConfig {
         firecracker: FirecrackerConfig {
-            binary,
             jailer: None,
             data_dir: data_dir.to_owned(),
-            log_level: Some("Error".into()),
-            no_seccomp: true,
-            seccomp_filter: None,
-            http_api_max_payload_size: None,
-            mmds_size_limit: None,
-            socket_timeout_secs: Some(15),
-            sandbox_datapath: arcbox_computer_runtime::config::SandboxDatapath::default(),
             // Direct mode cannot restore (and so never pools); keep the
             // e2e run free of background pre-warm spawns regardless.
             pool_size: 0,
@@ -94,6 +87,20 @@ fn try_config(data_dir: &str) -> Option<RuntimeConfig> {
             rootfs,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".into(),
         },
+    };
+    Some(GuestConfig {
+        runtime,
+        adapters: AdapterConfig {
+            binary,
+            jailer: None,
+            log_level: Some("Error".into()),
+            no_seccomp: true,
+            seccomp_filter: None,
+            http_api_max_payload_size: None,
+            mmds_size_limit: None,
+            socket_timeout_secs: Some(15),
+            sandbox_datapath: arcbox_tap_net::Datapath::default(),
+        },
     })
 }
 
@@ -109,9 +116,9 @@ fn no_tap() -> SandboxSpec {
 
 /// A manager over the environment `SandboxService::new` composes: this
 /// suite exercises the real composition rather than one of its own.
-fn manager(cfg: RuntimeConfig) -> SandboxManager {
+fn manager(cfg: GuestConfig) -> SandboxManager {
     let environment = node_environment(&cfg, block_tools()).unwrap();
-    SandboxManager::new(cfg, environment).unwrap()
+    SandboxManager::new(cfg.runtime, environment).unwrap()
 }
 
 /// Complete the startup cleanup handshake for a manager backed by a fresh

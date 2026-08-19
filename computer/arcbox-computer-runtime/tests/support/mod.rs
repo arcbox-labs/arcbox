@@ -119,7 +119,6 @@ impl Setup {
         config.defaults.kernel = dir.path().join("k").to_string_lossy().into_owned();
         config.defaults.rootfs = dir.path().join("r.ext4").to_string_lossy().into_owned();
         config.firecracker.jailer = self.jailer.then(|| JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: nix::unistd::geteuid().as_raw(),
             gid: nix::unistd::getegid().as_raw(),
             chroot_base_dir: Some(dir.path().join("j").to_string_lossy().into_owned()),
@@ -127,7 +126,6 @@ impl Setup {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec![],
         });
 
         let ports = Ports {

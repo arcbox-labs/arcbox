@@ -1,7 +1,3 @@
-use std::path::PathBuf;
-use std::time::Duration;
-
-use arcbox_fc_driver::FcDriverConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VmmError};
@@ -18,40 +14,23 @@ pub struct RuntimeConfig {
     pub defaults: DefaultVmConfig,
 }
 
-/// Firecracker binary paths, data directory, and process-level options.
+/// The `[firecracker]` keys this runtime reads.
+///
+/// The section is named for the VMM because that is what a deployed
+/// `vmm.toml` has always called it, and the on-disk vocabulary is frozen
+/// (`computer/AGENTS.md`) — but nothing here is Firecracker's. The keys
+/// that configure a VMM adapter (its binaries, its process-level flags,
+/// the sandbox datapath) belong to whoever builds that adapter, and are
+/// read out of this same section by the composer; serde ignores what it
+/// does not know, so one section serves both halves and the file's shape
+/// is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirecrackerConfig {
-    /// Path to the `firecracker` binary.
-    pub binary: String,
-    /// Jailer configuration (absent = run Firecracker directly without sandbox).
+    /// Jailer isolation for every sandbox VMM (absent = no isolation).
     #[serde(default)]
     pub jailer: Option<JailerConfig>,
     /// Root data directory (VMs, snapshots, images).
     pub data_dir: String,
-
-    // --- Process-level options ---
-    /// Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`).
-    #[serde(default)]
-    pub log_level: Option<String>,
-    /// Disable seccomp filtering (reduces isolation — use only for testing).
-    #[serde(default)]
-    pub no_seccomp: bool,
-    /// Path to a custom seccomp filter BPF file.
-    #[serde(default)]
-    pub seccomp_filter: Option<String>,
-    /// Maximum HTTP API payload size in bytes.
-    #[serde(default)]
-    pub http_api_max_payload_size: Option<usize>,
-    /// MMDS in-memory store size limit in bytes.
-    #[serde(default)]
-    pub mmds_size_limit: Option<usize>,
-    /// Seconds to wait for the Firecracker socket to become available.
-    /// `None` uses the five-second default.
-    #[serde(default)]
-    pub socket_timeout_secs: Option<u64>,
-    /// Host-side translation mechanism for invariant sandbox TAPs (CORE-83).
-    #[serde(default)]
-    pub sandbox_datapath: SandboxDatapath,
     /// Spare pre-warmed restore slots kept per snapshot id (CORE-78).
     ///
     /// A slot pre-executes the fixed host-side restore setup — jailer
@@ -81,32 +60,6 @@ pub struct FirecrackerConfig {
     pub dmsetup_candidates: Option<Vec<String>>,
 }
 
-impl From<&FirecrackerConfig> for FcDriverConfig {
-    /// The node-wide half of the Firecracker config: the binaries and the
-    /// process-level flags. The data dir, datapath, pool and warm-create
-    /// knobs stay with the manager; the jailer's per-VM fields become an
-    /// [`arcbox_vm_driver::IsolationSpec`] via [`JailerConfig`].
-    fn from(fc: &FirecrackerConfig) -> Self {
-        Self {
-            firecracker_binary: PathBuf::from(&fc.binary),
-            jailer_binary: fc.jailer.as_ref().map(|jc| PathBuf::from(&jc.binary)),
-            log_level: fc.log_level.clone(),
-            no_seccomp: fc.no_seccomp,
-            seccomp_filter: fc.seccomp_filter.as_deref().map(PathBuf::from),
-            http_api_max_payload_size: fc.http_api_max_payload_size,
-            mmds_size_limit: fc.mmds_size_limit,
-            socket_timeout: fc
-                .socket_timeout_secs
-                .map_or(Self::DEFAULT_SOCKET_TIMEOUT, Duration::from_secs),
-            resource_limits: fc
-                .jailer
-                .as_ref()
-                .map(|jc| jc.resource_limits.clone())
-                .unwrap_or_default(),
-        }
-    }
-}
-
 fn default_pool_size() -> usize {
     1
 }
@@ -114,12 +67,6 @@ fn default_pool_size() -> usize {
 fn default_warm_create() -> bool {
     true
 }
-
-/// How the pool-IP <-> fixed-guest-IP translation of an invariant sandbox TAP
-/// (CORE-81) is applied host-side — the TAP network's own
-/// [`arcbox_tap_net::Datapath`], under the name this config has always
-/// used.
-pub use arcbox_tap_net::Datapath as SandboxDatapath;
 
 /// Network IP-pool settings for sandbox TAP interfaces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,16 +102,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             firecracker: FirecrackerConfig {
-                binary: "/usr/bin/firecracker".into(),
                 jailer: None,
                 data_dir: "/var/lib/firecracker-vmm".into(),
-                log_level: None,
-                no_seccomp: false,
-                seccomp_filter: None,
-                http_api_max_payload_size: None,
-                mmds_size_limit: None,
-                socket_timeout_secs: None,
-                sandbox_datapath: SandboxDatapath::default(),
                 pool_size: default_pool_size(),
                 warm_create: default_warm_create(),
                 dmsetup_candidates: None,
@@ -208,16 +147,14 @@ mod tests {
         assert_eq!(cfg.defaults.memory_mib, 512);
         assert!(cfg.defaults.boot_args.contains("console=ttyS0"));
         assert!(!cfg.network.cidr.is_empty());
-        assert!(!cfg.firecracker.binary.is_empty());
+        assert!(!cfg.firecracker.data_dir.is_empty());
     }
 
     #[test]
     fn pool_size_defaults_to_one_spare_slot() {
         assert_eq!(RuntimeConfig::default().firecracker.pool_size, 1);
         // A config written before the knob existed still loads with the default.
-        let cfg: FirecrackerConfig =
-            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
-                .unwrap();
+        let cfg: FirecrackerConfig = toml::from_str("data_dir = \"/var/lib/vmm\"\n").unwrap();
         assert_eq!(cfg.pool_size, 1);
     }
 
@@ -225,15 +162,11 @@ mod tests {
     fn warm_create_defaults_on_and_parses_the_escape_hatch() {
         assert!(RuntimeConfig::default().firecracker.warm_create);
         // A config written before the knob existed still loads with the default.
-        let cfg: FirecrackerConfig =
-            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
-                .unwrap();
+        let cfg: FirecrackerConfig = toml::from_str("data_dir = \"/var/lib/vmm\"\n").unwrap();
         assert!(cfg.warm_create);
         // The escape hatch is reachable by config alone.
-        let cfg: FirecrackerConfig = toml::from_str(
-            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nwarm_create = false\n",
-        )
-        .unwrap();
+        let cfg: FirecrackerConfig =
+            toml::from_str("data_dir = \"/var/lib/vmm\"\nwarm_create = false\n").unwrap();
         assert!(!cfg.warm_create);
     }
 
@@ -241,13 +174,11 @@ mod tests {
     fn dmsetup_candidates_absent_is_none_and_explicit_lists_parse_as_written() {
         // A config written before the field existed still loads; the
         // absence is preserved so the composer can supply its own list.
-        let cfg: FirecrackerConfig =
-            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
-                .unwrap();
+        let cfg: FirecrackerConfig = toml::from_str("data_dir = \"/var/lib/vmm\"\n").unwrap();
         assert_eq!(cfg.dmsetup_candidates, None);
         // An explicit list is used exactly as written.
         let cfg: FirecrackerConfig = toml::from_str(
-            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n\
+            "data_dir = \"/var/lib/vmm\"\n\
              dmsetup_candidates = [\"/opt/arcbox/dmsetup\", \"/sbin/dmsetup\"]\n",
         )
         .unwrap();
@@ -262,76 +193,11 @@ mod tests {
         );
         // An empty list is a deliberate "no dmsetup" — CoW off.
         let cfg: FirecrackerConfig = toml::from_str(
-            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n\
+            "data_dir = \"/var/lib/vmm\"\n\
              dmsetup_candidates = []\n",
         )
         .unwrap();
         assert_eq!(cfg.dmsetup_candidates.as_deref(), Some(&[][..]));
-    }
-
-    #[test]
-    fn sandbox_datapath_defaults_to_ebpf_and_parses_the_fallback() {
-        assert_eq!(
-            RuntimeConfig::default().firecracker.sandbox_datapath,
-            SandboxDatapath::Ebpf
-        );
-        // A config written before the knob existed still loads with the default.
-        let cfg: FirecrackerConfig =
-            toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
-                .unwrap();
-        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Ebpf);
-        // The fallback is reachable by config alone.
-        let cfg: FirecrackerConfig = toml::from_str(
-            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nsandbox_datapath = \"filter\"\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Filter);
-        // And under the name it had while iptables was the only rendering —
-        // a node's config file predates the nftables backend.
-        let cfg: FirecrackerConfig = toml::from_str(
-            "binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\nsandbox_datapath = \"iptables\"\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.sandbox_datapath, SandboxDatapath::Filter);
-    }
-
-    #[test]
-    fn driver_config_takes_the_process_flags_and_the_jailer_binary() {
-        let mut fc = RuntimeConfig::default().firecracker;
-        assert_eq!(
-            FcDriverConfig::from(&fc),
-            FcDriverConfig::new("/usr/bin/firecracker")
-        );
-
-        fc.jailer = Some(JailerConfig {
-            binary: "/usr/bin/jailer".into(),
-            uid: 0,
-            gid: 0,
-            chroot_base_dir: None,
-            netns: None,
-            new_pid_ns: false,
-            cgroup_version: None,
-            parent_cgroup: None,
-            resource_limits: vec!["fsize=2048".into()],
-        });
-        fc.log_level = Some("Error".into());
-        fc.no_seccomp = true;
-        fc.seccomp_filter = Some("/etc/fc/seccomp.bpf".into());
-        fc.http_api_max_payload_size = Some(1 << 20);
-        fc.mmds_size_limit = Some(4096);
-        fc.socket_timeout_secs = Some(15);
-        let driver = FcDriverConfig::from(&fc);
-        assert_eq!(driver.jailer_binary, Some(PathBuf::from("/usr/bin/jailer")));
-        assert_eq!(driver.log_level.as_deref(), Some("Error"));
-        assert!(driver.no_seccomp);
-        assert_eq!(
-            driver.seccomp_filter,
-            Some(PathBuf::from("/etc/fc/seccomp.bpf"))
-        );
-        assert_eq!(driver.http_api_max_payload_size, Some(1 << 20));
-        assert_eq!(driver.mmds_size_limit, Some(4096));
-        assert_eq!(driver.socket_timeout, Duration::from_secs(15));
-        assert_eq!(driver.resource_limits, vec!["fsize=2048".to_string()]);
     }
 
     #[test]

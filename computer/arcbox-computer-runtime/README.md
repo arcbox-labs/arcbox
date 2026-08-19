@@ -57,7 +57,13 @@ let (id, ip) = manager
 `RuntimeConfig` loads from TOML (`RuntimeConfig::from_file`) or is built
 programmatically; `[firecracker]`, `[network]`, and `[defaults]` are the
 sections that matter, and `[firecracker.jailer]` opts into jailer mode.
-See `config.rs` for the fields.
+See `config/runtime.rs` for the fields.
+
+`[firecracker]` is named for the VMM a deployed `vmm.toml` has always run,
+not for anything this crate knows: the keys that configure a VMM adapter
+live in the same section and are read by whoever builds it (for the System
+VM, `arcbox_agent::config::AdapterConfig`). serde ignores unknown fields,
+so one section serves both halves.
 
 What the stack needs from its *environment* — the pieces that differ
 between the System VM's busybox userland and a stock distro — is a

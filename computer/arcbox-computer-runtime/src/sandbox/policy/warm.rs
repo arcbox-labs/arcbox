@@ -243,7 +243,6 @@ mod tests {
     fn warm_config() -> RuntimeConfig {
         let mut config = RuntimeConfig::default();
         config.firecracker.jailer = Some(JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: 0,
             gid: 0,
             chroot_base_dir: None,
@@ -251,7 +250,6 @@ mod tests {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec![],
         });
         config
     }

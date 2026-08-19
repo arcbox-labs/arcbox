@@ -1516,7 +1516,6 @@ mod tests {
         let mut config = RuntimeConfig::default();
         config.network.dns = vec!["1.1.1.1".into()];
         config.firecracker.jailer = Some(crate::config::JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: 0,
             gid: 0,
             chroot_base_dir: None,
@@ -1524,7 +1523,6 @@ mod tests {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec![],
         });
         let written = SandboxStateRecord::new(
             "box",
@@ -2799,7 +2797,6 @@ mod tests {
             let mut config = RuntimeConfig::default();
             config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
             config.firecracker.jailer = Some(crate::config::JailerConfig {
-                binary: "/usr/bin/jailer".into(),
                 uid: 0,
                 gid: 0,
                 chroot_base_dir: Some(data_dir.path().join("jail").to_string_lossy().into_owned()),
@@ -2807,7 +2804,6 @@ mod tests {
                 new_pid_ns: false,
                 cgroup_version: None,
                 parent_cgroup: None,
-                resource_limits: vec![],
             });
             let isolation = super::super::isolation_spec(&config).unwrap();
 

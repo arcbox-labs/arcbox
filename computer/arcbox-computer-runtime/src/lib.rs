@@ -82,9 +82,7 @@ pub use arcbox_tap_net as network;
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-pub use config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxDatapath,
-};
+pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
 pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    NodeEnvironment, RootfsBuilder, RootfsPaths, RuntimeConfig, SandboxManager, SandboxMountSpec,
+    NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmError,
 };
 use arcbox_connect::sandbox_v1;
@@ -29,6 +29,7 @@ use arcbox_tap_net::{IptablesLegacy, TapNetwork};
 use buffa::Message;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+use crate::config::GuestConfig;
 use crate::create_registry::{CreateRegistry, Reserve as CreateReserve};
 use crate::error::SandboxError;
 
@@ -114,39 +115,40 @@ pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
 /// the System VM. This is where they are built: `SandboxManager::new`
 /// builds none of them, so the choice of VMM is made here.
 ///
-/// Four components, each from `config`:
+/// Four components, out of the two halves of `config`:
 ///
-/// - the Firecracker driver over the `[firecracker]` binaries and
+/// - the Firecracker driver over the adapter half's binaries and
 ///   process-level flags ([`FcDriverConfig`]);
-/// - the Linux TAP network over the `[network]` pool, with its quarantine
-///   ledger under the data dir, the configured datapath, and
-///   iptables-legacy for the netfilter rendering of the invariant
-///   translation — which is the `Filter` datapath itself and what the
-///   `Ebpf` one falls back to;
+/// - the Linux TAP network over the runtime half's `[network]` pool, with
+///   its quarantine ledger under the data dir, the adapter half's
+///   datapath, and iptables-legacy for the netfilter rendering of the
+///   invariant translation — which is the `Filter` datapath itself and
+///   what the `Ebpf` one falls back to;
 /// - the `arcbox-vm-proto` guest-agent client, which every Firecracker
 ///   sandbox speaks;
 /// - the copy-on-write rootfs manager over the data dir, `block_tools`, and
-///   the config's `dmsetup` search list.
+///   the runtime half's `dmsetup` search list.
 pub fn node_environment(
-    config: &RuntimeConfig,
+    config: &GuestConfig,
     block_tools: Arc<dyn BlockTools>,
 ) -> anyhow::Result<NodeEnvironment> {
-    let data_dir = std::path::Path::new(&config.firecracker.data_dir);
+    let runtime = &config.runtime;
+    let data_dir = std::path::Path::new(&runtime.firecracker.data_dir);
     let network = TapNetwork::with_quarantine_dir(
-        &config.network.cidr,
-        &config.network.gateway,
-        config.network.dns.clone(),
+        &runtime.network.cidr,
+        &runtime.network.gateway,
+        runtime.network.dns.clone(),
         data_dir.join("sandbox-network-quarantine"),
-        config.firecracker.sandbox_datapath,
+        config.adapters.sandbox_datapath,
         Arc::new(IptablesLegacy::default()),
     )?;
     let mut cow_options = CowOptions::new(data_dir);
     cow_options.block_tools = block_tools;
-    if let Some(candidates) = &config.firecracker.dmsetup_candidates {
+    if let Some(candidates) = &runtime.firecracker.dmsetup_candidates {
         cow_options.dmsetup_candidates = candidates.iter().map(std::path::PathBuf::from).collect();
     }
     Ok(NodeEnvironment {
-        driver: Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))),
+        driver: Arc::new(FcDriver::new(FcDriverConfig::from(&config.adapters))),
         network: Arc::new(network),
         agent: Arc::new(VmProtoAgentFactory::default()),
         cow_manager: Arc::new(CowManager::new(cow_options)?),
@@ -192,8 +194,8 @@ impl SandboxService {
     }
 
     /// Create a new [`SandboxService`] from the given config.
-    pub fn new(config: RuntimeConfig) -> anyhow::Result<Self> {
-        let default_rootfs = config.defaults.rootfs.clone();
+    pub fn new(config: GuestConfig) -> anyhow::Result<Self> {
+        let default_rootfs = config.runtime.defaults.rootfs.clone();
         // The rootfs builder shares the environment's block tooling so both
         // mount through the same busybox.
         let block_tools = block_tools();
@@ -201,7 +203,7 @@ impl SandboxService {
         let environment = node_environment(&config, block_tools)?;
         // `into_shared` starts the lifecycle monitor driving the idle/TTL
         // expiry timers (CORE-21/60).
-        let manager = SandboxManager::new(config, environment)
+        let manager = SandboxManager::new(config.runtime, environment)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_shared();
         let creates = Arc::new(CreateRegistry::default());
