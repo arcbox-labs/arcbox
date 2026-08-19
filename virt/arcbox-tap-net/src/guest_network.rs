@@ -155,7 +155,7 @@ impl GuestNetwork for TapNetwork {
     }
 
     /// An IPv6 address cannot have come from this pool, so there is
-    /// nothing to withhold — the same reasoning [`TapNetwork::allocation`]
+    /// nothing to withhold — the same reasoning `TapNetwork::allocation`
     /// refuses one on, without an error to report to a caller that has no
     /// answer for it.
     fn hold_address(&self, address: IpAddr) {
