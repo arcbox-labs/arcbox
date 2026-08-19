@@ -18,9 +18,15 @@ arcbox-daemon  ──vsock──►  arcbox-agent        ──vsock──►  v
                                     └── arcbox-vm-proto ──┘
 ```
 
-`arcbox-agent` is this crate's only consumer: it owns the `sandbox.v1`
+`arcbox-agent` is the consumer of the whole crate: it owns the `sandbox.v1`
 surface and the vsock transport, and calls `SandboxManager` underneath.
 There are no service implementations, no tonic, and no daemon here.
+
+`RootfsBuilder` has a second, narrower consumer: whatever produces a node's
+Computer images, which needs `build_rootfs` and nothing else here. That is
+deliberate — an image's boot convention is defined by what boots it, so it
+belongs on this side of the seam rather than being restated by each
+producer.
 
 The **`vm-agent`** binary that becomes PID 1 *inside* each sandbox is a
 separate crate, [`arcbox-vm-agent`](../../virt/arcbox-vm-agent); the wire
@@ -30,11 +36,19 @@ crate and the agent each depend on the proto crate and never on each
 other, so the agent stays a small static musl binary no matter what the
 manager pulls in. `boot_proto` and `file_proto` stay reachable here as
 re-exports. `RootfsBuilder` (this crate) stages the binary into every
-sandbox rootfs at `/sbin/vm-agent` — OCI/overlay2 → ext4 conversion plus
-the default busybox image, with the agent binary source, the cache
-directory, and the busybox supplied by the composer as `RootfsPaths`. The
-rootfs convention the boot protocol relies on is therefore implemented
-once, here.
+rootfs at `VM_AGENT_PATH` — three build paths (a caller-sized, caller-named
+image; the cached sandbox-template conversion; the default busybox image)
+over the agent binary source, cache directory and busybox the composer
+supplies as `RootfsPaths`. The rootfs convention the boot protocol relies
+on is therefore implemented once, here: the agent at that path,
+`/etc/resolv.conf` symlinked into the `/run` tmpfs, and `init=` naming the
+agent — a converted image keeps the distro's own `/sbin/init`, so the
+kernel command line is what makes the agent PID 1.
+
+Capacity is the caller's, in whole `ROOTFS_CAPACITY_GRANULARITY` units:
+`arcbox-ext4` rounds an image's declared block count up to a whole block
+group, and anything short of one declares more blocks than the file holds
+and cannot be mounted at all.
 
 ## Usage
 

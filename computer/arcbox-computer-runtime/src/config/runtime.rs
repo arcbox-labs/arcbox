@@ -95,6 +95,11 @@ pub struct DefaultVmConfig {
     pub memory_mib: u64,
     pub kernel: String,
     pub rootfs: String,
+    /// Kernel command line. It must select `vm-agent` as PID 1 with an
+    /// `init=` naming [`VM_AGENT_PATH`](crate::VM_AGENT_PATH): an image
+    /// converted from a registry reference keeps the distro's own
+    /// `/sbin/init`, so nothing else makes the agent PID 1 and the boot ends
+    /// somewhere the runtime cannot reach.
     pub boot_args: String,
 }
 
@@ -122,7 +127,10 @@ impl Default for RuntimeConfig {
                 memory_mib: 512,
                 kernel: "/var/lib/firecracker-vmm/kernels/vmlinux".into(),
                 rootfs: "/var/lib/firecracker-vmm/images/ubuntu-22.04.ext4".into(),
-                boot_args: "console=ttyS0 reboot=k panic=1 pci=off".into(),
+                boot_args: format!(
+                    "console=ttyS0 reboot=k panic=1 pci=off init={}",
+                    crate::rootfs::VM_AGENT_PATH
+                ),
             },
         }
     }
@@ -146,6 +154,14 @@ mod tests {
         assert_eq!(cfg.defaults.vcpus, 1);
         assert_eq!(cfg.defaults.memory_mib, 512);
         assert!(cfg.defaults.boot_args.contains("console=ttyS0"));
+        // Without it the guest runs the image's own init, not the agent.
+        assert!(
+            cfg.defaults
+                .boot_args
+                .contains(&format!("init={}", crate::rootfs::VM_AGENT_PATH)),
+            "the default command line must select vm-agent as PID 1: {}",
+            cfg.defaults.boot_args
+        );
         assert!(!cfg.network.cidr.is_empty());
         assert!(!cfg.firecracker.data_dir.is_empty());
     }

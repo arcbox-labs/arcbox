@@ -9,7 +9,7 @@ use arcbox_ext4::{FormatOptions, Formatter};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::{RootfsBuilder, has_ext4_magic, rootfs_err};
+use super::{RootfsBuilder, VM_AGENT_PATH, has_ext4_magic, rootfs_err};
 
 /// Capacity of the default busybox rootfs image. The image file is written
 /// sparsely; per-sandbox writes land in the dm-snapshot COW overlay, so this
@@ -209,7 +209,7 @@ fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
     let mut vm_agent = std::fs::File::open(&spec.vm_agent)
         .with_context(|| format!("failed to open {}", spec.vm_agent.display()))?;
     fmt.create(
-        "/sbin/vm-agent",
+        VM_AGENT_PATH,
         EXE,
         None,
         None,
@@ -218,8 +218,9 @@ fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
         None,
         None,
     )
-    .context("write /sbin/vm-agent")?;
-    // Fallback for boot args that omit init=: PID 1 is still vm-agent.
+    .with_context(|| format!("write {VM_AGENT_PATH}"))?;
+    // Fallback for boot args that omit init=: PID 1 is still vm-agent. Only
+    // this image can offer it — a converted one keeps the distro's init.
     fmt.create(
         "/sbin/init",
         LNK,

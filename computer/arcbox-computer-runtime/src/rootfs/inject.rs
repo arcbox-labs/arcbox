@@ -96,15 +96,16 @@ impl RootfsBuilder {
         injected
     }
 
-    /// Copy the agent to `/sbin/vm-agent` (mode 755) and point
-    /// `/etc/resolv.conf` at the `/run` tmpfs inside the mounted image.
+    /// Copy the agent to [`VM_AGENT_PATH`](super::VM_AGENT_PATH) (mode 755)
+    /// and point `/etc/resolv.conf` at the `/run` tmpfs inside the mounted
+    /// image.
     #[cfg(target_os = "linux")]
     async fn write_agent_into(&self, mount_dir: &Path) -> Result<()> {
-        let sbin = mount_dir.join("sbin");
-        let dest = sbin.join("vm-agent");
-        tokio::fs::create_dir_all(&sbin)
+        let dest = super::agent_path_in(mount_dir);
+        let sbin = dest.parent().unwrap_or(mount_dir);
+        tokio::fs::create_dir_all(sbin)
             .await
-            .context("failed to create /sbin in rootfs")?;
+            .with_context(|| format!("failed to create {} in rootfs", sbin.display()))?;
         tokio::fs::copy(&self.paths().vm_agent, &dest)
             .await
             .context("failed to copy vm-agent into rootfs")?;

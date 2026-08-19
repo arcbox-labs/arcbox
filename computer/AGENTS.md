@@ -59,6 +59,21 @@ restructure plan and its locked decisions live in the company repo:
   vm-stack-redesign R3 moved it here; the in-sandbox init is
   `arcbox-vm-agent` and the wire vocabulary `arcbox-vm-proto`, both still
   under `virt/`. Its own README has the crate map.
+  - **`RootfsBuilder` has a consumer outside this repo** — a node's
+    Computer image production (PLAT-137) calls `build_rootfs` and
+    `inject_vm_agent`, so the rootfs boot convention is this crate's to
+    define and nobody else's to restate: the agent at `VM_AGENT_PATH`,
+    `/etc/resolv.conf` symlinked into the `/run` tmpfs, and `init=`
+    naming that path because a converted image keeps the distro's own
+    `/sbin/init`. Capacity is the caller's but only in whole
+    `ROOTFS_CAPACITY_GRANULARITY` (128 MiB) units — `arcbox-ext4` rounds
+    an image's declared block count up to a whole ext4 block group, and
+    anything short of one declares more blocks than its file holds and
+    cannot be mounted (`EXT4-fs: bad geometry`, surfacing as a bare
+    `EINVAL`). The two capacities this crate picks for itself are 512 MiB
+    and each has a test pinning it to that rule; the sandbox-template
+    one is deliberately absent from the cache key, whose stem the
+    template catalog reads as a digest input.
   - **It names no adapter at all** — the last two edges
     (`arcbox-fc-driver`, `arcbox-tap-net`) died in R3's PR-G5 and their
     `EXCEPTIONS` entries with them, so `cargo xtask check-layers` now

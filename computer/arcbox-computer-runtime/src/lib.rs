@@ -5,7 +5,10 @@
 //! This crate runs **inside** the Linux guest VM, managing nested microVMs
 //! for workload isolation (sandboxes) through a `VmDriver`
 //! (`arcbox_vm_driver`) — the reference driver is `arcbox-fc-driver`,
-//! Firecracker. It is consumed exclusively by `arcbox-agent`.
+//! Firecracker. `arcbox-agent` consumes all of it; a node's own image
+//! production consumes [`RootfsBuilder`] alone, which is why the boot
+//! convention an image must carry lives there rather than in whatever
+//! produces one.
 //!
 //! The **host-side** VMM that boots the guest is [`arcbox-vmm`], which sits on
 //! top of `arcbox-hypervisor` (Virtualization.framework on macOS, KVM on
@@ -35,8 +38,10 @@
 //! - [`agent`] — the guest-agent port: how the runtime reaches the agent
 //!   inside a Computer (exec, files, clock, readiness), with the
 //!   `arcbox-vm-proto` vsock client as its one implementation
-//! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
-//!   and the default busybox image; the composer supplies [`RootfsPaths`]
+//! - [`RootfsBuilder`] — image → ext4 with [`VM_AGENT_PATH`] injected: one
+//!   the caller sizes and names ([`RootfsSpec`]), the cached sandbox-template
+//!   conversion, and the default busybox image; the composer supplies
+//!   [`RootfsPaths`]
 //! - [`SandboxState`] — a computer's public lifecycle state
 //! - [`RuntimeConfig`] / [`SandboxSpec`] — configuration types
 //!
@@ -84,6 +89,7 @@ pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};
 pub use rootfs::{
     ROOTFS_CAPACITY_GRANULARITY, RootfsBuilder, RootfsPaths, RootfsSource, RootfsSpec,
+    VM_AGENT_PATH,
 };
 pub use sandbox::pause_reason;
 pub use sandbox::{

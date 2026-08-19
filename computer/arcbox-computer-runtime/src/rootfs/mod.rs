@@ -62,6 +62,19 @@ pub struct RootfsPaths {
     pub busybox: PathBuf,
 }
 
+/// Where `vm-agent` lands in every image this module builds, and therefore
+/// what a Computer's `init=` boot argument must name.
+///
+/// A converted image keeps its own `/sbin/init` — the distro's — so the boot
+/// argument is the only thing that makes the agent PID 1. Naming it here is
+/// what keeps a composer from restating the path.
+pub const VM_AGENT_PATH: &str = "/sbin/vm-agent";
+
+/// [`VM_AGENT_PATH`] resolved against a mounted image's root.
+fn agent_path_in(root: &Path) -> PathBuf {
+    root.join(VM_AGENT_PATH.trim_start_matches('/'))
+}
+
 /// The granularity every image's capacity must respect.
 ///
 /// 128 MiB is one whole ext4 block group at the 4 KiB block size
