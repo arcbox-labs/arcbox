@@ -8,10 +8,11 @@ repository.workspace = true
 description       = "Sandbox orchestration over nested microVMs behind the arcbox-vm-driver port: boot, exec, files, checkpoints, warm pools. The in-sandbox init is arcbox-vm-agent; the wire vocabulary is arcbox-vm-proto."
 
 [features]
-# The agent-port fake: `FakeAgentFactory`, which with the driver port's
-# `FakeDriver` and `FakeNetwork` runs the real boot path with no VMM. Off
-# by default so production builds carry none of it.
-testkit = []
+# The agent-port fake: `FakeAgentFactory`, and `fake_environment`, which
+# composes it with the driver port's `FakeDriver` and `FakeNetwork` to run
+# the real boot path with no VMM. Off by default so production builds
+# carry none of it.
+testkit = ["arcbox-vm-driver/testkit"]
 
 [dependencies]
 arcbox-atomic-file.workspace = true

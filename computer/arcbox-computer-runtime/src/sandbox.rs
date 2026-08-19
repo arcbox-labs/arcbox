@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 use arcbox_vm_driver::net::{
     AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
     NetworkReconcile,
@@ -28,9 +27,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-use crate::agent::{GuestAgent, GuestAgentFactory, Readiness, VmProtoAgentFactory};
+use crate::agent::{GuestAgent, Readiness};
 use crate::config::VmmConfig;
-use crate::environment::SandboxEnvironment;
+use crate::environment::NodeEnvironment;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Mailbox, Seeded,
@@ -38,9 +37,8 @@ use crate::lifecycle::actor::{
 use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::flows::{BootLaunch, ComputerFlows, ComputerServices, Launch, RestoreLaunch};
 use crate::lifecycle::runtime::{ComputerRuntime, Runtime};
-use crate::network::NetworkManager;
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
-use crate::snapshot_cow::{CowHandle, CowManager, CowOptions};
+use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::template_catalog::TemplateCatalog;
 
 pub(crate) mod boot;
@@ -125,31 +123,26 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    /// Create a new manager from the given configuration, in the reference
-    /// environment ([`SandboxEnvironment::default`]).
-    pub fn new(config: VmmConfig) -> Result<Self> {
-        Self::with_environment(config, SandboxEnvironment::default())
-    }
-
-    /// Create a new manager from the given configuration, with the
+    /// Create a new manager from the given configuration, over the
     /// environment-specific components the composer supplies.
     ///
     /// Fails with [`VmmError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
-    /// ahead of the guest), `Vsock` (the guest agent is reached over it), or
-    /// whatever the agent factory's readiness gate needs (`VsockListen` for
-    /// the guest's dial-out) — or when its guest network offers no
-    /// `NetworkReconcile` (the cleanup-token protocol is how a host
-    /// releases the addresses a previous process held), so an environment
-    /// missing one is refused here instead of at the first boot or the
-    /// first cleanup ticket.
-    pub fn with_environment(config: VmmConfig, environment: SandboxEnvironment) -> Result<Self> {
-        let driver = environment.driver.unwrap_or_else(|| {
-            Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))) as Arc<dyn VmDriver>
-        });
-        let agent = environment.agent.unwrap_or_else(|| {
-            Arc::new(VmProtoAgentFactory::default()) as Arc<dyn GuestAgentFactory>
-        });
+    /// ahead of the guest), `Staging` (every flow brings its computer's
+    /// files into the area the VMM can reach), `Vsock` (the guest agent is
+    /// reached over it), or whatever the agent factory's readiness gate
+    /// needs (`VsockListen` for the guest's dial-out) — or when its guest
+    /// network offers no `NetworkReconcile` (the cleanup-token protocol is
+    /// how a host releases the addresses a previous process held), so an
+    /// environment missing one is refused here instead of at the first boot
+    /// or the first cleanup ticket.
+    pub fn new(config: VmmConfig, environment: NodeEnvironment) -> Result<Self> {
+        let NodeEnvironment {
+            driver,
+            network,
+            agent,
+            cow_manager,
+        } = environment;
         let capabilities = driver.capabilities();
         for (missing, capability, need) in [
             (
@@ -165,9 +158,8 @@ impl SandboxManager {
             ),
             // The last hard-wired transport assumption in this layer: every
             // agent implementation the crate ships reaches its guest through
-            // the VM handle. It leaves with the composition root (PR-G),
-            // which is what will know whether its Computers are dialable at
-            // all.
+            // the VM handle. A composition root that knows its Computers are
+            // not dialable at all is what will retire it.
             (
                 !capabilities.vsock,
                 "vsock",
@@ -194,17 +186,6 @@ impl SandboxManager {
             &config.firecracker.data_dir,
         ))?);
         drop(records.load_all()?);
-        let network: Arc<dyn GuestNetwork> = match environment.network {
-            Some(network) => network,
-            None => Arc::new(NetworkManager::with_quarantine_dir(
-                &config.network.cidr,
-                &config.network.gateway,
-                config.network.dns.clone(),
-                Path::new(&config.firecracker.data_dir).join("sandbox-network-quarantine"),
-                config.firecracker.sandbox_datapath,
-                environment.packet_filter,
-            )?),
-        };
         if network.reconcile().is_none() {
             return Err(VmmError::Config(
                 "guest network has no reconcile capability; the quarantine ledger is how a host \
@@ -215,22 +196,6 @@ impl SandboxManager {
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let mut cow_options = CowOptions::new(&config.firecracker.data_dir);
-        cow_options.block_tools = environment.block_tools;
-        if let Some(candidates) = &config.firecracker.dmsetup_candidates {
-            cow_options.dmsetup_candidates = candidates.iter().map(PathBuf::from).collect();
-        }
-        let cow_manager = match environment.cow_manager {
-            Some(cow_manager) => cow_manager,
-            None => Arc::new(CowManager::new(cow_options)?),
-        };
-
-        // Ensure the jailer chroot base directory exists.
-        if let Some(ref jc) = config.firecracker.jailer {
-            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            std::fs::create_dir_all(base).map_err(VmmError::Io)?;
-        }
-
         let config = Arc::new(config);
 
         // Sweep leftovers of a previous agent process (crash / respawn):
@@ -606,33 +571,32 @@ pub struct SandboxNetworkIdentity {
     pub expose: crate::network::ExposeTarget,
 }
 
-/// The guest network's cleanup protocol, which
-/// [`SandboxManager::with_environment`] requires — the quarantine ledger
-/// gates every address the pool hands out, and the startup sweep gates the
-/// pool itself.
+/// The guest network's cleanup protocol, which [`SandboxManager::new`]
+/// requires — the quarantine ledger gates every address the pool hands
+/// out, and the startup sweep gates the pool itself.
 pub(super) fn reconcile_capability(network: &dyn GuestNetwork) -> &dyn NetworkReconcile {
-    network.reconcile().expect(
-        "SandboxManager::with_environment requires the guest network's reconcile capability",
-    )
+    network
+        .reconcile()
+        .expect("SandboxManager::new requires the guest network's reconcile capability")
 }
 
-/// The driver's `Prepare` capability, which [`SandboxManager::with_environment`]
+/// The driver's `Prepare` capability, which [`SandboxManager::new`]
 /// requires — the boot, pool, and restore flows all spawn the VMM before
 /// there is a guest to run on it.
 pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
     driver
         .prepare()
-        .expect("SandboxManager::with_environment requires the driver's Prepare capability")
+        .expect("SandboxManager::new requires the driver's Prepare capability")
 }
 
-/// The prepared VM's `Staging` capability, which
-/// [`SandboxManager::with_environment`] requires — every flow that puts a
-/// guest on a VMM first brings that guest's files into the area the VMM can
-/// reach, and pause takes its disk back out of it.
+/// The prepared VM's `Staging` capability, which [`SandboxManager::new`]
+/// requires — every flow that puts a guest on a VMM first brings that
+/// guest's files into the area the VMM can reach, and pause takes its disk
+/// back out of it.
 pub(crate) fn staging_capability(prepared: &dyn PreparedVm) -> &dyn Staging {
     prepared
         .staging()
-        .expect("SandboxManager::with_environment requires the driver's Staging capability")
+        .expect("SandboxManager::new requires the driver's Staging capability")
 }
 
 /// The VMM's pid as the crash journal records it: what a restart sweep
@@ -933,6 +897,9 @@ fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
 #[cfg(test)]
 mod tests {
     use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, JAILER_CHROOT_BASE};
+    // The id-budget tests measure the real Firecracker layout: the budget
+    // is the driver's, not a constant this layer keeps a copy of.
+    use arcbox_fc_driver::{FcDriver, FcDriverConfig};
 
     use super::*;
 
@@ -957,9 +924,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
-        let environment = |driver: FakeDriver| SandboxEnvironment {
-            driver: Some(Arc::new(driver)),
-            ..SandboxEnvironment::default()
+        // The vm-proto factory, not the agent fake: only a dial-out
+        // readiness makes the driver's `vsock_listen` a requirement, which
+        // is one of the three refusals below.
+        let environment = |driver: FakeDriver| NodeEnvironment {
+            driver: Arc::new(driver),
+            agent: Arc::new(crate::agent::VmProtoAgentFactory::default()),
+            ..crate::testkit::fake_environment(&config).unwrap()
         };
         let all = FakeDriver::new().capabilities();
 
@@ -987,14 +958,14 @@ mod tests {
             ),
         ] {
             let driver = FakeDriver::builder().capabilities(capabilities).build();
-            let error = SandboxManager::with_environment(config.clone(), environment(driver))
+            let error = SandboxManager::new(config.clone(), environment(driver))
                 .err()
                 .unwrap_or_else(|| panic!("a driver without {name} is refused"));
             assert!(matches!(error, VmmError::Config(_)), "{error}");
             assert!(error.to_string().contains(name), "{error}");
         }
 
-        let manager = SandboxManager::with_environment(config, environment(FakeDriver::new()))
+        let manager = SandboxManager::new(config.clone(), environment(FakeDriver::new()))
             .expect("a driver with every needed capability is accepted");
         assert_eq!(manager.services.driver.name(), "fake");
     }

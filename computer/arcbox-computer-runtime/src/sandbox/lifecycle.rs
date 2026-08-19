@@ -835,15 +835,15 @@ mod tests {
                 ..arcbox_vm_driver::testkit::FakeDriver::new().capabilities()
             })
             .build();
-        SandboxManager::with_environment(
-            config,
-            SandboxEnvironment {
-                driver: Some(Arc::new(driver)),
-                network: Some(Arc::new(
+        SandboxManager::new(
+            config.clone(),
+            NodeEnvironment {
+                driver: Arc::new(driver),
+                network: Arc::new(
                     arcbox_vm_driver::testkit::FakeNetwork::with_startup_cleanup("test-boot"),
-                )),
-                agent: Some(Arc::new(FakeAgentFactory::new())),
-                ..SandboxEnvironment::default()
+                ),
+                agent: Arc::new(FakeAgentFactory::new()),
+                ..crate::testkit::fake_environment(&config).unwrap()
             },
         )
         .expect("a probing agent asks the driver for no listener");

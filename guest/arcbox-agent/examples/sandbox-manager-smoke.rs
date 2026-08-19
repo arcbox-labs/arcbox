@@ -81,8 +81,7 @@ async fn main() -> anyhow::Result<()> {
     // exercises the real composition rather than one of its own.
     let environment =
         arcbox_agent::sandbox::node_environment(&config, arcbox_agent::sandbox::block_tools())?;
-    let manager = SandboxManager::with_environment(config, environment)
-        .context("SandboxManager::with_environment")?;
+    let manager = SandboxManager::new(config, environment).context("SandboxManager::new")?;
 
     // Phase 1 — Core lifecycle
     println!("\n=== Phase 1: Core lifecycle ===");

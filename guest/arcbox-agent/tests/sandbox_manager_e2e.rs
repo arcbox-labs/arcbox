@@ -111,7 +111,7 @@ fn no_tap() -> SandboxSpec {
 /// suite exercises the real composition rather than one of its own.
 fn manager(cfg: VmmConfig) -> SandboxManager {
     let environment = node_environment(&cfg, block_tools()).unwrap();
-    SandboxManager::with_environment(cfg, environment).unwrap()
+    SandboxManager::new(cfg, environment).unwrap()
 }
 
 /// Complete the startup cleanup handshake for a manager backed by a fresh

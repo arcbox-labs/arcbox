@@ -7,7 +7,7 @@
 //! the driver port hands out. A Computer that is not reachable that way —
 //! no vsock device at all, or an agent that answers on its own network
 //! address — supplies another factory through
-//! [`SandboxEnvironment::agent`](crate::environment::SandboxEnvironment::agent).
+//! [`NodeEnvironment::agent`](crate::environment::NodeEnvironment::agent).
 //!
 //! Readiness is the part that differs most between transports, so it has a
 //! vocabulary of its own: [`Readiness`] says *how* a guest announces that

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    RootfsBuilder, RootfsPaths, SandboxEnvironment, SandboxManager, SandboxMountSpec,
+    NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig, VmmError,
 };
 use arcbox_connect::sandbox_v1;
@@ -110,17 +110,19 @@ pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
     )
 }
 
-/// The environment-specific components the sandbox stack runs on inside the
-/// System VM — this is the composition root the charter puts here, so that
-/// `arcbox-computer-runtime` names no VMM of its own.
+/// The environment-specific components the sandbox stack runs on inside
+/// the System VM. This is where they are built: `SandboxManager::new`
+/// builds none of them, so the choice of VMM is made here.
 ///
-/// Four components, each built from `config`:
+/// Four components, each from `config`:
 ///
 /// - the Firecracker driver over the `[firecracker]` binaries and
 ///   process-level flags ([`FcDriverConfig`]);
 /// - the Linux TAP network over the `[network]` pool, with its quarantine
-///   ledger under the data dir and iptables-legacy rendering the invariant
-///   translation where the datapath falls back to netfilter;
+///   ledger under the data dir, the configured datapath, and
+///   iptables-legacy for the netfilter rendering of the invariant
+///   translation — which is the `Filter` datapath itself and what the
+///   `Ebpf` one falls back to;
 /// - the `arcbox-vm-proto` guest-agent client, which every Firecracker
 ///   sandbox speaks;
 /// - the copy-on-write rootfs manager over the data dir, `block_tools`, and
@@ -128,7 +130,7 @@ pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
 pub fn node_environment(
     config: &VmmConfig,
     block_tools: Arc<dyn BlockTools>,
-) -> anyhow::Result<SandboxEnvironment> {
+) -> anyhow::Result<NodeEnvironment> {
     let data_dir = std::path::Path::new(&config.firecracker.data_dir);
     let network = TapNetwork::with_quarantine_dir(
         &config.network.cidr,
@@ -143,14 +145,11 @@ pub fn node_environment(
     if let Some(candidates) = &config.firecracker.dmsetup_candidates {
         cow_options.dmsetup_candidates = candidates.iter().map(std::path::PathBuf::from).collect();
     }
-    Ok(SandboxEnvironment {
-        driver: Some(Arc::new(FcDriver::new(FcDriverConfig::from(
-            &config.firecracker,
-        )))),
-        network: Some(Arc::new(network)),
-        agent: Some(Arc::new(VmProtoAgentFactory::default())),
-        cow_manager: Some(Arc::new(CowManager::new(cow_options)?)),
-        ..SandboxEnvironment::default()
+    Ok(NodeEnvironment {
+        driver: Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))),
+        network: Arc::new(network),
+        agent: Arc::new(VmProtoAgentFactory::default()),
+        cow_manager: Arc::new(CowManager::new(cow_options)?),
     })
 }
 
@@ -202,7 +201,7 @@ impl SandboxService {
         let environment = node_environment(&config, block_tools)?;
         // `into_shared` starts the lifecycle monitor driving the idle/TTL
         // expiry timers (CORE-21/60).
-        let manager = SandboxManager::with_environment(config, environment)
+        let manager = SandboxManager::new(config, environment)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_shared();
         let creates = Arc::new(CreateRegistry::default());

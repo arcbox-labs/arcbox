@@ -40,9 +40,10 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_computer_runtime::{SandboxManager, SandboxSpec, VmmConfig};
+use arcbox_computer_runtime::{NodeEnvironment, SandboxManager, SandboxSpec, VmmConfig};
 
-let manager = Arc::new(SandboxManager::new(VmmConfig::default())?);
+// `environment` is the composer's; see below.
+let manager = Arc::new(SandboxManager::new(VmmConfig::default(), environment)?);
 
 let (id, ip) = manager
     .create_sandbox(SandboxSpec {
@@ -60,33 +61,38 @@ See `config.rs` for the fields.
 
 What the stack needs from its *environment* — the pieces that differ
 between the System VM's busybox userland and a stock distro — is a
-separate input, `SandboxEnvironment`. `SandboxManager::new(config)` uses
-the reference environment (the System VM's); a composer on another host
-overrides the members it owns and calls
-`SandboxManager::with_environment(config, env)`. Today that is the VM
-driver behind `arcbox_vm_driver::VmDriver` (`None` = the Firecracker
-driver built from `[firecracker]`; whatever is supplied must claim the
-`Prepare` capability, which the boot and pool flows need), what its NICs
-attach to behind `arcbox_vm_driver::net::GuestNetwork` (`None` = the TAP
-network from `[network]`), how its guest agent is reached behind
-`agent::GuestAgentFactory` (`None` = the `arcbox-vm-proto` client over
-the driver's vsock, which also decides what the readiness gate needs from
-the driver), the loop-device tooling behind
-`arcbox_snapshot::snapshot_cow::BlockTools`
-(`BusyboxBlockTools` is the reference, `UtilLinuxBlockTools` the
-stock-distro one; an ioctl implementation is a consumer's few dozen
-lines) and the netfilter
-rendering of the identity-invariant translation behind
-`arcbox_tap_net::PacketFilter` (`IptablesLegacy` is the reference,
-`Nftables` the stock-distro one — legacy and nft rulesets are mutually
-invisible, so this is a seam, not a path); the path seams follow.
+separate input, `NodeEnvironment`, and all four members are required.
+This crate builds none of them and names no VMM: whoever composes the node
+does. For the System VM that is `arcbox_agent::sandbox::node_environment`.
+
+- `driver` — the VMM behind `arcbox_vm_driver::VmDriver`. It must claim
+  `Prepare` and `Staging` and offer `vsock`, or `SandboxManager::new`
+  refuses it.
+- `network` — what the NICs attach to, behind
+  `arcbox_vm_driver::net::GuestNetwork`. It must offer `NetworkReconcile`.
+- `agent` — how the guest agent is reached, behind
+  `agent::GuestAgentFactory`. The reference is the `arcbox-vm-proto`
+  client over the driver's vsock, which also decides what the readiness
+  gate needs from the driver.
+- `cow_manager` — the copy-on-write rootfs manager
+  (`arcbox_snapshot::snapshot_cow::CowManager`), built over the composer's
+  own loop-device tooling: `BusyboxBlockTools` in the System VM,
+  `UtilLinuxBlockTools` on a stock distro, or a consumer's own few dozen
+  lines of ioctls.
+
+`testkit::fake_environment` (feature `testkit`) is those four over the
+port's fakes, for tests that must not need a VMM.
 
 The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
 invariant NAT (eBPF TCX or netfilter), and the quarantine ledger — is
 [`arcbox-tap-net`](../../virt/arcbox-tap-net), the Linux adapter of the
-`arcbox-vm-driver` `GuestNetwork` port; `arcbox_computer_runtime::network`
-re-exports it and `NetworkManager` is an alias of its `TapNetwork` until
-the manager moves onto the port.
+`arcbox-vm-driver` `GuestNetwork` port; the composer builds it, and
+`arcbox_computer_runtime::network` re-exports the crate for the System
+VM's own port-forward and init code. Rendering the invariant translation
+in the host's netfilter framework is that adapter's own seam
+(`arcbox_tap_net::PacketFilter`: `IptablesLegacy` in the System VM,
+`Nftables` on a stock distro — legacy and nft rulesets are mutually
+invisible), so it is an argument to the network, not a member here.
 
 ## Build and test
 
