@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use arcbox_agent::error::SandboxError;
 use arcbox_agent::sandbox::SandboxService;
-use arcbox_computer_runtime::VmmConfig;
+use arcbox_computer_runtime::RuntimeConfig;
 use arcbox_computer_runtime::config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
 };
@@ -19,14 +19,14 @@ fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("required env var is missing: {name}"))
 }
 
-fn test_config() -> VmmConfig {
+fn test_config() -> RuntimeConfig {
     let firecracker = required_env("FC_BINARY");
     let kernel = required_env("FC_KERNEL");
     let rootfs = required_env("FC_ROOTFS");
 
     let data_dir = format!("/tmp/arcbox-agent-test-{}", std::process::id());
 
-    VmmConfig {
+    RuntimeConfig {
         firecracker: FirecrackerConfig {
             binary: firecracker,
             jailer: None,

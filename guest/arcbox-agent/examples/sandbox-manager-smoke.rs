@@ -42,7 +42,8 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use arcbox_computer_runtime::{
-    RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState, config::VmmConfig,
+    RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState,
+    config::RuntimeConfig,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -70,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let run_phase2 = std::env::var("ARCBOX_SMOKE_RUN").is_ok_and(|v| v == "1");
     let run_phase3 = std::env::var("ARCBOX_SMOKE_CHECKPOINT").is_ok_and(|v| v == "1");
 
-    let config = VmmConfig::from_file(&config_path)
+    let config = RuntimeConfig::from_file(&config_path)
         .with_context(|| format!("load config from {config_path}"))?;
 
     // Save network config before consuming config.

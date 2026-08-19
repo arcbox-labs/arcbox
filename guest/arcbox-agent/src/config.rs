@@ -1,13 +1,13 @@
 //! VMM configuration loading for the guest agent.
 //!
-//! Loads [`VmmConfig`] for the embedded [`SandboxManager`] that runs inside
+//! Loads [`RuntimeConfig`] for the embedded [`SandboxManager`] that runs inside
 //! the guest VM.  The load priority is:
 //!
 //! 1. `ARCBOX_VMM_CONFIG` environment variable (path to TOML file)
 //! 2. `/etc/arcbox/vmm.toml`
 //! 3. Built-in guest defaults
 
-use arcbox_computer_runtime::VmmConfig;
+use arcbox_computer_runtime::RuntimeConfig;
 use arcbox_computer_runtime::config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
 };
@@ -18,7 +18,7 @@ pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
 
 /// Guest-specific VMM configuration defaults.
 ///
-/// These differ from [`VmmConfig::default()`] which targets the host-side
+/// These differ from [`RuntimeConfig::default()`] which targets the host-side
 /// daemon. Paths follow the guest view of host assets:
 ///
 /// - Boot-manifest binaries are materialized onto the guest Btrfs data disk
@@ -26,10 +26,10 @@ pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
 /// - The default sandbox rootfs is auto-built by the agent (busybox +
 ///   vm-agent, see `RootfsBuilder::ensure_default_rootfs`) on the writable
 ///   btrfs data volume.
-fn guest_defaults() -> VmmConfig {
+fn guest_defaults() -> RuntimeConfig {
     let runtime_bin = std::path::Path::new(ARCBOX_RUNTIME_BIN_DIR);
     let runtime_root = std::path::Path::new(ARCBOX_RUNTIME_DIR);
-    VmmConfig {
+    RuntimeConfig {
         firecracker: FirecrackerConfig {
             binary: runtime_bin.join("firecracker").to_string_lossy().into(),
             jailer: Some(arcbox_computer_runtime::config::JailerConfig {
@@ -97,7 +97,7 @@ fn guest_dmsetup_candidates() -> Vec<String> {
 /// written before the field existed — gets the search order the guest has
 /// always used, host-shared copy first. A config that spells the list out
 /// is taken as written, including `[]` to run without CoW.
-fn with_guest_environment(mut cfg: VmmConfig) -> VmmConfig {
+fn with_guest_environment(mut cfg: RuntimeConfig) -> RuntimeConfig {
     cfg.firecracker
         .dmsetup_candidates
         .get_or_insert_with(guest_dmsetup_candidates);
@@ -107,11 +107,11 @@ fn with_guest_environment(mut cfg: VmmConfig) -> VmmConfig {
 /// Load the VMM configuration for the guest agent.
 ///
 /// Priority: `ARCBOX_VMM_CONFIG` env var → `/etc/arcbox/vmm.toml` → guest defaults.
-pub fn load() -> VmmConfig {
+pub fn load() -> RuntimeConfig {
     // 1. Environment variable override.
     if let Ok(path) = std::env::var("ARCBOX_VMM_CONFIG") {
         if !path.is_empty() {
-            match VmmConfig::from_file(&path) {
+            match RuntimeConfig::from_file(&path) {
                 Ok(cfg) => {
                     tracing::info!(path, "loaded VMM config from ARCBOX_VMM_CONFIG");
                     return with_guest_environment(cfg);
@@ -126,7 +126,7 @@ pub fn load() -> VmmConfig {
     // 2. Well-known guest config file.
     const GUEST_CONFIG_PATH: &str = "/etc/arcbox/vmm.toml";
     if std::path::Path::new(GUEST_CONFIG_PATH).exists() {
-        match VmmConfig::from_file(GUEST_CONFIG_PATH) {
+        match RuntimeConfig::from_file(GUEST_CONFIG_PATH) {
             Ok(cfg) => {
                 tracing::info!(path = GUEST_CONFIG_PATH, "loaded VMM config");
                 return with_guest_environment(cfg);

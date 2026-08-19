@@ -44,7 +44,7 @@
 //!   Sandboxes reach the network only through the driver port's
 //!   `GuestNetwork`; [`NetworkManager`] is that adapter's type, not a
 //!   surface the manager speaks.
-//! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
+//! - [`RuntimeConfig`] / [`SandboxSpec`] — configuration types
 //!
 //! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
 //! manager, and the template catalog — lives in `arcbox-snapshot` in the
@@ -83,7 +83,7 @@ pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
+    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxDatapath,
 };
 pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};

@@ -40,10 +40,10 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_computer_runtime::{NodeEnvironment, SandboxManager, SandboxSpec, VmmConfig};
+use arcbox_computer_runtime::{NodeEnvironment, RuntimeConfig, SandboxManager, SandboxSpec};
 
 // `environment` is the composer's; see below.
-let manager = Arc::new(SandboxManager::new(VmmConfig::default(), environment)?);
+let manager = Arc::new(SandboxManager::new(RuntimeConfig::default(), environment)?);
 
 let (id, ip) = manager
     .create_sandbox(SandboxSpec {
@@ -54,7 +54,7 @@ let (id, ip) = manager
     .await?;
 ```
 
-`VmmConfig` loads from TOML (`VmmConfig::from_file`) or is built
+`RuntimeConfig` loads from TOML (`RuntimeConfig::from_file`) or is built
 programmatically; `[firecracker]`, `[network]`, and `[defaults]` are the
 sections that matter, and `[firecracker.jailer]` opts into jailer mode.
 See `config.rs` for the fields.

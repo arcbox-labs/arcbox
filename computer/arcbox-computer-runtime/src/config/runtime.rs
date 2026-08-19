@@ -8,9 +8,10 @@ use crate::error::{Result, VmmError};
 
 use super::JailerConfig;
 
-/// Top-level VMM daemon configuration (maps to `config.toml`).
+/// Top-level configuration of the sandbox runtime, as the composer's
+/// config file spells it out (`/etc/arcbox/vmm.toml` in the System VM).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VmmConfig {
+pub struct RuntimeConfig {
     pub firecracker: FirecrackerConfig,
     pub network: NetworkConfig,
     pub grpc: GrpcConfig,
@@ -150,7 +151,7 @@ pub struct DefaultVmConfig {
     pub boot_args: String,
 }
 
-impl Default for VmmConfig {
+impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             firecracker: FirecrackerConfig {
@@ -188,7 +189,7 @@ impl Default for VmmConfig {
     }
 }
 
-impl VmmConfig {
+impl RuntimeConfig {
     /// Load configuration from a TOML file.
     pub fn from_file(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| VmmError::Config(e.to_string()))?;
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_default_config_has_sane_values() {
-        let cfg = VmmConfig::default();
+        let cfg = RuntimeConfig::default();
         assert_eq!(cfg.defaults.vcpus, 1);
         assert_eq!(cfg.defaults.memory_mib, 512);
         assert!(cfg.defaults.boot_args.contains("console=ttyS0"));
@@ -212,7 +213,7 @@ mod tests {
 
     #[test]
     fn pool_size_defaults_to_one_spare_slot() {
-        assert_eq!(VmmConfig::default().firecracker.pool_size, 1);
+        assert_eq!(RuntimeConfig::default().firecracker.pool_size, 1);
         // A config written before the knob existed still loads with the default.
         let cfg: FirecrackerConfig =
             toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
@@ -222,7 +223,7 @@ mod tests {
 
     #[test]
     fn warm_create_defaults_on_and_parses_the_escape_hatch() {
-        assert!(VmmConfig::default().firecracker.warm_create);
+        assert!(RuntimeConfig::default().firecracker.warm_create);
         // A config written before the knob existed still loads with the default.
         let cfg: FirecrackerConfig =
             toml::from_str("binary = \"/usr/bin/firecracker\"\ndata_dir = \"/var/lib/vmm\"\n")
@@ -271,7 +272,7 @@ mod tests {
     #[test]
     fn sandbox_datapath_defaults_to_ebpf_and_parses_the_fallback() {
         assert_eq!(
-            VmmConfig::default().firecracker.sandbox_datapath,
+            RuntimeConfig::default().firecracker.sandbox_datapath,
             SandboxDatapath::Ebpf
         );
         // A config written before the knob existed still loads with the default.
@@ -296,7 +297,7 @@ mod tests {
 
     #[test]
     fn driver_config_takes_the_process_flags_and_the_jailer_binary() {
-        let mut fc = VmmConfig::default().firecracker;
+        let mut fc = RuntimeConfig::default().firecracker;
         assert_eq!(
             FcDriverConfig::from(&fc),
             FcDriverConfig::new("/usr/bin/firecracker")
@@ -335,9 +336,9 @@ mod tests {
 
     #[test]
     fn test_vmm_config_json_roundtrip() {
-        let cfg = VmmConfig::default();
+        let cfg = RuntimeConfig::default();
         let json = serde_json::to_string(&cfg).unwrap();
-        let decoded: VmmConfig = serde_json::from_str(&json).unwrap();
+        let decoded: RuntimeConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.defaults.vcpus, cfg.defaults.vcpus);
         assert_eq!(decoded.defaults.memory_mib, cfg.defaults.memory_mib);
         assert_eq!(decoded.network.cidr, cfg.network.cidr);
@@ -346,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_from_file_missing_returns_config_error() {
-        let result = VmmConfig::from_file("/nonexistent/arcbox-test-config.toml");
+        let result = RuntimeConfig::from_file("/nonexistent/arcbox-test-config.toml");
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 use crate::agent::{GuestAgent, Readiness};
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::environment::NodeEnvironment;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{
@@ -102,7 +102,7 @@ pub struct SandboxManager {
     snapshots: Arc<SnapshotCatalog>,
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
-    config: Arc<VmmConfig>,
+    config: Arc<RuntimeConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
     cow_manager: Arc<CowManager>,
     /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
@@ -136,7 +136,7 @@ impl SandboxManager {
     /// how a host releases the addresses a previous process held), so an
     /// environment missing one is refused here instead of at the first boot
     /// or the first cleanup ticket.
-    pub fn new(config: VmmConfig, environment: NodeEnvironment) -> Result<Self> {
+    pub fn new(config: RuntimeConfig, environment: NodeEnvironment) -> Result<Self> {
         let NodeEnvironment {
             driver,
             network,
@@ -615,7 +615,7 @@ pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
 
 /// The isolation every sandbox VMM runs under: the jailer's, when one is
 /// configured; none otherwise (direct mode).
-pub(crate) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
+pub(crate) fn isolation_spec(config: &RuntimeConfig) -> Result<IsolationSpec> {
     config
         .firecracker
         .jailer
@@ -626,7 +626,7 @@ pub(crate) fn isolation_spec(config: &VmmConfig) -> Result<IsolationSpec> {
 /// Where a paused computer's retained disk overlay lives: a function of the
 /// data dir and the id, which is why the flows that keep, rename, look for
 /// and delete it can all say it the same way.
-pub(crate) fn preserved_cow_file(config: &VmmConfig, id: &str) -> PathBuf {
+pub(crate) fn preserved_cow_file(config: &RuntimeConfig, id: &str) -> PathBuf {
     PathBuf::from(&config.firecracker.data_dir)
         .join("cow")
         .join(format!("arcbox-cow-{id}.img"))
@@ -720,7 +720,7 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
 pub(super) fn validate_new_sandbox_id(
     id: &str,
     driver: &dyn VmDriver,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
 ) -> Result<()> {
     VmId::new(id)?;
     if let Some(budget) = driver.id_budget(&isolation_spec(config)?)
@@ -924,7 +924,7 @@ mod tests {
         use arcbox_vm_driver::{DriverCapabilities, VmDriver as _};
 
         let dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
         // The vm-proto factory, not the agent fake: only a dial-out
         // readiness makes the driver's `vsock_listen` a requirement, which
@@ -988,8 +988,8 @@ mod tests {
 
     /// A jailed config, which is what makes a driver answer with a budget
     /// at all — the layout behind that answer is the driver's business.
-    fn jailed_config() -> VmmConfig {
-        let mut config = VmmConfig::default();
+    fn jailed_config() -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
         config.firecracker.jailer = Some(crate::config::JailerConfig {
             binary: "/usr/bin/jailer".into(),
             uid: 0,

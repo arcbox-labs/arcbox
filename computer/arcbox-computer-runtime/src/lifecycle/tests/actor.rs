@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{GuestAgent, GuestAgentFactory};
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded, WorkloadOutcome,
@@ -265,7 +265,7 @@ impl Harness {
         ));
         let (timers, timers_enabled) = watch::channel(true);
         if journal {
-            let config = VmmConfig::default();
+            let config = RuntimeConfig::default();
             let record = SandboxStateRecord::new("box", None, None, None, &config, None).unwrap();
             write_state_record(dir.path(), &record).unwrap();
         }
@@ -1138,7 +1138,7 @@ async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
     let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
     let journal =
-        SandboxStateRecord::new("box", None, None, None, &VmmConfig::default(), None).unwrap();
+        SandboxStateRecord::new("box", None, None, None, &RuntimeConfig::default(), None).unwrap();
     write_state_record(harness.dir.path(), &journal).unwrap();
 
     let record_path = harness.dir.path().join("sandbox-records").join("box.json");

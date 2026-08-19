@@ -32,7 +32,7 @@ mod tests {
     async fn force_remove_tears_down_cow_after_blocked_boot() {
         let data_dir = tempfile::tempdir().unwrap();
 
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         config.defaults.kernel = data_dir
             .path()

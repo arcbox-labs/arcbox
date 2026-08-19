@@ -169,7 +169,7 @@ impl SandboxManager {
 /// needs a catalog lookup, which is why the two halves are separate: the read
 /// borrows the actor's `watch` and the sizing must not.
 pub(super) fn paused_artifacts(
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     id: &SandboxId,
     snapshot: &ComputerSnapshot,
 ) -> PausedArtifacts {

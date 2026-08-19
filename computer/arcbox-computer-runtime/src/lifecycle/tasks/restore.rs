@@ -26,7 +26,7 @@ use arcbox_vm_driver::{
 use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory};
-use crate::config::{JailerConfig, VmmConfig};
+use crate::config::{JailerConfig, RuntimeConfig};
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox;
@@ -58,7 +58,7 @@ pub struct RestoreVm<'a> {
     /// A pre-warmed slot this restore adopted (CORE-78), when the pool had
     /// one for this checkpoint.
     pub claimed: Option<PreparedSlot>,
-    pub config: &'a VmmConfig,
+    pub config: &'a RuntimeConfig,
     pub cow_manager: &'a CowManager,
     pub driver: &'a dyn VmDriver,
     pub network: &'a dyn GuestNetwork,

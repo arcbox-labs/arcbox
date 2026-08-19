@@ -337,7 +337,7 @@ pub struct PrewarmOutcome {
 /// the cache off. Stopping restores from a bad snapshot = rebuild or delete
 /// the template.
 pub(super) fn template_restore_eligible(
-    config: &crate::config::VmmConfig,
+    config: &crate::config::RuntimeConfig,
     spec: &SandboxSpec,
     caller_supplied_boot: bool,
     warm: &crate::sandbox::TemplateWarmRef,
@@ -394,7 +394,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use crate::config::VmmConfig;
+    use crate::config::RuntimeConfig;
     use crate::sandbox::SandboxManager;
     use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
     use crate::template_catalog::{
@@ -402,7 +402,7 @@ mod tests {
     };
 
     async fn manager(data_dir: &Path) -> SandboxManager {
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
         let manager = SandboxManager::new(config, environment).unwrap();

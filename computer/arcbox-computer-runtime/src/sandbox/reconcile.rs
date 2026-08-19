@@ -54,7 +54,7 @@ use tracing::{info, warn};
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
 use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
 use super::{LeaseExt, SandboxState};
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
@@ -330,7 +330,7 @@ impl SandboxStateRecord {
         pid: Option<i32>,
         network: Option<JournaledLease<'_>>,
         cow: Option<&CowHandle>,
-        config: &VmmConfig,
+        config: &RuntimeConfig,
         restore_origin_dir: Option<&Path>,
     ) -> Result<Self> {
         let allocation = network
@@ -574,7 +574,7 @@ impl OrphanSweep {
 /// teardown → TAP release → the VM's own area, discarded through the
 /// driver → directory removal.
 pub(super) async fn sweep_orphans(
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     driver: &dyn VmDriver,
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
@@ -727,7 +727,7 @@ async fn reap_orphans(
     retained: &HashSet<String>,
     held: &HashSet<String>,
     phases: &HashMap<&str, super::record::PersistPhase>,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     driver: &dyn VmDriver,
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
@@ -1402,7 +1402,7 @@ async fn remove_dir_if_present(path: &Path) -> Result<()> {
 }
 
 fn validate_state_record(
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     sandboxes_dir: &Path,
     directory: &Path,
     record: &SandboxStateRecord,
@@ -1513,7 +1513,7 @@ mod tests {
         // everything the old shape said, field for field — including the two
         // the lease does not carry, which are reconstructed rather than
         // dropped. What adoption added is purely additive on top.
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.network.dns = vec!["1.1.1.1".into()];
         config.firecracker.jailer = Some(crate::config::JailerConfig {
             binary: "/usr/bin/jailer".into(),
@@ -1603,7 +1603,7 @@ mod tests {
             mac: "02:fc:00:00:00:07".parse().unwrap(),
             cleanup_token: "gen-1".into(),
         };
-        let config = VmmConfig::default();
+        let config = RuntimeConfig::default();
         for baked in [true, false] {
             let record = SandboxStateRecord::new(
                 "box",
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[test]
     fn cleanup_record_validation_keys_cow_resources_by_the_pool_slot() {
-        let config = VmmConfig::default();
+        let config = RuntimeConfig::default();
         let sandboxes_dir = Path::new("/var/lib/firecracker-vmm/sandboxes");
         let directory = sandboxes_dir.join("sb-1");
         let cow_for = |owner: &str| CowRecord {
@@ -1943,7 +1943,7 @@ mod tests {
         std::fs::write(&cow_file, b"overlay").unwrap();
         drop(store);
 
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
         let manager = super::super::SandboxManager::new(config, environment).unwrap();
@@ -1998,7 +1998,7 @@ mod tests {
             .unwrap();
         vm.detach().unwrap().detach().await.unwrap();
         let pid = vm.record().process.map(|process| process.pid).unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         write_state_record(
             &vm_dir,
@@ -2161,7 +2161,7 @@ mod tests {
         let vm = boot_previous_vm(&driver, &vm_dir, "keeper", case.vsock, true).await;
         let pid = vm.record().process.map(|process| process.pid).unwrap();
 
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         let store = SandboxRecordStore::new(data_dir).unwrap();
         record_in_phase(&store, "keeper", case.phase);
@@ -2258,7 +2258,7 @@ mod tests {
     #[tokio::test]
     async fn an_unusable_journal_is_skipped_and_the_sweep_goes_on() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
 
         // A journal whose id disagrees with the directory holding it, which
@@ -2311,7 +2311,7 @@ mod tests {
     #[tokio::test]
     async fn a_journal_the_port_cannot_name_is_skipped_at_the_boundary() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
 
         // Directory and id agree, and both are what a pre-#680 process
@@ -2356,7 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn a_skipped_journal_holds_its_disk_and_its_address() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
 
         // The address is the pool's next free one, so a create after the
@@ -2443,7 +2443,7 @@ mod tests {
     #[tokio::test]
     async fn a_skipped_journal_does_not_answer_for_the_id_it_claims() {
         let data_dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
 
         // Directory `broken`, journal claiming `ghost` — the disagreement
@@ -2491,7 +2491,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let driver = FakeDriver::new();
         let network = std::sync::Arc::new(FakeNetwork::new());
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
 
         let keeper_dir = data_dir.path().join("sandboxes").join("keeper");
@@ -2796,7 +2796,7 @@ mod tests {
             let probe = driver.clone();
             let network = FakeNetwork::new();
 
-            let mut config = VmmConfig::default();
+            let mut config = RuntimeConfig::default();
             config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
             config.firecracker.jailer = Some(crate::config::JailerConfig {
                 binary: "/usr/bin/jailer".into(),

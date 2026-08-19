@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager, SandboxMountSpec,
-    SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig, VmmError,
+    NodeEnvironment, RootfsBuilder, RootfsPaths, RuntimeConfig, SandboxManager, SandboxMountSpec,
+    SandboxNetworkSpec, SandboxSpec, SandboxState, VmmError,
 };
 use arcbox_connect::sandbox_v1;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
@@ -128,7 +128,7 @@ pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
 /// - the copy-on-write rootfs manager over the data dir, `block_tools`, and
 ///   the config's `dmsetup` search list.
 pub fn node_environment(
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     block_tools: Arc<dyn BlockTools>,
 ) -> anyhow::Result<NodeEnvironment> {
     let data_dir = std::path::Path::new(&config.firecracker.data_dir);
@@ -192,7 +192,7 @@ impl SandboxService {
     }
 
     /// Create a new [`SandboxService`] from the given config.
-    pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
+    pub fn new(config: RuntimeConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
         // The rootfs builder shares the environment's block tooling so both
         // mount through the same busybox.

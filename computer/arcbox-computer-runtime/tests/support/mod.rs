@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arcbox_computer_runtime::config::{JailerConfig, VmmConfig};
+use arcbox_computer_runtime::config::{JailerConfig, RuntimeConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
@@ -105,7 +105,7 @@ impl Setup {
         std::fs::write(dir.path().join("k"), b"kernel").unwrap();
         std::fs::write(dir.path().join("r.ext4"), b"rootfs").unwrap();
 
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
         config.firecracker.warm_create = self.warm;
         // A node without device-mapper, said explicitly rather than left to
@@ -153,7 +153,7 @@ struct Ports {
 }
 
 impl Ports {
-    async fn manager(&self, config: &VmmConfig) -> Arc<SandboxManager> {
+    async fn manager(&self, config: &RuntimeConfig) -> Arc<SandboxManager> {
         let manager = SandboxManager::new(
             config.clone(),
             NodeEnvironment {
@@ -190,7 +190,7 @@ impl Ports {
 pub struct Fixture {
     pub manager: Arc<SandboxManager>,
     ports: Ports,
-    config: VmmConfig,
+    config: RuntimeConfig,
     /// The data dir, kept alive for the fixture's life.
     dir: tempfile::TempDir,
 }

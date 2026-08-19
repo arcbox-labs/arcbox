@@ -27,7 +27,7 @@ use super::effect::ReleaseScope;
 use super::event::RestoreOrigin;
 use super::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure, TaskResult};
 use crate::agent::{GuestAgent, GuestAgentFactory};
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pool::SlotPool;
@@ -51,7 +51,7 @@ pub struct ComputerServices {
     pub driver: Arc<dyn VmDriver>,
     pub network: Arc<dyn GuestNetwork>,
     pub agents: Arc<dyn GuestAgentFactory>,
-    pub config: Arc<VmmConfig>,
+    pub config: Arc<RuntimeConfig>,
     pub cow_manager: Arc<CowManager>,
     pub records: Arc<SandboxRecordStore>,
     pub snapshots: Arc<SnapshotCatalog>,
