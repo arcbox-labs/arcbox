@@ -165,7 +165,9 @@ pub struct TapNetwork {
     gateway: Ipv4Addr,
     /// DNS servers.
     dns: Vec<String>,
-    /// Set of already-allocated guest IPs.
+    /// Set of already-allocated guest IPs: live leases, quarantined ones,
+    /// and addresses held by [`TapNetwork::hold_address`] for durable state
+    /// this build cannot read.
     allocated: Mutex<HashSet<u32>>,
     /// Allocations whose TAP is inactive but whose IP cannot be recycled until
     /// the host confirms its listeners are gone.
@@ -268,7 +270,10 @@ impl TapNetwork {
         let gateway = gateway
             .parse::<Ipv4Addr>()
             .map_err(|e| TapNetError::Network(format!("invalid gateway: {e}")))?;
-        let quarantined = quarantine_dir
+        let quarantine::LoadedQuarantines {
+            pending: quarantined,
+            held,
+        } = quarantine_dir
             .as_deref()
             .map(|dir| quarantine::load_quarantines(dir, base, prefix_len, gateway))
             .transpose()?
@@ -282,6 +287,14 @@ impl TapNetwork {
                 )));
             }
         }
+        // A marker this build could not act on still names an address, and
+        // a guest may still be on it. Held, not quarantined: `next_ip`
+        // skips it, while `pending_quarantines` never lists it and
+        // `finalize_startup_cleanup` never waits on a cleanup nothing could
+        // perform. A collision with a readable marker's address is a set
+        // union, not a duplicate — the readable one is the actionable
+        // record of the two, and both want the same address kept.
+        allocated.extend(held.into_iter().map(u32::from));
 
         let startup_barrier = quarantine_dir.is_some();
         let startup_token = if startup_barrier {
@@ -626,6 +639,23 @@ impl TapNetwork {
         match self.applied.lock().unwrap().get(tap_name) {
             Some(AppliedDatapath::Ebpf | AppliedDatapath::Untranslated) => ExposeTarget::PoolIp,
             Some(AppliedDatapath::Filter) | None => ExposeTarget::GuestIpWithFwmark,
+        }
+    }
+
+    /// Withhold `ip` from the pool for this manager's lifetime, without
+    /// touching any host state.
+    ///
+    /// For an address named by durable state this build cannot read: the
+    /// entry cannot be quarantined (nothing can name its VM) and cannot be
+    /// released (nothing can prove its guest is gone), but a guest may
+    /// still be on it. `next_ip` skips whatever `allocated` holds, so this
+    /// is what keeps the address from being handed to a fresh sandbox
+    /// whose [`TapNetwork::activate`] would then destroy the live TAP that
+    /// address names. There is no matching un-hold: the whole reason to
+    /// hold it is that nothing here can tell when it would be safe.
+    pub fn hold_address(&self, ip: Ipv4Addr) {
+        if self.allocated.lock().unwrap().insert(u32::from(ip)) {
+            debug!(%ip, "holding an address named by durable state this build cannot read");
         }
     }
 

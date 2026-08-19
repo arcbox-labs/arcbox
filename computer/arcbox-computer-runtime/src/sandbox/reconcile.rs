@@ -59,7 +59,9 @@ use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::network::NetworkAllocation;
-use crate::snapshot_cow::{CowHandle, CowManager};
+use crate::snapshot_cow::{
+    COW_FILE_PREFIX, COW_FILE_SUFFIX, CowHandle, CowManager, DM_NAME_PREFIX,
+};
 
 /// How long the sweep gives the driver to find and reconnect to one
 /// orphaned VMM. Finding one is a `/proc` walk and reconnecting a couple of
@@ -402,6 +404,68 @@ pub(super) struct AdoptedSandbox {
     net_invariant: bool,
 }
 
+/// The journals one sweep could not read, in the two vocabularies it has
+/// to answer in afterwards.
+///
+/// Two sets rather than one on purpose: `ids` are durable-record keys and
+/// `owners` are host-resource names. Conflating them is how a journal ends
+/// up speaking for a durable record it does not own — see [`Self::hold`].
+#[derive(Default)]
+struct SkippedJournals {
+    /// The name of the directory each unreadable journal sat in: the key
+    /// its durable record shares, and never the id the journal claims.
+    ids: HashSet<String>,
+    /// Every name such a record could have given a host resource. Nothing
+    /// in a record this process refused to read can be trusted to be the
+    /// real one, so the reap holds all of them rather than guessing.
+    owners: HashSet<String>,
+}
+
+impl SkippedJournals {
+    /// Record that nothing `dir`'s journal names may be acted on.
+    ///
+    /// The durable key is the directory alone. The resource names are
+    /// every spelling the record offers — the directory it sat in, the id
+    /// it claims, the pool slot it says its dm/CoW resources are keyed by
+    /// ([`SandboxStateRecord::resource_owner`]), and the owners its
+    /// journaled CoW names spell out. One reason a journal is unreadable
+    /// is that those disagree, so holding a name that turns out to be
+    /// nobody's costs a leaked device this sweep would have reaped, while
+    /// missing the real one aborts the whole reconciliation on a device a
+    /// live VMM still pins.
+    fn hold(&mut self, dir: &Path, record: &SandboxStateRecord) {
+        if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
+            self.ids.insert(name.to_owned());
+            self.owners.insert(name.to_owned());
+        }
+        self.owners.insert(record.id.clone());
+        self.owners.insert(record.resource_owner().to_owned());
+        // A record names its dm device and its overlay outright, and those
+        // names need not agree with `resource_owner()` on a record this
+        // process refused to read — `validate_state_record`'s check that
+        // they do is one of the checks that can have failed. The reap keys
+        // on owners, so take the owner back out of each name exactly the
+        // way `CowManager::reconcile_stale` derives it.
+        if let Some(cow) = &record.cow {
+            if let Some(owner) = cow.dm_name.strip_prefix(DM_NAME_PREFIX) {
+                self.owners.insert(owner.to_owned());
+            }
+            if let Some(rest) = cow
+                .cow_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(COW_FILE_PREFIX))
+            {
+                self.owners.insert(
+                    rest.strip_suffix(COW_FILE_SUFFIX)
+                        .unwrap_or(rest)
+                        .to_owned(),
+                );
+            }
+        }
+    }
+}
+
 /// What one sweep did, in the two pieces its caller needs at different
 /// moments: [`OrphanSweep::take_runtime`] first, for normalization, and the
 /// runtime directories afterwards, for [`finalize_sweep`].
@@ -414,6 +478,9 @@ pub(super) struct OrphanSweep {
     /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
     /// are live state again, not debris — and so do their runtime dirs.
     adopted: HashMap<String, AdoptedSandbox>,
+    /// Sandboxes whose journal this process could not read: the name of
+    /// the directory each was found in, never the id it claimed.
+    skipped: HashSet<String>,
     runtime_dirs: Vec<PathBuf>,
 }
 
@@ -424,6 +491,7 @@ impl SweptRuntime {
         Self {
             swept: HashSet::new(),
             adopted: HashMap::new(),
+            skipped: HashSet::new(),
         }
     }
 }
@@ -433,6 +501,7 @@ impl OrphanSweep {
         Self {
             ids: HashSet::new(),
             adopted: HashMap::new(),
+            skipped: HashSet::new(),
             runtime_dirs: Vec::new(),
         }
     }
@@ -444,6 +513,7 @@ impl OrphanSweep {
         SweptRuntime {
             swept: std::mem::take(&mut self.ids),
             adopted: std::mem::take(&mut self.adopted),
+            skipped: std::mem::take(&mut self.skipped),
         }
     }
 }
@@ -476,6 +546,7 @@ pub(super) async fn sweep_orphans(
         Err(error) => return Err(error.into()),
     };
     let mut records = Vec::new();
+    let mut skipped = SkippedJournals::default();
     for entry in entries {
         let entry = entry?;
         let dir = entry.path();
@@ -489,7 +560,59 @@ pub(super) async fn sweep_orphans(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        validate_state_record(config, &sandboxes_dir, &dir, &record)?;
+        // A journal this process cannot make sense of is skipped, not
+        // propagated. Aborting here costs far more than the record itself:
+        // the sweep gates every create, so one unreadable journal would
+        // strand every *other* sandbox's resources and leave the manager
+        // unusable.
+        //
+        // Skipping means acting on *nothing* the record names, which is
+        // more than leaving it out of `records`. That alone would leave
+        // its VM neither adopted nor killed — `adopt_or_kill` iterates
+        // `records` — while its dm device and overlay fell out of the keep
+        // sets `reap_orphans` builds, so the global CoW pass would walk
+        // into a device a live VMM still pins and fail the whole
+        // reconciliation on it: the exact abort this skip exists to
+        // remove, in the exact case it was written for. So the sweep holds
+        // instead. Every name the record could have given a host resource
+        // goes into those keep sets, and the address it names goes out of
+        // the pool ([`GuestNetwork::hold_address`]) so a later create
+        // cannot take the interface out from under a guest that may still
+        // be running on it.
+        //
+        // The trade, stated plainly: one sandbox leaks visibly — its VM,
+        // its TAP, its device, its overlay and its address, all held for
+        // this process's lifetime, with the journal still on disk for a
+        // version that can read it — instead of every sandbox on the node
+        // leaking silently behind a manager that never starts.
+        //
+        // This is also the single place the question is asked. `VmId` is
+        // narrower than [`super::validate_id`] — the latter runs over
+        // snapshot and execution ids that never become a VM identity, and
+        // is deliberately permissive for exactly this reason — so the id a
+        // driver will be handed is parsed here, letting `adopt_or_kill` and
+        // [`SandboxStateRecord::lease`] rely on it downstream.
+        let usable = validate_state_record(config, &sandboxes_dir, &dir, &record)
+            .and_then(|()| VmId::new(record.id.as_str()).map_err(VmmError::from))
+            .and_then(|_| VmId::new(record.resource_owner()).map_err(VmmError::from));
+        if let Err(error) = usable {
+            warn!(
+                sandbox_id = %record.id,
+                path = %dir.display(),
+                %error,
+                "skipping an unusable crash journal: its VM is left alone and every \
+                 resource it names is held out of this sweep's reap"
+            );
+            skipped.hold(&dir, &record);
+            // Held rather than quarantined: quarantining needs a `VmId` to
+            // name the lease through the port, which is exactly what may
+            // have failed above, and it would tear down the TAP of a guest
+            // this sweep has decided not to touch.
+            if let Some(allocation) = &record.network {
+                network.hold_address(allocation.ip_address.into());
+            }
+            continue;
+        }
         records.push((dir, record));
     }
     // `read_dir` order is arbitrary; a stable one makes a sweep that fails
@@ -518,6 +641,7 @@ pub(super) async fn sweep_orphans(
         &records,
         &mut adopted,
         &retained,
+        &skipped.owners,
         &phases,
         config,
         driver,
@@ -536,6 +660,7 @@ pub(super) async fn sweep_orphans(
     Ok(OrphanSweep {
         ids: swept,
         adopted,
+        skipped: skipped.ids,
         runtime_dirs,
     })
 }
@@ -552,6 +677,7 @@ async fn reap_orphans(
     records: &[(PathBuf, SandboxStateRecord)],
     adopted: &mut HashMap<String, AdoptedSandbox>,
     retained: &HashSet<String>,
+    held: &HashSet<String>,
     phases: &HashMap<&str, super::record::PersistPhase>,
     config: &VmmConfig,
     driver: &dyn VmDriver,
@@ -581,11 +707,19 @@ async fn reap_orphans(
     // are distinct because a paused sandbox has a retained file and no
     // device, so folding them together would leave the device of a sandbox
     // that crashed mid-pause unreaped.
-    let live_devices: HashSet<String> = records
+    //
+    // Every name a skipped journal offered counts as live here: `records`
+    // does not carry those journals, so nothing above killed their VMs,
+    // and a device a live VMM pins turns this pass into the error that
+    // fails the whole reconciliation. Not provably dead is treated as
+    // alive, which is a held device at worst and a completed sweep at
+    // best.
+    let mut live_devices: HashSet<String> = records
         .iter()
         .filter(|(_, record)| adopted.contains_key(&record.id))
         .map(|(_, record)| record.resource_owner().to_owned())
         .collect();
+    live_devices.extend(held.iter().cloned());
     let mut keep_cow_files = retained.clone();
     keep_cow_files.extend(live_devices.iter().cloned());
     cow_manager.reconcile_stale(&keep_cow_files, &live_devices)?;
@@ -651,6 +785,7 @@ pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
 pub(super) struct SweptRuntime {
     swept: HashSet<String>,
     adopted: HashMap<String, AdoptedSandbox>,
+    skipped: HashSet<String>,
 }
 
 /// Normalizes durable records after the orphan sweep decided each sandbox's
@@ -675,9 +810,10 @@ pub(super) fn normalize_durable_records(
 ) -> Result<()> {
     let inactive = built;
     let mut nothing_adopted = HashMap::new();
-    let (swept, adopted) = match sweep {
-        Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted),
-        None => (None, &mut nothing_adopted),
+    let nothing_skipped = HashSet::new();
+    let (swept, adopted, skipped) = match sweep {
+        Some(sweep) => (Some(&sweep.swept), &mut sweep.adopted, &sweep.skipped),
+        None => (None, &mut nothing_adopted, &nothing_skipped),
     };
 
     for record in store.load_all()? {
@@ -685,6 +821,14 @@ pub(super) fn normalize_durable_records(
             None => JournalEvidence::Unchecked,
             Some(_) if adopted.contains_key(&record.id) => JournalEvidence::Adopted,
             Some(ids) if ids.contains(&record.id) => JournalEvidence::Swept,
+            // The sweep found a journal in this id's directory and could
+            // not read it, so it knows no more about the resources than if
+            // it had never run — which is what `Unchecked` means. Reading
+            // it as `Unjournaled` instead would refuse a live phase and
+            // abort startup, undoing the skip that kept the sweep going.
+            // Keyed by directory name alone: see where `skipped` is filled
+            // for why a journal never answers for the id it claims.
+            Some(_) if skipped.contains(&record.id) => JournalEvidence::Unchecked,
             Some(_) => JournalEvidence::Unjournaled,
         };
         match recovery::plan(record.phase, evidence) {
@@ -1211,10 +1355,10 @@ fn validate_state_record(
     }
     if let Some(cow) = &record.cow {
         let owner = record.resource_owner();
-        let expected_name = format!("arcbox-snap-{owner}");
+        let expected_name = format!("{DM_NAME_PREFIX}{owner}");
         let expected_file = Path::new(&config.firecracker.data_dir)
             .join("cow")
-            .join(format!("arcbox-cow-{owner}.img"));
+            .join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}"));
         if cow.dm_name != expected_name
             || cow.dm_device != format!("/dev/mapper/{expected_name}")
             || cow.cow_file != expected_file
@@ -1994,6 +2138,235 @@ mod tests {
                 .join(STATE_FILE)
                 .exists(),
             "an adopted journal is live state, not debris"
+        );
+    }
+
+    /// A journal this process cannot make sense of costs only itself. The
+    /// sweep gates every create, so propagating would strand every *other*
+    /// sandbox's resources and leave the manager unusable — a far larger
+    /// leak than the one record names.
+    #[tokio::test]
+    async fn an_unusable_journal_is_skipped_and_the_sweep_goes_on() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // A journal whose id disagrees with the directory holding it, which
+        // is the shape `validate_state_record` refuses — and the one where
+        // the two spellings name different sandboxes. Written by hand:
+        // nothing this crate does produces one.
+        let broken_dir = data_dir.path().join("sandboxes").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let stray = SandboxStateRecord::new("not-broken", None, None, None, &config, None).unwrap();
+        write_state_record(&broken_dir, &stray).unwrap();
+
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, "broken", PersistPhase::Ready);
+        drop(store);
+
+        let (vm, manager, _network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+
+        reconciled.expect("one unreadable journal does not fail the reconciliation");
+        assert_eq!(
+            vm.state(),
+            VmState::Running,
+            "the sandbox the sweep could read was still reclaimed"
+        );
+        assert_eq!(
+            manager.snapshot(&"keeper".to_owned()).unwrap().state,
+            SandboxState::Ready
+        );
+        // Inspectable rather than fatal. `Unjournaled` would have refused a
+        // live phase here, which is the abort the skip exists to avoid.
+        assert_eq!(
+            manager.snapshot(&"broken".to_owned()).unwrap().state,
+            SandboxState::Failed,
+            "the unreadable one is reported, not reconciled"
+        );
+        assert!(
+            broken_dir.join(STATE_FILE).exists(),
+            "its journal stays on disk for a version that can read it"
+        );
+    }
+
+    /// The motivating shape, end to end: a journal `validate_state_record`
+    /// accepts and the *port* cannot name. `_` is legal to
+    /// [`super::validate_id`] and is not a [`VmId`] (#680), so every record
+    /// a previous process wrote for an `inst_…` sandbox arrives here.
+    ///
+    /// The parse belongs at this boundary rather than downstream: without
+    /// it the record reaches `adopt_or_kill`, whose `VmId::new` propagates
+    /// and fails the whole sweep — which is what this PR removes.
+    #[tokio::test]
+    async fn a_journal_the_port_cannot_name_is_skipped_at_the_boundary() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // Directory and id agree, and both are what a pre-#680 process
+        // could legitimately have created.
+        let legacy = "inst_7f3a";
+        let legacy_dir = data_dir.path().join("sandboxes").join(legacy);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let record = SandboxStateRecord::new(legacy, None, None, None, &config, None).unwrap();
+        write_state_record(&legacy_dir, &record).unwrap();
+
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, legacy, PersistPhase::Ready);
+        drop(store);
+
+        let (vm, manager, _network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+
+        reconciled.expect("a journal the port cannot name does not fail the reconciliation");
+        assert_eq!(
+            vm.state(),
+            VmState::Running,
+            "the sandbox the sweep could name was still reclaimed"
+        );
+        assert_eq!(
+            manager.snapshot(&legacy.to_owned()).unwrap().state,
+            SandboxState::Failed,
+            "the one it could not is reported, not reconciled"
+        );
+        assert!(
+            legacy_dir.join(STATE_FILE).exists(),
+            "its journal stays on disk for a version that can name it"
+        );
+    }
+
+    /// Skipping means acting on nothing the record names, which is more
+    /// than leaving it out of the sweep's records. Left out alone, its
+    /// overlay falls out of the global keep sets and the CoW pass deletes
+    /// it — or, while the VMM it named is still alive, aborts the whole
+    /// reconciliation on the device that VMM pins — and its address goes
+    /// back into the pool, where the next create takes the interface out
+    /// from under that guest.
+    #[tokio::test]
+    async fn a_skipped_journal_holds_its_disk_and_its_address() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // The address is the pool's next free one, so a create after the
+        // sweep takes it back the moment the sweep lets it go.
+        let held = "10.200.0.2".parse::<std::net::IpAddr>().unwrap();
+        let lease = NetworkLease {
+            vm: VmId::new("not-broken").unwrap(),
+            ip: held,
+            prefix_len: 16,
+            gateway: "10.200.0.1".parse().unwrap(),
+            mac: "02:fc:00:00:00:02".parse().unwrap(),
+            cleanup_token: "gen-broken".into(),
+        };
+        let broken_dir = data_dir.path().join("sandboxes").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let mut stray = SandboxStateRecord::new(
+            "not-broken",
+            None,
+            Some(JournaledLease::cold_boot(&lease, true)),
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        // A third owner, named by the journal's own CoW record: the check
+        // that it agrees with `resource_owner()` is one of the ones an
+        // unreadable record can have failed, so it cannot be derived.
+        let cow_dir = data_dir.path().join("cow");
+        stray.cow = Some(CowRecord {
+            dm_name: format!("{DM_NAME_PREFIX}journaled"),
+            dm_device: format!("/dev/mapper/{DM_NAME_PREFIX}journaled"),
+            cow_loop: "/dev/loop9".into(),
+            cow_file: cow_dir.join(format!("{COW_FILE_PREFIX}journaled{COW_FILE_SUFFIX}")),
+            template_path: "/templates/rootfs.img".into(),
+        });
+        write_state_record(&broken_dir, &stray).unwrap();
+
+        // Every spelling: an unreadable record is exactly the case where
+        // the directory it sits in, the id it claims and the resources it
+        // names need not be the same sandbox, so none can be ruled out as
+        // the overlay's owner.
+        std::fs::create_dir_all(&cow_dir).unwrap();
+        for owner in ["broken", "not-broken", "journaled"] {
+            std::fs::write(
+                cow_dir.join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}")),
+                b"overlay",
+            )
+            .unwrap();
+        }
+
+        let (_vm, _manager, network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+        reconciled.expect("one unreadable journal does not fail the reconciliation");
+
+        for owner in ["broken", "not-broken", "journaled"] {
+            assert!(
+                cow_dir
+                    .join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}"))
+                    .exists(),
+                "the global reap deleted the overlay of a sandbox it could not identify: {owner}"
+            );
+        }
+        let fresh = GuestNetwork::reserve(
+            &*network,
+            &VmId::new("fresh").unwrap(),
+            arcbox_vm_driver::net::NetworkPolicy {
+                mode: arcbox_vm_driver::net::NetworkMode::Nat,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            fresh.ip, held,
+            "the address of a guest nobody could identify was handed out again"
+        );
+    }
+
+    /// A journal this process cannot read answers for the directory it
+    /// sits in and for nothing else. Recording the id it *claims* would let
+    /// it answer for a durable record it has nothing to do with, and the
+    /// answer it gives — `Unchecked` — is exactly the one that turns
+    /// `RefuseUnjournaled` into `Fail`: a sandbox declared failed while its
+    /// VMM may still be running.
+    #[tokio::test]
+    async fn a_skipped_journal_does_not_answer_for_the_id_it_claims() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // Directory `broken`, journal claiming `ghost` — the disagreement
+        // that makes a journal unreadable in the first place.
+        let broken_dir = data_dir.path().join("sandboxes").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let stray = SandboxStateRecord::new("ghost", None, None, None, &config, None).unwrap();
+        write_state_record(&broken_dir, &stray).unwrap();
+
+        // A real `ghost`: durably `Ready`, with no journal of its own. Its
+        // VMM may still be running, so recovery must refuse rather than
+        // declare it failed.
+        let (vm, _manager, network, reconciled) = sweep_one(
+            data_dir.path(),
+            &AdoptionCase::live(),
+            &[("ghost", PersistPhase::Ready)],
+        )
+        .await;
+
+        let error = reconciled.expect_err("an unjournaled live record still refuses normalization");
+        assert!(
+            error.to_string().contains("has no cleanup journal"),
+            "the broken journal spoke for ghost: {error}"
+        );
+        assert_eq!(
+            vm.state(),
+            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the reclaimed vm is handed back, not dropped"
+        );
+        assert_eq!(
+            network.adopted_mode(&VmId::new("keeper").unwrap()),
+            None,
+            "and so is its lease"
         );
     }
 

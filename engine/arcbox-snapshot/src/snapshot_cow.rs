@@ -52,7 +52,20 @@ const DMSETUP_CANDIDATES: &[&str] = &["/usr/sbin/dmsetup", "/sbin/dmsetup"];
 const SNAPSHOT_CHUNK_SECTORS: u64 = 8;
 
 /// Device-mapper name prefix for sandbox snapshots.
-const DM_NAME_PREFIX: &str = "arcbox-snap-";
+///
+/// Public with [`COW_FILE_PREFIX`] and [`COW_FILE_SUFFIX`] because the
+/// convention has an inverse: [`CowManager::reconcile_stale`] reads an
+/// owner back out of a name on the host, and a composer holding a durable
+/// record it cannot otherwise interpret does the same to decide what that
+/// record still names. One definition, so the two directions cannot drift.
+pub const DM_NAME_PREFIX: &str = "arcbox-snap-";
+
+/// File-name prefix of a sandbox's copy-on-write overlay, under `cow_dir`.
+pub const COW_FILE_PREFIX: &str = "arcbox-cow-";
+
+/// File-name suffix of a sandbox's copy-on-write overlay. Optional when
+/// reading one back: `reconcile_stale` accepts a name without it.
+pub const COW_FILE_SUFFIX: &str = ".img";
 
 /// Maximum length of a device-mapper name (DM_NAME_LEN - 1, from linux/dm-ioctl.h).
 const DM_NAME_MAX_LEN: usize = 127;
@@ -140,7 +153,7 @@ impl CowTestProbe {
         CowHandle {
             dm_device: format!("/dev/mapper/{dm_name}"),
             cow_loop: format!("/dev/loop-test-{sandbox_id}"),
-            cow_file: cow_dir.join(format!("arcbox-cow-{sandbox_id}.img")),
+            cow_file: cow_dir.join(format!("{COW_FILE_PREFIX}{sandbox_id}{COW_FILE_SUFFIX}")),
             template_path: PathBuf::from(rootfs_path),
             dm_name,
         }
@@ -467,7 +480,9 @@ impl CowManager {
         // On reattach the overlay is the sandbox's retained disk, so every
         // rollback below passes `cow_file: None` — a failed re-assembly must
         // never delete it.
-        let cow_file = self.cow_dir.join(format!("arcbox-cow-{sandbox_id}.img"));
+        let cow_file = self
+            .cow_dir
+            .join(format!("{COW_FILE_PREFIX}{sandbox_id}{COW_FILE_SUFFIX}"));
         let cow_size = sectors * 512;
         if reuse_existing_cow {
             let verified = std::fs::metadata(&cow_file)
@@ -692,7 +707,9 @@ impl CowManager {
     /// Idempotent: a missing file is success. Any loop still backing the
     /// file is detached first so the unlink actually frees the space.
     pub async fn remove_preserved_cow(&self, sandbox_id: &str) -> Result<()> {
-        let cow_file = self.cow_dir.join(format!("arcbox-cow-{sandbox_id}.img"));
+        let cow_file = self
+            .cow_dir
+            .join(format!("{COW_FILE_PREFIX}{sandbox_id}{COW_FILE_SUFFIX}"));
         if !cow_file.exists() {
             return Ok(());
         }

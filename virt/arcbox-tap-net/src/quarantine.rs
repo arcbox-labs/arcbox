@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use arcbox_vm_driver::VmId;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
@@ -213,12 +213,30 @@ struct NetworkQuarantine {
     allocation: NetworkAllocation,
 }
 
+/// What one ledger load found.
+///
+/// Two collections rather than one because a marker this process cannot
+/// read is not a lesser quarantine — it is not a quarantine at all.
+/// Nothing can name it, so nothing can list or finalize it, and folding it
+/// into [`Self::pending`] would leave a gate waiting on a cleanup no caller
+/// could ever perform ([`TapNetwork::finalize_startup_cleanup`]). Its
+/// address is still real, so it is held instead.
+#[derive(Default)]
+pub struct LoadedQuarantines {
+    /// The per-VM cleanups this process can name, list and finalize.
+    pub pending: HashMap<String, NetworkAllocation>,
+    /// Addresses named by markers this process could not act on: withheld
+    /// from the pool for this manager's lifetime, listed nowhere, and
+    /// releasable by nothing.
+    pub held: HashSet<Ipv4Addr>,
+}
+
 pub fn load_quarantines(
     dir: &Path,
     base: Ipv4Addr,
     prefix_len: u8,
     gateway: Ipv4Addr,
-) -> Result<HashMap<String, NetworkAllocation>> {
+) -> Result<LoadedQuarantines> {
     let existed = dir.try_exists()?;
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -234,6 +252,7 @@ pub fn load_quarantines(
         std::fs::File::open(parent)?.sync_all()?;
     }
     let mut quarantined = HashMap::new();
+    let mut held = HashSet::new();
     let mut tokens = HashSet::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -249,30 +268,56 @@ pub fn load_quarantines(
             Some("tmp") => continue,
             Some("json") => {}
             _ => {
-                return Err(TapNetError::Network(format!(
-                    "unexpected sandbox network quarantine file {}",
-                    path.display()
-                )));
+                warn!(path = %path.display(), "ignoring an unexpected file in the quarantine ledger");
+                continue;
             }
         }
-        let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(&path)?)?;
-        validate_id(&marker.id)?;
-        if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
-            return Err(TapNetError::Network(format!(
-                "sandbox network quarantine {} has an invalid cleanup token",
-                marker.id
-            )));
+        // A marker this process cannot read is skipped, not propagated.
+        // This load runs inside `TapNetwork`'s constructor, so an error
+        // here fails the network subsystem outright — no pool, no creates,
+        // and no self-heal short of deleting the file by hand, while the
+        // ledger exists precisely to name host resources that still need
+        // reaping. The entry stays on disk for a version that can read it.
+        //
+        // The rule this pays for: an id a *previous* process could write is
+        // not necessarily one this process can parse. `VmId` is narrower
+        // than it was, and a marker is written before the VMM that would
+        // have rejected the id ever starts, so the hosts that most need
+        // reconciling are exactly the ones holding unparseable markers.
+        //
+        // The two skips differ in what is left behind, and the warnings say
+        // which is which. A marker that decodes names an address, and that
+        // address is held: a guest may still be on it, and handing it out
+        // again would give `tap::create` a live device of the same name to
+        // destroy and leave the new occupant inheriting filter rules the
+        // previous one's activation appended. A marker that does not decode
+        // names nothing, so there is nothing to hold.
+        let marker = match decode_marker(&path) {
+            Ok(marker) => marker,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "skipping a network quarantine marker this process cannot decode; \
+                     it names no address, so none is held for it"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = check_marker(&path, &marker, base, prefix_len, gateway) {
+            warn!(
+                path = %path.display(),
+                ip = %marker.allocation.ip_address,
+                %error,
+                "skipping a network quarantine marker this process cannot act on; its \
+                 address is held out of the pool, and no cleanup can finalize it"
+            );
+            held.insert(marker.allocation.ip_address);
+            continue;
         }
-        validate_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
         if !tokens.insert(marker.allocation.cleanup_token.clone()) {
             return Err(TapNetError::Network(format!(
                 "duplicate sandbox network quarantine token for {}",
-                marker.id
-            )));
-        }
-        if path.file_stem().and_then(|value| value.to_str()) != Some(marker.id.as_str()) {
-            return Err(TapNetError::Network(format!(
-                "sandbox network quarantine filename does not match {}",
                 marker.id
             )));
         }
@@ -287,7 +332,50 @@ pub fn load_quarantines(
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(quarantined)
+    Ok(LoadedQuarantines {
+        pending: quarantined,
+        held,
+    })
+}
+
+/// The bytes on disk as a marker. Separate from [`check_marker`] because
+/// the split is what the two skips in [`load_quarantines`] turn on: a
+/// marker that decodes names an address to hold even when every check on
+/// it fails, and one that does not decode names nothing at all.
+fn decode_marker(path: &Path) -> Result<NetworkQuarantine> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// Every check that decides whether *this* process can act on `marker`.
+///
+/// One place for [`load_quarantines`] to skip on: everything here is about
+/// the marker alone, and a failure means the ledger holds an entry this
+/// build cannot name. The duplicate-token and duplicate-id checks stay in
+/// the loop deliberately — they are properties of the set, not of a
+/// marker, and skipping one of a colliding pair would silently pick a
+/// winner and lose the other's address.
+fn check_marker(
+    path: &Path,
+    marker: &NetworkQuarantine,
+    base: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Ipv4Addr,
+) -> Result<()> {
+    validate_id(&marker.id)?;
+    if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
+        return Err(TapNetError::Network(format!(
+            "sandbox network quarantine {} has an invalid cleanup token",
+            marker.id
+        )));
+    }
+    validate_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
+    if path.file_stem().and_then(|value| value.to_str()) != Some(marker.id.as_str()) {
+        return Err(TapNetError::Network(format!(
+            "sandbox network quarantine filename does not match {}",
+            marker.id
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `allocation` is one this network could have written for `id`:
@@ -377,10 +465,11 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
 /// of its own, so the only dot in a marker's name is the extension).
 /// Checked where an id enters the network (`reserve`), on
 /// every ledger write, and on every ledger load, so a reserved address can
-/// always be quarantined, every entry the ledger holds is one the port can
-/// name, and a file from outside the contract fails at load with its id in
-/// the message rather than lingering as a quarantine `NetworkReconcile`
-/// could never list or finalize.
+/// always be quarantined and every entry the ledger *holds* is one the port
+/// can name. A file from outside the contract never becomes one: the load
+/// skips it, names it in a warning and withholds its address, rather than
+/// admitting it as a quarantine `NetworkReconcile` could never list or
+/// finalize.
 pub fn validate_id(id: &str) -> Result<()> {
     VmId::new(id)
         .map(drop)

@@ -154,6 +154,16 @@ impl GuestNetwork for TapNetwork {
         Ok(self.release_checked(&allocation)?)
     }
 
+    /// An IPv6 address cannot have come from this pool, so there is
+    /// nothing to withhold — the same reasoning `TapNetwork::allocation`
+    /// refuses one on, without an error to report to a caller that has no
+    /// answer for it.
+    fn hold_address(&self, address: IpAddr) {
+        if let IpAddr::V4(ip) = address {
+            Self::hold_address(self, ip);
+        }
+    }
+
     fn identity(&self, lease: &NetworkLease, mode: AttachMode) -> NetworkIdentity {
         Self::identity_for(lease, mode)
     }
@@ -185,14 +195,16 @@ impl NetworkReconcile for TapNetwork {
     /// Every quarantined VM with its token.
     ///
     /// The error is a broken invariant rather than an expected on-disk
-    /// case: every id this crate reserves, writes, or loads passes the
-    /// `VmId` rules (`quarantine::validate_id`), and a marker file
-    /// carrying anything else fails construction outright. Should one
-    /// reach here, the whole list fails rather than losing that one entry
-    /// from it — nothing can name the entry, so nothing can finalize it,
-    /// so `finalize_startup_cleanup` refuses while it sits in the ledger
-    /// and the startup gate never opens. Dropping it would trade one loud
-    /// failure for that permanent, unexplained stall.
+    /// case: every id this crate reserves or writes passes the `VmId`
+    /// rules (`quarantine::validate_id`), and a marker file carrying
+    /// anything else never enters the map — the load skips it, holding its
+    /// address out of the pool without registering a cleanup nothing could
+    /// finalize. Should one reach here anyway, the whole list fails rather
+    /// than losing that one entry from it: nothing can name the entry, so
+    /// nothing can finalize it, so `finalize_startup_cleanup` refuses while
+    /// it sits in the map and the startup gate never opens. Dropping it
+    /// would trade one loud failure for that permanent, unexplained
+    /// stall.
     async fn pending_cleanups(&self) -> Result<Vec<(VmId, String)>> {
         self.pending_quarantines()
             .into_iter()
@@ -698,10 +710,12 @@ mod tests {
 
     /// The network only ever carries ids the port can name: an id past
     /// `VmId::MAX_LEN` is refused at `reserve` (before any TAP exists) with
-    /// the port's own message, and
-    /// a ledger file that carries one (written outside this contract) fails
-    /// at load naming it, instead of surviving as a quarantine
-    /// `NetworkReconcile` could never list or finalize.
+    /// the port's own message, and a ledger file that carries one (written
+    /// outside this contract, or by a build whose rules were wider) is
+    /// skipped at load rather than admitted as a quarantine
+    /// `NetworkReconcile` could never list or finalize. Skipped is not
+    /// forgotten: the entry stays on disk and its address stays out of the
+    /// pool, because a guest this process cannot name may still be on it.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn ids_the_port_cannot_name_are_refused_not_stranded() {
@@ -746,12 +760,38 @@ mod tests {
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();
-        let Err(error) = network() else {
-            panic!("a ledger holding an id the port cannot name must fail to load");
-        };
+        // This used to be fatal, and being fatal was the opposite of
+        // useful: the load runs inside the constructor, so one marker this
+        // build cannot name meant no network at all — and the ledger holds
+        // host resources that still need reaping, which a host that cannot
+        // construct its network never reaps. The marker is skipped, and it
+        // stays on disk for a version that can name it.
+        let reloaded = network().expect("an unnameable marker is skipped, not fatal");
+        reloaded.mark_reconciled();
+        let startup = TapNetwork::startup_cleanup_token(&reloaded).unwrap();
+        TapNetwork::finalize_startup_cleanup(&reloaded, &startup)
+            .expect("a skipped marker is no pending cleanup, so the gate opens");
         assert!(
-            error.to_string().contains(&long_id) && error.to_string().contains("exceeds 64"),
-            "{error}"
+            !reloaded.quarantine_pending(&long_id),
+            "a skipped marker is not registered as a pending cleanup"
+        );
+        assert!(
+            ledger.join(format!("{long_id}.json")).exists(),
+            "its entry is left where a later version can read it"
+        );
+        // And the gate opening is exactly why the address must be withheld
+        // by something else: nothing can finalize a cleanup for an id
+        // nothing can name, so nothing would ever hand this address back.
+        // A guest may still be on it, and `activate` would destroy the TAP
+        // that address names.
+        assert_eq!(
+            TapNetwork::reserve(&reloaded, "box").unwrap().ip_address,
+            "10.0.0.2".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            TapNetwork::reserve(&reloaded, "next").unwrap().ip_address,
+            "10.0.0.4".parse::<Ipv4Addr>().unwrap(),
+            "10.0.0.3 is the skipped marker's address and must not be reissued"
         );
     }
 }

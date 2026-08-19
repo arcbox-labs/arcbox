@@ -9,8 +9,8 @@ use tracing::{debug, info, warn};
 
 use super::block_tools::loop_backing_file;
 use super::{
-    CowHandle, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR, TEMPLATE_MARKER_TEMP_PREFIX,
-    TEMPLATE_PENDING_PREFIX, TemplateEntry, dmsetup_remove,
+    COW_FILE_PREFIX, COW_FILE_SUFFIX, CowHandle, CowManager, DM_NAME_PREFIX, TEMPLATE_LOOP_DIR,
+    TEMPLATE_MARKER_TEMP_PREFIX, TEMPLATE_PENDING_PREFIX, TemplateEntry, dmsetup_remove,
 };
 use crate::error::{Result, SnapshotError};
 
@@ -208,8 +208,8 @@ impl CowManager {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if let Some(rest) = name.strip_prefix("arcbox-cow-") {
-                let id = rest.strip_suffix(".img").unwrap_or(rest);
+            if let Some(rest) = name.strip_prefix(COW_FILE_PREFIX) {
+                let id = rest.strip_suffix(COW_FILE_SUFFIX).unwrap_or(rest);
                 if keep_cow_files.contains(id) || live_devices.contains(id) {
                     debug!(file = %path.display(), "keeping retained sandbox cow file");
                     continue;

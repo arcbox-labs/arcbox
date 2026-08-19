@@ -320,6 +320,17 @@ impl GuestNetwork for FakeNetwork {
         Ok(())
     }
 
+    /// Takes the host number out of the pool and records nothing else:
+    /// a held address is not a lease, so `stale` never reports it as
+    /// another VM's, and no protocol call can give it back.
+    fn hold_address(&self, address: IpAddr) {
+        // An address this fake could never have handed out is already
+        // unreachable through `reserve`; there is nothing to withhold.
+        if let Ok(host) = host_number(address) {
+            lock(&self.ledger).used.insert(host);
+        }
+    }
+
     async fn release(&self, lease: NetworkLease) -> Result<()> {
         let mut ledger = lock(&self.ledger);
         let host = host_number(lease.ip)?;
