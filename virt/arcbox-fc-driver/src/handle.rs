@@ -2,7 +2,8 @@
 //! with the vsock, listen, checkpoint, and detach capabilities.
 //!
 //! [`FcProcessHandle`] is the same port over a VMM process whose API is out
-//! of reach: kill, observe, detach, and nothing the API would serve.
+//! of reach: kill, observe, detach, reach the area the VM's files were
+//! staged into, and nothing the API would serve.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use std::time::Duration;
 
 use arcbox_vm_driver::{
     AfterCheckpoint, Checkpoint, CheckpointFormat, CheckpointImage, CheckpointKind,
-    CheckpointOptions, Detach, Error, ExitStatus, IoMode, Result, ShutdownMode, VmEvent, VmHandle,
-    VmId, VmRecord, VmState, Vsock, VsockConn, VsockListen, VsockListener,
+    CheckpointOptions, Detach, Error, ExitStatus, IoMode, Result, ShutdownMode, Staging, VmEvent,
+    VmHandle, VmId, VmRecord, VmState, Vsock, VsockConn, VsockListen, VsockListener,
 };
 use async_trait::async_trait;
 use fc_sdk::Client;
@@ -23,6 +24,7 @@ use crate::error::FcError;
 use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
 use crate::render::VmLayout;
+use crate::staging::JailStaging;
 use crate::{CHECKPOINT_FORMAT, NAME, api, jail, listener, vsock};
 
 pub mod process_only;
@@ -41,7 +43,10 @@ const CTRL_ALT_DEL_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct FcHandle {
     process: Arc<FcProcess>,
     client: Client,
-    layout: VmLayout,
+    /// The area this VM's files were staged into, and the layout that names
+    /// every path in it — the same area the prepared VM staged them into,
+    /// and the only route to them for a VM this driver adopted.
+    staging: JailStaging,
     record: VmRecord,
     /// The vsock socket the host dials and listens next to, when the VM
     /// has a vsock device; shared with the prepared VM the handle came from.
@@ -66,11 +71,16 @@ impl FcHandle {
         Self {
             process,
             client,
-            layout,
+            staging: JailStaging::new(layout),
             record,
             vsock,
             quiesced: AtomicBool::new(quiesced),
         }
+    }
+
+    /// Where this VM's files live: the jail, the runtime dir, the sockets.
+    fn layout(&self) -> &VmLayout {
+        self.staging.layout()
     }
 
     fn vsock_endpoint(&self) -> Result<&VsockEndpoint> {
@@ -185,7 +195,7 @@ impl VmHandle for FcHandle {
             },
         };
         self.unlink_vsock();
-        if let Some(jail) = self.layout.jail()
+        if let Some(jail) = self.layout().jail()
             && self.process.is_adopted()
             && !self.process.is_detached()
         {
@@ -202,7 +212,7 @@ impl VmHandle for FcHandle {
     /// it can be restored, and that is inside a per-VM chroot
     /// ([`crate::render::require_jailed_restore`]).
     fn checkpoint(&self) -> Option<&dyn Checkpoint> {
-        self.layout.jail().is_some().then_some(self)
+        self.layout().jail().is_some().then_some(self)
     }
 
     fn vsock_listener(&self) -> Option<&dyn VsockListen> {
@@ -211,6 +221,13 @@ impl VmHandle for FcHandle {
 
     fn detach(&self) -> Option<&dyn Detach> {
         Some(self)
+    }
+
+    /// The area this VM's disks were staged into. Present whatever grip
+    /// made it: an adopted VM has no [`FcPrepared`](crate::FcPrepared), and
+    /// this is then the only route to a disk that has to outlive it.
+    fn staging(&self) -> Option<&dyn Staging> {
+        Some(&self.staging)
     }
 }
 
@@ -232,7 +249,7 @@ impl VsockListen for FcHandle {
     /// Bound next to the same socket [`Vsock::dial`] uses — after a restore
     /// the one the checkpoint recorded, which is where the guest dials out.
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
-        listener::bind(&self.layout, self.vsock_endpoint()?, &self.process, port)
+        listener::bind(self.layout(), self.vsock_endpoint()?, &self.process, port)
     }
 }
 
@@ -353,7 +370,7 @@ impl FcHandle {
     /// or when `dst` is already inside it (chowned so the jailed VMM can
     /// write there), else a fresh `{jail}/snapshots/<n>` to move from.
     async fn snapshot_site(&self, dst: &Path) -> Result<SnapshotSite> {
-        let Some(jail) = self.layout.jail() else {
+        let Some(jail) = self.layout().jail() else {
             return Ok(SnapshotSite::Direct {
                 vmstate: utf8(&dst.join("vmstate"))?,
                 mem: utf8(&dst.join("mem"))?,

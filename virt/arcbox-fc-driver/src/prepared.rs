@@ -1,14 +1,13 @@
 //! [`FcPrepared`]: a spawned Firecracker waiting for a spec — the port's
 //! [`PreparedVm`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arcbox_vm_driver::{
-    CheckpointImage, DiskSource, Error, ExitStatus, IsolationSpec, PreparedVm, ProcessRecord,
-    RestoreSpec, Result, Staging, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen,
-    VsockListener,
+    CheckpointImage, Error, ExitStatus, IsolationSpec, PreparedVm, ProcessRecord, RestoreSpec,
+    Result, Staging, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen, VsockListener,
 };
 use async_trait::async_trait;
 use fc_sdk::VmBuilder;
@@ -18,7 +17,8 @@ use crate::error::FcError;
 use crate::handle::FcHandle;
 use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
-use crate::render::{self, StageKind, VmLayout};
+use crate::render::{self, VmLayout};
+use crate::staging::JailStaging;
 use crate::{NAME, api, jail, listener, spawn};
 
 /// A spawned VMM process with its API socket up and nothing loaded yet.
@@ -27,7 +27,10 @@ use crate::{NAME, api, jail, listener, spawn};
 /// after which the returned handle owns it (and shares the guard).
 pub struct FcPrepared {
     config: Arc<FcDriverConfig>,
-    layout: VmLayout,
+    /// The area this VM's files are brought into, and the layout that
+    /// names every path in it. Shared in shape — not in value — with the
+    /// handle a boot returns, which builds its own from the same layout.
+    staging: JailStaging,
     process: Arc<FcProcess>,
     record: VmRecord,
     /// Where guest dial-outs land: the layout's vsock socket, until a
@@ -80,7 +83,7 @@ impl FcPrepared {
             let vsock = VsockEndpoint::new(layout.vsock_host_uds());
             Ok(Self {
                 config: Arc::clone(&config),
-                layout: layout.clone(),
+                staging: JailStaging::new(layout.clone()),
                 process,
                 record,
                 vsock,
@@ -130,7 +133,7 @@ impl FcPrepared {
                 self.record.id
             )));
         }
-        if *isolation != *self.layout.isolation() {
+        if *isolation != *self.layout().isolation() {
             return Err(Error::InvalidSpec(format!(
                 "spec isolation does not match what vm {} was prepared with",
                 self.record.id
@@ -139,21 +142,9 @@ impl FcPrepared {
         Ok(())
     }
 
-    /// Brings `src` into the jail at `in_jail` and answers with the host
-    /// path it landed at — the path a spec must name for it, which
-    /// rendering then passes to Firecracker chroot-relative.
-    ///
-    /// Goes through [`VmLayout::place`] rather than staging directly, so
-    /// every path decision stays in `render`: without a jail this is the
-    /// identity, and a source already inside the jail is named where it is
-    /// instead of being copied onto itself.
-    async fn bring_in(&self, src: &Path, in_jail: &str, kind: StageKind) -> Result<PathBuf> {
-        let mut stage = Vec::new();
-        let named = self.layout.place(src, in_jail, kind, &mut stage)?;
-        if let Some(jail) = self.layout.jail() {
-            jail::apply(jail, &stage).await?;
-        }
-        Ok(self.layout.host_view(&named))
+    /// Where this VM's files live: the jail, the runtime dir, the sockets.
+    fn layout(&self) -> &VmLayout {
+        self.staging.layout()
     }
 
     fn handle(&self, client: fc_sdk::Client, has_vsock: bool) -> FcHandle {
@@ -161,7 +152,7 @@ impl FcPrepared {
         FcHandle::new(
             Arc::clone(&self.process),
             client,
-            self.layout.clone(),
+            self.layout().clone(),
             self.record.clone(),
             has_vsock.then(|| self.vsock.clone()),
             false,
@@ -196,15 +187,15 @@ impl PreparedVm for FcPrepared {
     }
 
     fn staging(&self) -> Option<&dyn Staging> {
-        Some(self)
+        Some(&self.staging)
     }
 
     async fn boot(&self, spec: VmSpec) -> Result<Box<dyn VmHandle>> {
         let _launch = self.launch.lock().await;
         self.require_unused()?;
         self.require_same_identity(&spec.id, &spec.isolation)?;
-        let plan = render::fc_config(&spec, &self.config, self.layout.runtime_dir())?;
-        if let Some(jail) = self.layout.jail() {
+        let plan = render::fc_config(&spec, &self.config, self.layout().runtime_dir())?;
+        if let Some(jail) = self.layout().jail() {
             jail::apply(jail, &plan.stage).await?;
         }
         let mut builder = VmBuilder::new(self.process.api_socket())
@@ -236,8 +227,8 @@ impl PreparedVm for FcPrepared {
         let _launch = self.launch.lock().await;
         self.require_unused()?;
         self.require_same_identity(&spec.id, &spec.isolation)?;
-        let plan = render::fc_restore(image, &spec, &self.config, self.layout.runtime_dir())?;
-        if let Some(jail) = self.layout.jail() {
+        let plan = render::fc_restore(image, &spec, &self.config, self.layout().runtime_dir())?;
+        if let Some(jail) = self.layout().jail() {
             jail::apply(jail, &plan.stage).await?;
         }
         let vm = fc_sdk::restore(self.process.api_socket(), plan.load)
@@ -264,7 +255,8 @@ impl PreparedVm for FcPrepared {
         // can dial out.
         let has_vsock = loaded.vsock.is_some();
         if let Some(vsock) = loaded.vsock {
-            self.vsock.relocate(self.layout.host_view(&vsock.uds_path));
+            self.vsock
+                .relocate(self.layout().host_view(&vsock.uds_path));
         }
         // The load left the guest frozen so it could not touch a stale disk;
         // it runs from here.
@@ -284,93 +276,10 @@ impl PreparedVm for FcPrepared {
     /// retry, and both halves are idempotent.
     async fn discard(&self) -> Result<ExitStatus> {
         let status = self.process.kill().await?;
-        if let Some(jail) = self.layout.jail() {
+        if let Some(jail) = self.layout().jail() {
             jail.remove().await?;
         }
         Ok(status)
-    }
-}
-
-/// The jail is the staging area: files land under its root, named as
-/// [`render`] would have named them for a boot, so a spec that carries
-/// what these hand back is rendered without staging anything twice.
-/// Without a jail every verb is the identity — the VMM reads host paths as
-/// they are, and there is nothing to bring anywhere.
-#[async_trait]
-impl Staging for FcPrepared {
-    async fn stage_kernel(&self, src: &Path) -> Result<PathBuf> {
-        self.bring_in(src, render::KERNEL_FILE, StageKind::LinkOrCopy)
-            .await
-    }
-
-    async fn stage_disk(&self, id: &str, source: DiskSource<'_>) -> Result<PathBuf> {
-        let kind = match source {
-            DiskSource::Device(_) => StageKind::BlockNode,
-            // Never a hard link: Firecracker writes guest blocks into a
-            // disk, and a link would write them into the caller's file.
-            DiskSource::Image(_) => StageKind::Copy,
-            DiskSource::Handover(_) => StageKind::Move,
-        };
-        self.bring_in(source.path(), &render::staged_disk_file(id)?, kind)
-            .await
-    }
-
-    async fn unstage_disk(&self, id: &str, dst: &Path) -> Result<bool> {
-        let Some(staged) = self.layout.jail_path(&render::staged_disk_file(id)?)? else {
-            return Ok(false);
-        };
-        if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
-            return Ok(false);
-        }
-        // The jail is its own vfsmount, so this crosses one even on the
-        // same filesystem; `move_file` handles the EXDEV that follows.
-        jail::move_file(&staged, dst).await.map_err(Error::Io)?;
-        Ok(true)
-    }
-
-    async fn stage_checkpoint(&self, image: &CheckpointImage) -> Result<CheckpointImage> {
-        let Some(jail) = self.layout.jail() else {
-            return Ok(image.clone());
-        };
-        // Through the jail's own question, which resolves: a dir spelled
-        // through the root but landing outside it has to be brought in,
-        // not loaded from where the VMM cannot reach. The answer is where
-        // the files are, which is what the image must name.
-        if let Some(view) = jail.view(&image.dir) {
-            return Ok(CheckpointImage {
-                dir: self.layout.host_view(&view),
-                ..image.clone()
-            });
-        }
-        let name = image
-            .dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                Error::InvalidSpec(format!(
-                    "{NAME}: checkpoint dir {} has no usable name",
-                    image.dir.display()
-                ))
-            })?;
-        let in_jail = render::checkpoint_dir(name);
-        // Both files are read-only to Firecracker (mem is mapped
-        // MAP_PRIVATE on load), so a root jailer links instead of copying
-        // — the mem file is the guest's whole memory.
-        self.bring_in(
-            &image.dir.join("vmstate"),
-            &format!("{in_jail}/vmstate"),
-            StageKind::LinkOrCopy,
-        )
-        .await?;
-        let mem = image.dir.join("mem");
-        if tokio::fs::try_exists(&mem).await.unwrap_or(false) {
-            self.bring_in(&mem, &format!("{in_jail}/mem"), StageKind::LinkOrCopy)
-                .await?;
-        }
-        Ok(CheckpointImage {
-            dir: jail.root.join(&in_jail),
-            ..image.clone()
-        })
     }
 }
 
@@ -412,7 +321,7 @@ impl VsockListen for FcPrepared {
     /// device; a restore moves the endpoint to the recorded path before
     /// the guest resumes and the listener follows.
     async fn listen(&self, port: u32) -> Result<Box<dyn VsockListener>> {
-        listener::bind(&self.layout, &self.vsock, &self.process, port)
+        listener::bind(self.layout(), &self.vsock, &self.process, port)
     }
 }
 
