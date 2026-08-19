@@ -31,17 +31,33 @@ pub struct GuestConfig {
 impl GuestConfig {
     /// Both halves out of the same bytes, so the two parses cannot see
     /// different versions of a file being rewritten under them.
-    pub fn from_toml(content: &str) -> Result<Self, String> {
+    pub fn from_toml(content: &str) -> Result<Self, toml::de::Error> {
         Ok(Self {
-            runtime: toml::from_str(content).map_err(|e| e.to_string())?,
-            adapters: AdapterConfig::from_toml(content).map_err(|e| e.to_string())?,
+            runtime: toml::from_str(content)?,
+            adapters: AdapterConfig::from_toml(content)?,
         })
     }
 
     /// Both halves of one file, or why it could not be read.
-    pub fn from_file(path: &str) -> Result<Self, String> {
-        Self::from_toml(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+    pub fn from_file(path: &str) -> Result<Self, GuestConfigError> {
+        Ok(Self::from_toml(&std::fs::read_to_string(path)?)?)
     }
+}
+
+/// Why a `vmm.toml` did not load.
+///
+/// The parse half keeps `toml`'s own error rather than its text: the span
+/// it carries is the useful part when a deployed file fails, and the two
+/// failures are answered differently — a missing file falls through to the
+/// next candidate, a malformed one is a config the operator wrote wrong.
+#[derive(Debug, thiserror::Error)]
+pub enum GuestConfigError {
+    /// The file could not be read.
+    #[error("read config: {0}")]
+    Read(#[from] std::io::Error),
+    /// The file is not a config this agent understands.
+    #[error("parse config: {0}")]
+    Parse(#[from] toml::de::Error),
 }
 
 /// Persistent Btrfs mount that owns sandbox images, snapshots, and VM state.
@@ -256,6 +272,18 @@ mod tests {
 
     /// A complete `vmm.toml`: every key either half knows, in the one
     /// `[firecracker]` section a deployed System VM already has on disk.
+    ///
+    /// **Every optional key has to be named here**, because
+    /// [`every_firecracker_key_lands_in_exactly_one_half`] reads each
+    /// half's key set off a *parsed value*, and TOML omits a field that
+    /// came out `None`. A new `Option` field this fixture does not set is
+    /// therefore invisible to both sides of that comparison — which costs
+    /// nothing in the direction that matters (a file key read by neither
+    /// half is still in the file, so it still fails), but does mean the
+    /// fixture stops being the complete config it claims to be.
+    ///
+    /// [`every_firecracker_key_lands_in_exactly_one_half`]:
+    ///     #method.every_firecracker_key_lands_in_exactly_one_half
     const COMPLETE_CONFIG: &str = r#"
 [firecracker]
 binary = "/arcbox/runtime/bin/firecracker"

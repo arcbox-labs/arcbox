@@ -71,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
     let run_phase3 = std::env::var("ARCBOX_SMOKE_CHECKPOINT").is_ok_and(|v| v == "1");
 
     let config = arcbox_agent::config::GuestConfig::from_file(&config_path)
-        .map_err(anyhow::Error::msg)
         .with_context(|| format!("load config from {config_path}"))?;
 
     // Save network config before consuming config.
