@@ -56,29 +56,38 @@ const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often a wait loop re-reads the state it is waiting for.
 ///
-/// This is the resolution of every phase timing in `metrics.json`, and it
-/// biases them upward: a phase whose true duration is 1.4 s is reported as
-/// whichever tick first observes it. At the 500 ms this used to be, the
-/// `sandbox_ready` bucket boundary sat at ~1.53 s — directly on top of the
-/// distribution — so the same unchanged code reported 1508 ms on one run and
-/// 2011 ms on the next, and looked *stable* at both, because a bucket has no
-/// variance. Measured 2026-08-19 against `ce4f4e78` and `86ac9e12`: the true
-/// values were 1398 ms and 1327-1462 ms, i.e. indistinguishable, while the
-/// coarse readings differed by 500 ms.
+/// This is the resolution of any phase whose span contains such a loop —
+/// directly, or inside a scenario function it calls — and it biases those
+/// phases upward: the phase is reported as whichever tick first observes it.
+/// Phases made of single calls (`daemon_ready`, `sandbox_create`,
+/// `sandbox_file_io`, `sandbox_restore`, `template_build`, `connect_json`,
+/// the `sandbox_exec_*` family) contain no loop and are unaffected.
 ///
-/// Consequence to keep in mind: **numbers recorded before this change are
-/// not comparable with numbers after it.** Every phase was inflated, by an
-/// amount that depends on where its true value fell inside a bucket — 14 ms
-/// for `sandbox_file_io`, 247 ms for `template_create`, measured the same
-/// day. Re-baseline rather than subtracting.
+/// At the 500 ms this used to be, the `sandbox_ready` bucket boundary sat at
+/// ~1.53 s — directly on top of the distribution — so the same unchanged code
+/// reported 1508 ms on one run and 2011 ms on the next, and looked *stable*
+/// at both, because a bucket has no variance. Measured 2026-08-19 against
+/// `ce4f4e78` and `86ac9e12`: the true values were 1398 ms and
+/// 1327-1462 ms, i.e. indistinguishable, while the coarse readings differed
+/// by 500 ms.
+///
+/// Consequence to keep in mind: for a phase that does contain a loop,
+/// **numbers recorded before this change are not comparable with numbers
+/// after it**, and the gap depends on where the true value fell inside a
+/// bucket — same-day pairing: `sandbox_ready` 1508 -> 1398,
+/// `template_create` 1568 -> 1321. Re-baseline those rather than subtracting
+/// a correction, and do not read a delta on a loop-free phase as this.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// The same, for a loop whose observation is a guest `exec` round trip
-/// rather than a lock-free read on the host.
+/// The same, for a loop whose observation runs a command *inside* the
+/// sandbox being timed.
 ///
-/// The round trip costs tens of milliseconds and runs *inside* the sandbox
-/// being timed, so polling it at [`POLL_INTERVAL`] would not observe sooner —
-/// it would only add load to the thing under measurement.
+/// Neither interval observes anything host-local — `Inspect` is an RPC that
+/// crosses to the manager in the System VM. The difference is what happens
+/// at the far end: a guest `exec` starts a process in the nested VM under
+/// test, which costs tens of milliseconds and adds load to the very thing
+/// the phase is measuring. Polling it at [`POLL_INTERVAL`] would not observe
+/// sooner; it would only make the measurement worse.
 const GUEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct SandboxSmokeConfig {
