@@ -1,4 +1,10 @@
-//! End-to-end tests for the full sandbox lifecycle.
+//! End-to-end tests for the full sandbox lifecycle, over the environment
+//! this crate composes for the System VM.
+//!
+//! The manager is built through [`arcbox_agent::sandbox::node_environment`],
+//! the same function `SandboxService::new` uses, so what boots here is the
+//! production composition — a real Firecracker driver, a real TAP network,
+//! the vm-proto agent client and a real copy-on-write rootfs manager.
 //!
 //! ## Prerequisites
 //!
@@ -16,7 +22,7 @@
 //! ## Running
 //!
 //! ```bash
-//! sudo -E cargo test --test e2e -p arcbox-computer-runtime -- --include-ignored --test-threads=1
+//! sudo -E cargo test --test sandbox_manager_e2e -p arcbox-agent -- --include-ignored --test-threads=1
 //! ```
 //!
 //! `--test-threads=1` prevents concurrent TAP interface names from colliding.
@@ -28,11 +34,16 @@
 //! sudo chmod 666 /dev/kvm
 //! ```
 
+// The composition root this suite drives is Linux-only, as is everything
+// it boots.
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxEvent, SandboxManager,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig,
@@ -96,6 +107,13 @@ fn no_tap() -> SandboxSpec {
     }
 }
 
+/// A manager over the environment `SandboxService::new` composes: this
+/// suite exercises the real composition rather than one of its own.
+fn manager(cfg: VmmConfig) -> SandboxManager {
+    let environment = node_environment(&cfg, block_tools()).unwrap();
+    SandboxManager::with_environment(cfg, environment).unwrap()
+}
+
 /// Complete the startup cleanup handshake for a manager backed by a fresh
 /// test directory, where no stale host resources exist.
 async fn finalize_startup_cleanup(mgr: &SandboxManager) {
@@ -153,7 +171,7 @@ async fn e2e_sandbox_basic_lifecycle() {
         return;
     };
 
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
     let (id, _ip) = mgr.create_sandbox(no_tap()).await.unwrap();
@@ -187,7 +205,7 @@ async fn e2e_event_broadcast_ready() {
         return;
     };
 
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
     let (id, _) = mgr.create_sandbox(no_tap()).await.unwrap();
@@ -204,7 +222,6 @@ async fn e2e_event_broadcast_ready() {
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and root"]
 async fn e2e_two_sandboxes_distinct_ips() {
-    #[cfg(target_os = "linux")]
     if !common::is_root() {
         eprintln!("SKIP e2e_two_sandboxes_distinct_ips — requires root");
         return;
@@ -216,7 +233,7 @@ async fn e2e_two_sandboxes_distinct_ips() {
         return;
     };
 
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     finalize_startup_cleanup(&mgr).await;
 
     // Subscribe twice so that waiting for id1 does not consume id2's events.
@@ -247,7 +264,6 @@ async fn e2e_two_sandboxes_distinct_ips() {
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and root"]
 async fn e2e_sandbox_with_tap_network() {
-    #[cfg(target_os = "linux")]
     if !common::is_root() {
         eprintln!("SKIP e2e_sandbox_with_tap_network — requires root");
         return;
@@ -259,7 +275,7 @@ async fn e2e_sandbox_with_tap_network() {
         return;
     };
 
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     finalize_startup_cleanup(&mgr).await;
     let mut events = mgr.subscribe_events();
 
@@ -270,7 +286,6 @@ async fn e2e_sandbox_with_tap_network() {
         "sandbox did not reach ready"
     );
 
-    #[cfg(target_os = "linux")]
     let tap_name = {
         let info = mgr.inspect_sandbox(&id).unwrap();
         let net = info.network.expect("tap mode should populate network info");
@@ -292,7 +307,6 @@ async fn e2e_sandbox_with_tap_network() {
 
     mgr.remove_sandbox(&id, true).await.unwrap();
 
-    #[cfg(target_os = "linux")]
     assert!(
         !common::iface_exists(&tap_name),
         "TAP {tap_name} should be removed after sandbox is removed"
@@ -312,7 +326,7 @@ async fn e2e_run_command() {
         return;
     };
 
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
     let (id, _) = mgr.create_sandbox(no_tap()).await.unwrap();
@@ -361,7 +375,6 @@ async fn e2e_run_command() {
 
 /// The VMM pid the sandbox's crash journal names, so the test can prove a
 /// process outlived its manager — and, later, that Remove reaped it.
-#[cfg(target_os = "linux")]
 fn journaled_pid(data_dir: &std::path::Path, id: &str) -> i32 {
     let journal = data_dir.join("sandboxes").join(id).join("state.json");
     let bytes = std::fs::read(&journal)
@@ -378,7 +391,6 @@ fn journaled_pid(data_dir: &std::path::Path, id: &str) -> i32 {
 /// VMM that Remove killed and it lingers unreaped, still named
 /// "firecracker". The state letter is what says it is gone, exactly as the
 /// driver's own liveness probe reads it.
-#[cfg(target_os = "linux")]
 fn firecracker_alive(pid: i32) -> bool {
     // `/proc/<pid>/stat` is "<pid> (<comm>) <state> ...", and comm may itself
     // contain spaces or parens — split at the LAST ')'.
@@ -417,7 +429,6 @@ fn firecracker_alive(pid: i32) -> bool {
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables, root, and vm-agent in rootfs"]
 async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
-    #[cfg(target_os = "linux")]
     if !common::is_root() {
         eprintln!("SKIP e2e_sandbox_outlives_its_manager_and_is_adopted — requires root");
         return;
@@ -433,7 +444,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
     };
 
     let (id, ip) = {
-        let mgr = SandboxManager::new(cfg).unwrap();
+        let mgr = manager(cfg);
         finalize_startup_cleanup(&mgr).await;
         let mut events = mgr.subscribe_events();
         let (id, ip) = mgr.create_sandbox(SandboxSpec::default()).await.unwrap();
@@ -448,9 +459,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
         (id, ip)
     };
 
-    #[cfg(target_os = "linux")]
     let pid = journaled_pid(&data_dir, &id);
-    #[cfg(target_os = "linux")]
     let tap_name = {
         let octets = ip
             .parse::<std::net::Ipv4Addr>()
@@ -458,7 +467,6 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
             .octets();
         format!("vmtap{}-{}", octets[2], octets[3])
     };
-    #[cfg(target_os = "linux")]
     assert!(
         firecracker_alive(pid),
         "the vmm outlives the manager that booted it"
@@ -466,7 +474,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
 
     // The next process: same data directory, nothing else carried over.
     let cfg = try_config(data_dir.to_str().unwrap()).unwrap();
-    let mgr = SandboxManager::new(cfg).unwrap();
+    let mgr = manager(cfg);
     // Awaits the startup sweep, which is where adoption happens.
     if let Some(token) = mgr.startup_cleanup_token().await.unwrap() {
         mgr.finalize_startup_cleanup(&token).await.unwrap();
@@ -483,12 +491,10 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
         Some(ip),
         "it kept the address its guest is configured with"
     );
-    #[cfg(target_os = "linux")]
     assert!(
         common::iface_exists(&tap_name),
         "TAP {tap_name} survived the restart rather than being swept"
     );
-    #[cfg(target_os = "linux")]
     assert!(firecracker_alive(pid), "the guest was never restarted");
 
     // An exec proves the vsock path was re-established, not just that the
@@ -529,7 +535,6 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
     // no PreparedVm crosses a restart.
     mgr.remove_sandbox(&id, true).await.unwrap();
     assert!(mgr.inspect_sandbox(&id).is_err());
-    #[cfg(target_os = "linux")]
     {
         assert!(!firecracker_alive(pid), "remove left a firecracker behind");
         assert!(

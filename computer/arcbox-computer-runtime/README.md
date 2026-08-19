@@ -107,8 +107,10 @@ root and no Firecracker.
 
 Everything real — TAP creation (`arcbox-tap-net`), boot, checkpoint —
 needs Linux with `CAP_NET_ADMIN`, a `firecracker` binary, and (for jailer
-mode) root.
-`examples/sandbox-smoke.rs` is the end-to-end walkthrough;
+mode) root, and so belongs to whoever composes the driver and the network.
+That is `arcbox-agent`: its `tests/sandbox_manager_e2e.rs` and
+`examples/sandbox-manager-smoke.rs` boot real Firecracker through the
+environment its `SandboxService` composes.
 `.github/workflows/test-vm-linux.yml` runs the whole ladder on real KVM.
 
 ## Jailer mode: every path the FC API sees is chroot-relative

@@ -1,19 +1,20 @@
-//! End-to-end smoke test for [`SandboxManager`].
+//! End-to-end smoke test for [`SandboxManager`], over the environment this
+//! crate composes for the System VM.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # Phase 1 + N only (core lifecycle + network — no guest agent required):
 //! ARCBOX_CONFIG=/etc/arcbox-computer-runtime/config.toml \
-//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
+//!   cargo run -p arcbox-agent --example sandbox-manager-smoke
 //!
 //! # Also run commands + guest-side network checks (Phase 2):
 //! ARCBOX_SMOKE_RUN=1 ARCBOX_CONFIG=... \
-//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
+//!   cargo run -p arcbox-agent --example sandbox-manager-smoke
 //!
 //! # Also checkpoint + restore (Phase 3):
 //! ARCBOX_SMOKE_CHECKPOINT=1 ARCBOX_CONFIG=... \
-//!   cargo run -p arcbox-computer-runtime --example sandbox-smoke
+//!   cargo run -p arcbox-agent --example sandbox-manager-smoke
 //! ```
 //!
 //! | Phase | Env var                     | Extra requirement              |
@@ -22,6 +23,17 @@
 //! | N     | (always)                    | same as Phase 1                |
 //! | 2     | `ARCBOX_SMOKE_RUN=1`        | guest agent in rootfs + vsock  |
 //! | 3     | `ARCBOX_SMOKE_CHECKPOINT=1` | KVM snapshot support           |
+
+// Everything below drives the Linux-only composition root; off Linux the
+// example says so and exits.
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "only `main` is compiled off Linux"
+    )
+)]
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -35,6 +47,12 @@ use arcbox_computer_runtime::{
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("the sandbox-manager smoke test is Linux-only");
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -59,7 +77,12 @@ async fn main() -> anyhow::Result<()> {
     let net_cidr = config.network.cidr.clone();
     let net_gateway = config.network.gateway.clone();
 
-    let manager = SandboxManager::new(config).context("SandboxManager::new")?;
+    // The environment `SandboxService::new` composes, so the smoke test
+    // exercises the real composition rather than one of its own.
+    let environment =
+        arcbox_agent::sandbox::node_environment(&config, arcbox_agent::sandbox::block_tools())?;
+    let manager = SandboxManager::with_environment(config, environment)
+        .context("SandboxManager::with_environment")?;
 
     // Phase 1 — Core lifecycle
     println!("\n=== Phase 1: Core lifecycle ===");
