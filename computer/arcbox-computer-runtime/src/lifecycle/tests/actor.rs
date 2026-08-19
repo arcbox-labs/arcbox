@@ -1399,9 +1399,24 @@ async fn a_handover_during_a_capture_is_refused() {
         .send(|reply| Command::Detach { reply })
         .error()
         .await;
+    let VmmError::WrongState {
+        expected, actual, ..
+    } = &error
+    else {
+        panic!("a handover during a capture must be refused: {error}");
+    };
+    // `wrong_state` reads `actual` off the public projection, and a capture
+    // projects `Ready` — so an expected side phrased as a state list would say
+    // "expected Ready or Running, actual Ready" and contradict itself. This is
+    // the string `detach_all` folds into the failure someone diagnoses a lost
+    // handover from, so it has to stay legible.
+    let actual_word = actual.to_lowercase();
     assert!(
-        matches!(error, VmmError::WrongState { .. }),
-        "a handover during a capture must be refused: {error}"
+        !expected
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word == actual_word),
+        "the refusal names the state it is refusing: expected {expected}, actual {actual}"
     );
     assert!(
         !harness.script.calls().contains(&"detach"),
