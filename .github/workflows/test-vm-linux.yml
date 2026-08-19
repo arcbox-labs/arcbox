@@ -84,6 +84,12 @@ jobs:
       - name: Clippy
         run: cargo clippy -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot -- -D warnings
 
+      - name: Remote-image feature
+        # `remote-image` is off by default and no job passes --all-features,
+        # so nothing else in CI ever compiles the registry-pull path a node
+        # builds Computer images through. One check keeps it from rotting.
+        run: cargo check -p arcbox-computer-runtime --features remote-image
+
       - name: Unit tests
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
