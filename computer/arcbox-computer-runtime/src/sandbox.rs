@@ -697,13 +697,16 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
 /// [`validate_new_sandbox_id`] where an id becomes a VM identity.
 ///
 /// Deliberately NO length cap here: this also runs against persisted
-/// records (reconcile, record loads) — where rejecting one legacy
-/// over-long id costs that record its reconciliation, so it is skipped
-/// rather than acted on and every resource it names is held (see
-/// `reconcile::sweep_orphans`) — and against snapshot / execution ids
-/// that never become a VM identity at all. Both limits the driver imposes
-/// are enforced only where a sandbox id enters the system:
-/// [`validate_new_sandbox_id`].
+/// records, and what one legacy over-long id would cost differs by call
+/// site. On the sweep path it costs that record its reconciliation — the
+/// journal is skipped rather than acted on, and every resource it names
+/// is held (`reconcile::sweep_orphans`). On a record *load* it costs
+/// every record theirs: [`SandboxRecordStore::load_all`] validates each
+/// id and propagates, so one rejection aborts the whole startup read,
+/// which is the stronger reason the cap is absent. It also runs against
+/// snapshot / execution ids that never become a VM identity at all. Both
+/// limits the driver imposes are enforced only where a sandbox id enters
+/// the system: [`validate_new_sandbox_id`].
 ///
 /// The gap between this alphabet and [`VmId`]'s is not academic: `_` is
 /// legal here and is not a `VmId`, so every record a pre-#680 process
