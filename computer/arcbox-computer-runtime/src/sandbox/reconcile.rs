@@ -414,8 +414,8 @@ pub(super) struct OrphanSweep {
     /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
     /// are live state again, not debris — and so do their runtime dirs.
     adopted: HashMap<String, AdoptedSandbox>,
-    /// Ids whose journal this process could not make sense of, so it acted
-    /// on neither the record nor the resources it names.
+    /// Sandboxes whose journal this process could not read: the name of
+    /// the directory each was found in, never the id it claimed.
     skipped: HashSet<String>,
     runtime_dirs: Vec<PathBuf>,
 }
@@ -520,15 +520,21 @@ pub(super) async fn sweep_orphans(
                 %error,
                 "skipping an unusable crash journal; the resources it names are left in place"
             );
-            // Both spellings, because one reason a journal is unusable is
-            // that they disagree: the durable record is keyed by the
-            // directory the journal was found in, and by the id the journal
-            // claims, and an unreadable one is exactly the case where those
-            // are not the same sandbox.
+            // The directory name, and never the id the journal claims.
+            // The directory is how this journal was found and the key its
+            // durable record shares; the claimed id is the untrusted half
+            // of a record this process has just refused to read, and one
+            // reason to refuse is that the two disagree. Letting directory
+            // `foo`'s broken journal insert `bar` would let it answer for a
+            // durable `bar` it has nothing to do with: a genuinely
+            // unjournaled `bar` in a live phase would read `Unchecked`
+            // instead of `Unjournaled`, so `recovery::plan` would return
+            // `Fail` where it must return `RefuseUnjournaled` — declaring a
+            // sandbox failed while its VMM may still be running, which is
+            // the one thing that refusal exists to prevent.
             if let Some(dir_name) = dir.file_name().and_then(|name| name.to_str()) {
                 skipped.insert(dir_name.to_owned());
             }
-            skipped.insert(record.id);
             continue;
         }
         records.push((dir, record));
@@ -729,11 +735,13 @@ pub(super) fn normalize_durable_records(
             None => JournalEvidence::Unchecked,
             Some(_) if adopted.contains_key(&record.id) => JournalEvidence::Adopted,
             Some(ids) if ids.contains(&record.id) => JournalEvidence::Swept,
-            // The sweep found this one's journal and could not read it, so
-            // it knows no more about the resources than if it had never
-            // run — which is what `Unchecked` means. Reading it as
-            // `Unjournaled` instead would refuse a live phase and abort
-            // startup, undoing the skip that kept the sweep going.
+            // The sweep found a journal in this id's directory and could
+            // not read it, so it knows no more about the resources than if
+            // it had never run — which is what `Unchecked` means. Reading
+            // it as `Unjournaled` instead would refuse a live phase and
+            // abort startup, undoing the skip that kept the sweep going.
+            // Keyed by directory name alone: see where `skipped` is filled
+            // for why a journal never answers for the id it claims.
             Some(_) if skipped.contains(&record.id) => JournalEvidence::Unchecked,
             Some(_) => JournalEvidence::Unjournaled,
         };
@@ -2093,6 +2101,52 @@ mod tests {
         assert!(
             broken_dir.join(STATE_FILE).exists(),
             "its journal stays on disk for a version that can read it"
+        );
+    }
+
+    /// A journal this process cannot read answers for the directory it
+    /// sits in and for nothing else. Recording the id it *claims* would let
+    /// it answer for a durable record it has nothing to do with, and the
+    /// answer it gives — `Unchecked` — is exactly the one that turns
+    /// `RefuseUnjournaled` into `Fail`: a sandbox declared failed while its
+    /// VMM may still be running.
+    #[tokio::test]
+    async fn a_skipped_journal_does_not_answer_for_the_id_it_claims() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // Directory `broken`, journal claiming `ghost` — the disagreement
+        // that makes a journal unreadable in the first place.
+        let broken_dir = data_dir.path().join("sandboxes").join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        let stray = SandboxStateRecord::new("ghost", None, None, None, &config, None).unwrap();
+        write_state_record(&broken_dir, &stray).unwrap();
+
+        // A real `ghost`: durably `Ready`, with no journal of its own. Its
+        // VMM may still be running, so recovery must refuse rather than
+        // declare it failed.
+        let (vm, _manager, network, reconciled) = sweep_one(
+            data_dir.path(),
+            &AdoptionCase::live(),
+            &[("ghost", PersistPhase::Ready)],
+        )
+        .await;
+
+        let error = reconciled.expect_err("an unjournaled live record still refuses normalization");
+        assert!(
+            error.to_string().contains("has no cleanup journal"),
+            "the broken journal spoke for ghost: {error}"
+        );
+        assert_eq!(
+            vm.state(),
+            VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9)),
+            "the reclaimed vm is handed back, not dropped"
+        );
+        assert_eq!(
+            network.adopted_mode(&VmId::new("keeper").unwrap()),
+            None,
+            "and so is its lease"
         );
     }
 
