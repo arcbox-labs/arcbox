@@ -370,6 +370,7 @@ dependencies = [
  "anyhow",
  "arcbox-atomic-file",
  "arcbox-computer-runtime",
+ "arcbox-constants",
  "arcbox-error",
  "arcbox-ext4",
  "arcbox-fc-driver",

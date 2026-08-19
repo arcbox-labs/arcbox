@@ -264,7 +264,7 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/var/lib/arcbox/sandbox/template-catalog` | Template catalog metadata, one JSON per template name (artifacts live in the rootfs cache / snapshot catalog) | agent |
 | `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
 | `/var/lib/arcbox/sandbox/rootfs-<layer>-<agent>.ext4` | Converted image rootfs cache, keyed on the source layer and the injected `vm-agent`; superseded entries are swept on the next conversion unless a snapshot still needs them as its dm-snapshot origin | agent |
-| `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
+| `/var/jail` | Firecracker jailer chroots, on a dev-allowing tmpfs. Short on purpose: the jail's sockets carry the sandbox id in their absolute path, and every byte of the base is a byte AF_UNIX leaves the id | agent |
 | `/run/arcbox/runtime/bin/{firecracker,jailer}` | Firecracker binaries in the active Btrfs runtime generation | agent |
 | `/run/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel in the active Btrfs runtime generation | agent |
 | `/arcbox/bin/vm-agent` | Sandbox init binary, staged next to `arcbox-agent` (via VirtioFS) | host daemon |

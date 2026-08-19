@@ -17,6 +17,23 @@ pub const KUBELET_DATA_MOUNT_POINT: &str = "/var/lib/kubelet";
 /// Guest mount point for CNI persistent state (`/var/lib/cni`).
 pub const CNI_DATA_MOUNT_POINT: &str = "/var/lib/cni";
 
+/// Guest base directory for Firecracker jailer chroots, laid out as
+/// `{base}/{firecracker binary name}/{vm id}/root`.
+///
+/// Short on purpose, and every byte of it is spent twice over. The jail's
+/// sockets carry the VM id in their absolute path and AF_UNIX leaves 107
+/// bytes for one, so the base is subtracted from what the id may use
+/// (`arcbox_fc_driver::jail::id_budget`): `/var/lib/arcbox/jailer` left
+/// 39, and the control plane mints 41-byte `inst-<uuid v7>` ids, so every
+/// create was refused at ingress. This leaves 52.
+///
+/// Under `/var` rather than the jailer's own `/srv/jailer` default because
+/// that is what the System VM has: its root is a read-only EROFS image
+/// carrying no `/srv`, and the jailer `mknod`s the rootfs inside the
+/// chroot, so the base must be a writable, dev-allowing mount —
+/// `arcbox-agent init` mounts a tmpfs here for exactly that.
+pub const JAILER_CHROOT_BASE: &str = "/var/jail";
+
 /// Docker Engine API Unix socket path in guest.
 pub const DOCKER_API_UNIX_SOCKET: &str = "/var/run/docker.sock";
 

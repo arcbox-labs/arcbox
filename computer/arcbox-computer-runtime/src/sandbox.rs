@@ -922,6 +922,8 @@ fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
 
 #[cfg(test)]
 mod tests {
+    use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, JAILER_CHROOT_BASE};
+
     use super::*;
 
     fn placeholder(id: &str) -> ComputerRuntime {
@@ -1001,16 +1003,21 @@ mod tests {
         assert!(!computers.read().unwrap().contains_key("dup"));
     }
 
-    /// A jailed `FcDriver` on the stock guest layout, which is what pins the
-    /// id budget the sandbox flows are held to.
+    /// A jailed `FcDriver` on the layout the node deploys, which is what
+    /// pins the id budget the sandbox flows are held to.
+    ///
+    /// The base is the constant the guest agent configures rather than a
+    /// copy of its value: the budget is measured off that path, so a
+    /// fixture holding its own copy would keep passing while the node it
+    /// claims to describe refuses every id.
     fn stock_jailed_config() -> VmmConfig {
         let mut config = VmmConfig::default();
-        config.firecracker.binary = "/usr/local/bin/firecracker".into();
+        config.firecracker.binary = format!("{ARCBOX_RUNTIME_BIN_DIR}/firecracker");
         config.firecracker.jailer = Some(crate::config::JailerConfig {
-            binary: "/usr/local/bin/jailer".into(),
+            binary: format!("{ARCBOX_RUNTIME_BIN_DIR}/jailer"),
             uid: 0,
             gid: 0,
-            chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+            chroot_base_dir: Some(JAILER_CHROOT_BASE.into()),
             netns: None,
             new_pid_ns: false,
             cgroup_version: None,
@@ -1023,6 +1030,15 @@ mod tests {
     fn fc_driver(config: &VmmConfig) -> FcDriver {
         FcDriver::new(FcDriverConfig::from(&config.firecracker))
     }
+
+    /// The id shape the platform node actually mints, in the rendering a
+    /// driver can run: the control plane's `inst_<uuid v7>` with the `_`
+    /// the VMM refuses turned into a `-`.
+    ///
+    /// Spelled out rather than generated, because its *length* is the
+    /// property under test and a bare `Uuid` is 5 bytes short of it — the
+    /// gap that let a 39-byte budget look sufficient.
+    const CONTROL_PLANE_ID: &str = "inst-019e409e-7546-7a3e-8b2c-1f2e3d4c5b6a";
 
     #[test]
     fn validate_id_accepts_safe_ids_and_rejects_traversal() {
@@ -1044,9 +1060,9 @@ mod tests {
     }
 
     /// The budget is the driver's, measured on the layout it will lay down —
-    /// not a constant this layer keeps its own copy of. A 36-char UUID fits;
-    /// anything past it must fail fast at ingress instead of surfacing as a
-    /// socket connect timeout.
+    /// not a constant this layer keeps its own copy of. Anything past it
+    /// must fail fast at ingress instead of surfacing as a socket connect
+    /// timeout.
     #[test]
     fn a_new_sandbox_id_is_held_to_the_drivers_own_budget() {
         let mut config = stock_jailed_config();
@@ -1054,10 +1070,6 @@ mod tests {
         let budget = driver
             .id_budget(&isolation_spec(&config).expect("a jailed isolation spec"))
             .expect("a jailed layout bounds the id");
-        assert!(
-            budget >= Uuid::new_v4().to_string().len(),
-            "the stock layout must still fit a UUID, got {budget}"
-        );
         assert!(validate_new_sandbox_id(&"a".repeat(budget), &driver, &config).is_ok());
         assert!(validate_new_sandbox_id(&"a".repeat(budget + 1), &driver, &config).is_err());
 
@@ -1073,6 +1085,26 @@ mod tests {
         assert!(validate_new_sandbox_id(&"a".repeat(budget), &deeper, &config).is_err());
     }
 
+    /// CORE-140's length half. A budget that refuses the ids the node mints
+    /// closes the charset half of the bug and leaves the create failing on
+    /// the other one — attributably, but still failing.
+    ///
+    /// Held against the real id, not a bare UUID: on the previous
+    /// `/var/lib/arcbox/jailer` base the budget was 39, which a 36-byte
+    /// UUID clears and the node's 41-byte id does not.
+    #[test]
+    fn the_deployed_layout_admits_the_id_shape_the_node_mints() {
+        let config = stock_jailed_config();
+        let driver = fc_driver(&config);
+        assert_eq!(
+            CONTROL_PLANE_ID.len(),
+            41,
+            "the node's ids are `inst-` plus a UUID"
+        );
+        validate_new_sandbox_id(CONTROL_PLANE_ID, &driver, &config)
+            .expect("the deployed jail layout must leave room for the ids the node mints");
+    }
+
     /// CORE-140. Firecracker validates the `--id` it is handed and refuses it
     /// by panicking — under the jailer *and* in direct mode, where the same
     /// flag is passed straight to the VMM. So the refusal cannot be gated on
@@ -1082,13 +1114,14 @@ mod tests {
         let mut config = stock_jailed_config();
         for _ in 0..2 {
             let driver = fc_driver(&config);
-            let error = validate_new_sandbox_id("inst_019e409e-7546", &driver, &config)
-                .expect_err("firecracker would refuse to run under this id");
+            let error =
+                validate_new_sandbox_id(&CONTROL_PLANE_ID.replacen('-', "_", 1), &driver, &config)
+                    .expect_err("firecracker would refuse to run under this id");
             assert!(
                 matches!(&error, VmmError::Config(message) if message.contains('_')),
                 "the error should name the offending character, got {error}"
             );
-            assert!(validate_new_sandbox_id("inst-019e409e-7546", &driver, &config).is_ok());
+            assert!(validate_new_sandbox_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
             // Direct mode passes the same `--id`, so it is refused there too.
             config.firecracker.jailer = None;
         }

@@ -19,6 +19,7 @@ mod platform {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
+    use arcbox_constants::paths::JAILER_CHROOT_BASE;
     use nix::mount::{MsFlags, mount};
     use nix::sys::resource::{Resource, setrlimit};
     use wait_timeout::ChildExt;
@@ -48,12 +49,15 @@ mod platform {
         mount_tmpfs("/etc");
 
         // The Firecracker jailer mknods a block device for the rootfs
-        // inside its chroot under /var/lib/arcbox/jailer/. That requires
-        // a filesystem mounted without `nodev`. Mount only the jailer
+        // inside its chroot under JAILER_CHROOT_BASE. That requires a
+        // filesystem mounted without `nodev`. Mount only the jailer
         // subtree as a separate dev-allowing tmpfs to keep the rest of
-        // /var with the default safer flags.
-        mkdir_p("/var/lib/arcbox/jailer");
-        mount_tmpfs_dev("/var/lib/arcbox/jailer");
+        // /var with the default safer flags. The base is the one the
+        // sandbox config names, so the two cannot drift: a jail staged
+        // somewhere this never mounted would fail its `mknod`, and one
+        // mounted where no jail is staged would waste the mount.
+        mkdir_p(JAILER_CHROOT_BASE);
+        mount_tmpfs_dev(JAILER_CHROOT_BASE);
 
         // Populate /etc with files containerd/dockerd expect.
         write_etc_resolv_conf();
