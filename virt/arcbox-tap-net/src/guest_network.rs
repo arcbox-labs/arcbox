@@ -746,12 +746,20 @@ mod tests {
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();
-        let Err(error) = network() else {
-            panic!("a ledger holding an id the port cannot name must fail to load");
-        };
+        // This used to be fatal, and being fatal was the opposite of
+        // useful: the load runs inside the constructor, so one marker this
+        // build cannot name meant no network at all — and the ledger holds
+        // host resources that still need reaping, which a host that cannot
+        // construct its network never reaps. The marker is skipped, and it
+        // stays on disk for a version that can name it.
+        let reloaded = network().expect("an unnameable marker is skipped, not fatal");
         assert!(
-            error.to_string().contains(&long_id) && error.to_string().contains("exceeds 64"),
-            "{error}"
+            !reloaded.quarantine_pending(&long_id),
+            "a skipped marker is not registered as a pending cleanup"
+        );
+        assert!(
+            ledger.join(format!("{long_id}.json")).exists(),
+            "its entry is left where a later version can read it"
         );
     }
 }

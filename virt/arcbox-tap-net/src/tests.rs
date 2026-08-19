@@ -372,16 +372,19 @@ fn quarantine_loader_rejects_foreign_or_inconsistent_allocations() {
         };
         mutate(&mut allocation);
         quarantine::write_quarantine(&quarantine, "box", &allocation).unwrap();
-        assert!(
-            TapNetwork::with_quarantine_dir(
-                "10.0.0.0/30",
-                "10.0.0.1",
-                vec![],
-                quarantine,
-                Datapath::default(),
-                Arc::new(IptablesLegacy::default()),
-            )
-            .is_err()
-        );
+        let network = TapNetwork::with_quarantine_dir(
+            "10.0.0.0/30",
+            "10.0.0.1",
+            vec![],
+            quarantine,
+            Datapath::default(),
+            Arc::new(IptablesLegacy::default()),
+        )
+        .expect("a marker this pool did not write is skipped, not fatal");
+        // Skipped means *not adopted*: the entry is neither trusted as a
+        // pending cleanup nor allowed to hold an address out of the pool.
+        // Failing the whole load instead would take the network subsystem
+        // down over one file, and with it every address it was protecting.
+        assert!(!network.quarantine_pending("box"));
     }
 }

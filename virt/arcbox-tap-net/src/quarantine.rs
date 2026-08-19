@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use arcbox_vm_driver::VmId;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
@@ -249,30 +249,37 @@ pub fn load_quarantines(
             Some("tmp") => continue,
             Some("json") => {}
             _ => {
-                return Err(TapNetError::Network(format!(
-                    "unexpected sandbox network quarantine file {}",
-                    path.display()
-                )));
+                warn!(path = %path.display(), "ignoring an unexpected file in the quarantine ledger");
+                continue;
             }
         }
-        let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(&path)?)?;
-        validate_id(&marker.id)?;
-        if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
-            return Err(TapNetError::Network(format!(
-                "sandbox network quarantine {} has an invalid cleanup token",
-                marker.id
-            )));
-        }
-        validate_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
+        // A marker this process cannot read is skipped, not propagated.
+        // This load runs inside `TapNetwork`'s constructor, so an error
+        // here fails the network subsystem outright — every address stays
+        // out of the pool and nothing can be created, with no self-heal
+        // short of deleting the file by hand. Skipping leaks the one
+        // address the marker names, visibly, and the ledger entry stays on
+        // disk for a version that can read it.
+        //
+        // The rule this pays for: an id a *previous* process could write is
+        // not necessarily one this process can parse. `VmId` is narrower
+        // than it was, and a marker is written before the VMM that would
+        // have rejected the id ever starts, so the hosts that most need
+        // reconciling are exactly the ones holding unparseable markers.
+        let marker = match read_marker(&path, base, prefix_len, gateway) {
+            Ok(marker) => marker,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "skipping an unreadable network quarantine marker; its address stays out of the pool"
+                );
+                continue;
+            }
+        };
         if !tokens.insert(marker.allocation.cleanup_token.clone()) {
             return Err(TapNetError::Network(format!(
                 "duplicate sandbox network quarantine token for {}",
-                marker.id
-            )));
-        }
-        if path.file_stem().and_then(|value| value.to_str()) != Some(marker.id.as_str()) {
-            return Err(TapNetError::Network(format!(
-                "sandbox network quarantine filename does not match {}",
                 marker.id
             )));
         }
@@ -288,6 +295,39 @@ pub fn load_quarantines(
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(quarantined)
+}
+
+/// One marker, and every check that decides whether *this* process can act
+/// on it.
+///
+/// Split out so [`load_quarantines`] has one place to skip: everything here
+/// is about the marker alone, and a failure means the ledger holds an entry
+/// this build cannot name. The duplicate-token and duplicate-id checks stay
+/// in the loop deliberately — they are properties of the set, not of a
+/// marker, and skipping one of a colliding pair would silently pick a
+/// winner and lose the other's address.
+fn read_marker(
+    path: &Path,
+    base: Ipv4Addr,
+    prefix_len: u8,
+    gateway: Ipv4Addr,
+) -> Result<NetworkQuarantine> {
+    let marker: NetworkQuarantine = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_id(&marker.id)?;
+    if Uuid::parse_str(&marker.allocation.cleanup_token).is_err() {
+        return Err(TapNetError::Network(format!(
+            "sandbox network quarantine {} has an invalid cleanup token",
+            marker.id
+        )));
+    }
+    validate_allocation(&marker.id, &marker.allocation, base, prefix_len, gateway)?;
+    if path.file_stem().and_then(|value| value.to_str()) != Some(marker.id.as_str()) {
+        return Err(TapNetError::Network(format!(
+            "sandbox network quarantine filename does not match {}",
+            marker.id
+        )));
+    }
+    Ok(marker)
 }
 
 /// Whether `allocation` is one this network could have written for `id`:
