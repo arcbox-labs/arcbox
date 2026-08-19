@@ -59,7 +59,7 @@ use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::deadlines;
 use crate::sandbox::record::{
-    PersistPhase, SandboxProvisionOutcome, SandboxRecordStore, SandboxTransition,
+    ComputerProvisionOutcome, ComputerRecordStore, ComputerTransition, PersistPhase,
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
@@ -143,7 +143,7 @@ pub enum Command {
     /// answered by READY, which is what its caller waits for.
     Provision {
         provision: Provision,
-        outcome: SandboxProvisionOutcome,
+        outcome: ComputerProvisionOutcome,
         reply: Reply,
     },
     /// Capture a user checkpoint; answered with the catalog entry.
@@ -287,7 +287,7 @@ struct Completion {
 /// What a completed sub-task tells the actor.
 enum Report {
     Booted(Arc<dyn GuestAgent>),
-    Restored(Arc<dyn GuestAgent>, SandboxProvisionOutcome),
+    Restored(Arc<dyn GuestAgent>, ComputerProvisionOutcome),
     Resumed(Arc<dyn GuestAgent>),
     Gated,
     Captured(CheckpointInfo),
@@ -369,7 +369,7 @@ pub struct ComputerActor {
     /// — the durable effects are then no-ops, as they are today.
     generation: Option<Uuid>,
     vm_dir: PathBuf,
-    records: Arc<SandboxRecordStore>,
+    records: Arc<ComputerRecordStore>,
     events_tx: broadcast::Sender<ComputerEvent>,
     tasks: Arc<dyn ComputerTasks>,
     seeded: Seeded,
@@ -408,7 +408,7 @@ pub struct ComputerActor {
     /// pause's own, which names itself.
     capture: Option<CaptureSpec>,
     /// The provision outcome the `Starting` and atomic-`Ready` writes carry.
-    outcome: SandboxProvisionOutcome,
+    outcome: ComputerProvisionOutcome,
     /// Attributes of the events a transition asks for.
     pause_reason: PauseReason,
     resume_reason: String,
@@ -459,7 +459,7 @@ pub struct ComputerSeed {
     pub unregister: Arc<dyn Fn() + Send + Sync>,
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,
-    pub records: Arc<SandboxRecordStore>,
+    pub records: Arc<ComputerRecordStore>,
     pub events_tx: broadcast::Sender<ComputerEvent>,
     pub tasks: Arc<dyn ComputerTasks>,
     pub deadlines: Deadlines,
@@ -501,7 +501,7 @@ impl ComputerActor {
             error: None,
             pause_snapshot_id: None,
             capture: None,
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             pause_reason: PauseReason::Requested,
             resume_reason: crate::sandbox::pause_reason::RESUME.to_owned(),
             exit: None,

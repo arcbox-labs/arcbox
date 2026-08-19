@@ -24,7 +24,7 @@ impl ComputerActor {
             Effect::CommitRestored { durability } => {
                 return self.commit(
                     PersistPhase::Ready,
-                    SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
+                    ComputerTransition::ReadyWithOutcome(self.outcome.clone()),
                     durability,
                 );
             }
@@ -146,15 +146,15 @@ impl ComputerActor {
 
     fn persist(&mut self, phase: PersistPhase, durability: Durability) -> Flow {
         let transition = match phase {
-            PersistPhase::Starting => SandboxTransition::Starting(self.outcome.clone()),
-            PersistPhase::Ready => SandboxTransition::Ready,
-            PersistPhase::Stopping => SandboxTransition::Stopping,
-            PersistPhase::Stopped => SandboxTransition::Stopped,
+            PersistPhase::Starting => ComputerTransition::Starting(self.outcome.clone()),
+            PersistPhase::Ready => ComputerTransition::Ready,
+            PersistPhase::Stopping => ComputerTransition::Stopping,
+            PersistPhase::Stopped => ComputerTransition::Stopped,
             PersistPhase::Failed => {
-                SandboxTransition::Failed(self.error.clone().unwrap_or_default())
+                ComputerTransition::Failed(self.error.clone().unwrap_or_default())
             }
-            PersistPhase::Removing => SandboxTransition::Removing,
-            PersistPhase::Pausing => SandboxTransition::Pausing,
+            PersistPhase::Removing => ComputerTransition::Removing,
+            PersistPhase::Pausing => ComputerTransition::Pausing,
             PersistPhase::Paused => {
                 // What a paused computer retains, recorded where every
                 // reader of it looks: `Inspect` and `List` size the
@@ -166,11 +166,11 @@ impl ComputerActor {
                 runtime
                     .pause_snapshot_id
                     .clone_from(&self.pause_snapshot_id);
-                SandboxTransition::Paused {
+                ComputerTransition::Paused {
                     snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
                 }
             }
-            PersistPhase::Resuming => SandboxTransition::Resuming,
+            PersistPhase::Resuming => ComputerTransition::Resuming,
             // The provisioning intent is written before there is a machine to
             // ask for it, so no transition names it.
             PersistPhase::Creating => return Flow::Continue,
@@ -181,7 +181,7 @@ impl ComputerActor {
     fn commit(
         &mut self,
         phase: PersistPhase,
-        transition: SandboxTransition,
+        transition: ComputerTransition,
         durability: Durability,
     ) -> Flow {
         let Some(generation) = self.generation else {
@@ -247,7 +247,7 @@ impl ComputerActor {
                 // `Failure` and fail the same callers twice.
                 let reverted = self.commit(
                     PersistPhase::Paused,
-                    SandboxTransition::Paused {
+                    ComputerTransition::Paused {
                         snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
                     },
                     Durability::Warn,

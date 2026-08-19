@@ -99,7 +99,7 @@ pub(super) enum Effect {
     /// `Ready` reached in one hop from `Creating`: the restore path's atomic
     /// commit, which carries the provision outcome the skipped `Starting`
     /// write would have persisted. It is the one durable move outside the
-    /// edge set — `SandboxRecord::apply` allows it only from `Creating`
+    /// edge set — `ComputerRecord::apply` allows it only from `Creating`
     /// (`atomic_ready`), so no other state may emit it.
     CommitRestored {
         durability: Durability,

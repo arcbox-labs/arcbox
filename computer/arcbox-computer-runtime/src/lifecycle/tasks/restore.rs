@@ -144,7 +144,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             // and crash reconciliation key the chroot and dm/CoW teardown
             // on it (see release_runtime_resources / sweep_orphans).
             instance.lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
-            let handover = sandbox::reconcile::SandboxStateRecord::new(
+            let handover = sandbox::reconcile::ComputerStateRecord::new(
                 new_id,
                 sandbox::journaled_pid(&*slot.prepared),
                 lease
@@ -236,7 +236,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
 
             let pid = sandbox::journaled_pid(&*spawned_prepared);
             let journal = |cow: Option<&CowHandle>| {
-                sandbox::reconcile::SandboxStateRecord::new(
+                sandbox::reconcile::ComputerStateRecord::new(
                     new_id,
                     pid,
                     lease
@@ -452,7 +452,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
     // Persist cleanup metadata before handing runtime resources to the
     // instance. A failed durable write aborts and unwinds every resource.
     let adopted_slot = instance.lock().unwrap().pool_slot_id.clone();
-    let final_journal = sandbox::reconcile::SandboxStateRecord::new(
+    let final_journal = sandbox::reconcile::ComputerStateRecord::new(
         new_id,
         sandbox::journaled_pid(&*prepared),
         lease

@@ -207,7 +207,7 @@ pub(super) fn explore() -> Vec<Node> {
                         );
                         phase = Some(*next);
                     }
-                    // The one move outside the edge set: `SandboxRecord::
+                    // The one move outside the edge set: `ComputerRecord::
                     // apply` waives it for `ReadyWithOutcome`, and only from
                     // `Creating`, so the machine must never emit it elsewhere.
                     Effect::CommitRestored { .. } => {

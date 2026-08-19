@@ -1,5 +1,5 @@
 use super::reconcile::JournaledLease;
-use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::record::{ComputerProvisionOutcome, ComputerTransition, ProvisionIntent};
 use super::*;
 use crate::lifecycle::actor::ComputerSnapshot;
 use crate::sandbox::record::PersistPhase;
@@ -350,7 +350,7 @@ impl SandboxManager {
                 .unwrap_or_default();
 
             super::reconcile::create_runtime_dir(&vm_dir)?;
-            let cleanup_record = super::reconcile::SandboxStateRecord::new(
+            let cleanup_record = super::reconcile::ComputerStateRecord::new(
                 &id,
                 None,
                 lease
@@ -408,7 +408,7 @@ impl SandboxManager {
                         .transition(
                             &id,
                             generation,
-                            SandboxTransition::Failed(error.to_string()),
+                            ComputerTransition::Failed(error.to_string()),
                         )
                         .err()
                         .map(|record_error| format!("record: {record_error}"));
@@ -489,7 +489,7 @@ impl SandboxManager {
             })),
             seeded: Seeded::Fresh,
         });
-        let outcome = SandboxProvisionOutcome {
+        let outcome = ComputerProvisionOutcome {
             ip_address: ip_address.clone(),
         };
         // `AckUnconfirmed` says the `Starting` write is visible but not

@@ -1,5 +1,5 @@
 use super::reconcile::JournaledLease;
-use super::record::{ProvisionIntent, SandboxProvisionOutcome};
+use super::record::{ComputerProvisionOutcome, ProvisionIntent};
 use super::*;
 use crate::lifecycle::tasks::CaptureSpec;
 
@@ -278,7 +278,7 @@ impl SandboxManager {
         let mut nic: Option<NicSpec> = None;
         let setup = async {
             super::reconcile::create_runtime_dir(&vm_dir)?;
-            let cleanup_record = super::reconcile::SandboxStateRecord::new(
+            let cleanup_record = super::reconcile::ComputerStateRecord::new(
                 &new_id,
                 None,
                 lease
@@ -348,7 +348,7 @@ impl SandboxManager {
             })),
             seeded: Seeded::Fresh,
         });
-        let outcome = SandboxProvisionOutcome {
+        let outcome = ComputerProvisionOutcome {
             ip_address: ip_address.clone(),
         };
         // A restore's caller waits for READY: that is what makes the sandbox

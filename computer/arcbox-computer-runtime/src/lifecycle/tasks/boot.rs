@@ -184,7 +184,7 @@ pub async fn do_boot(
     };
 
     let process_pid = sandbox::journaled_pid(&*prepared);
-    let journal_error = sandbox::reconcile::SandboxStateRecord::new(
+    let journal_error = sandbox::reconcile::ComputerStateRecord::new(
         id,
         process_pid,
         net.map(NetworkAttachment::journaled),
@@ -241,7 +241,7 @@ pub async fn do_boot(
     let paths: Result<(PathBuf, PathBuf)> = async {
         if fc_cfg.jailer.is_some() {
             let journal = |cow: Option<&CowHandle>| {
-                sandbox::reconcile::SandboxStateRecord::new(
+                sandbox::reconcile::ComputerStateRecord::new(
                     id,
                     process_pid,
                     net.map(NetworkAttachment::journaled),
@@ -286,7 +286,7 @@ pub async fn do_boot(
             let rootfs = match cow_manager.setup(id, &spec.rootfs).await {
                 Ok(handle) => {
                     cow_handle = Some(handle);
-                    let record = sandbox::reconcile::SandboxStateRecord::new(
+                    let record = sandbox::reconcile::ComputerStateRecord::new(
                         id,
                         process_pid,
                         net.map(NetworkAttachment::journaled),

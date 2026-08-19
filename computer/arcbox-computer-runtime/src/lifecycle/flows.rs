@@ -31,8 +31,8 @@ use crate::config::RuntimeConfig;
 use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pool::SlotPool;
-use crate::sandbox::record::SandboxProvisionOutcome;
-use crate::sandbox::record::SandboxRecordStore;
+use crate::sandbox::record::ComputerProvisionOutcome;
+use crate::sandbox::record::ComputerRecordStore;
 use crate::sandbox::warm::WarmPublishTicket;
 use crate::sandbox::{CheckpointInfo, ComputerEvent, ComputerId, NetworkAttachment};
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
@@ -53,7 +53,7 @@ pub struct ComputerServices {
     pub agents: Arc<dyn GuestAgentFactory>,
     pub config: Arc<RuntimeConfig>,
     pub cow_manager: Arc<CowManager>,
-    pub records: Arc<SandboxRecordStore>,
+    pub records: Arc<ComputerRecordStore>,
     pub snapshots: Arc<SnapshotCatalog>,
     pub events_tx: broadcast::Sender<ComputerEvent>,
     pub pool: Arc<SlotPool>,
@@ -177,7 +177,7 @@ impl ComputerTasks for ComputerFlows {
     async fn restore(
         &self,
         origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)> {
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)> {
         self.restore_vm(origin).await
     }
 

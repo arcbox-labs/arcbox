@@ -76,7 +76,7 @@ pub async fn restore_paused(
             // journal and the datapath cannot disagree.
             let net =
                 net.map(|lease| JournaledLease::from_snapshot(lease, snap_meta.net_invariant));
-            sandbox::reconcile::SandboxStateRecord::new(id, pid, net, cow, config, None)
+            sandbox::reconcile::ComputerStateRecord::new(id, pid, net, cow, config, None)
                 .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
         };
         journal(None, None, lease.as_ref())?;

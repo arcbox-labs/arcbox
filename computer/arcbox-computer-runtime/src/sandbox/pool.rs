@@ -14,7 +14,7 @@
 //! network-agnostic (the seam CORE-81 builds on).
 
 use super::boot::{StageError, stage_rootfs_cow_or_copy};
-use super::reconcile::{self, POOL_SLOT_PREFIX, SandboxStateRecord};
+use super::reconcile::{self, ComputerStateRecord, POOL_SLOT_PREFIX};
 use super::*;
 use crate::config::JailerConfig;
 use crate::snapshot::SnapshotMeta;
@@ -78,7 +78,7 @@ pub(super) async fn prepare_slot(
     reconcile::create_runtime_dir(&vm_dir)?;
     reconcile::write_state_record(
         &vm_dir,
-        &SandboxStateRecord::new(&slot_id, None, None, None, config, None)?,
+        &ComputerStateRecord::new(&slot_id, None, None, None, config, None)?,
     )?;
 
     match stage_slot(driver, config, jc, cow_manager, snapshot, &slot_id, &vm_dir).await {
@@ -174,7 +174,7 @@ async fn stage_slot(
     let journal = |cow: Option<&CowHandle>| {
         reconcile::write_state_record(
             vm_dir,
-            &SandboxStateRecord::new(slot_id, pid, None, cow, config, None)?,
+            &ComputerStateRecord::new(slot_id, pid, None, cow, config, None)?,
         )
     };
     let carry = |error: ComputerError, prepared, cow_handle| SlotFailure {

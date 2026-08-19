@@ -217,7 +217,7 @@ impl ComputerActor {
             return Ok(());
         };
         self.records
-            .transition(&self.id, generation, SandboxTransition::Stopped)?
+            .transition(&self.id, generation, ComputerTransition::Stopped)?
             .confirmed("computer stop retry")?;
         // The write just confirmed, so whatever blocked the first clear is
         // answered.

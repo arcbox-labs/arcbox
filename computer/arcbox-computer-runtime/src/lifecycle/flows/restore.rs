@@ -21,8 +21,8 @@ use crate::lifecycle::event::RestoreOrigin;
 use crate::lifecycle::tasks::restore::{RestoreTimings, RestoreVm, RestoredVm, restore_vm};
 use crate::lifecycle::tasks::resume::restore_paused;
 use crate::lifecycle::tasks::{TaskFailure, TaskResult};
-use crate::sandbox::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
-use crate::sandbox::record::SandboxProvisionOutcome;
+use crate::sandbox::reconcile::{ComputerStateRecord, JournaledLease, write_state_record};
+use crate::sandbox::record::ComputerProvisionOutcome;
 use crate::sandbox::{journaled_pid, pool};
 
 impl ComputerFlows {
@@ -32,7 +32,7 @@ impl ComputerFlows {
     pub(super) async fn restore_vm(
         &self,
         origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)> {
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)> {
         let Launch::Restore(launch) = self.take_launch() else {
             return Err(self.wrong_launch("restore"));
         };
@@ -93,7 +93,7 @@ impl ComputerFlows {
             // so it is written before anything is torn down.
             Err(failure) => {
                 let pool_slot_id = self.computer.lock().unwrap().pool_slot_id.clone();
-                let journal = SandboxStateRecord::new(
+                let journal = ComputerStateRecord::new(
                     &self.id,
                     failure.prepared.as_deref().and_then(journaled_pid),
                     lease
@@ -165,7 +165,7 @@ impl ComputerFlows {
             &snapshot_id,
         );
 
-        Ok((agent, SandboxProvisionOutcome { ip_address }))
+        Ok((agent, ComputerProvisionOutcome { ip_address }))
     }
 
     /// Bring a paused computer back in place, onto a fresh network.

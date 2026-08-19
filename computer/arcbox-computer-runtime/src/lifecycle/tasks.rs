@@ -31,7 +31,7 @@ use super::event::{Event, RestoreOrigin};
 use crate::agent::GuestAgent;
 use crate::error::ComputerError;
 use crate::sandbox::CheckpointInfo;
-use crate::sandbox::record::SandboxProvisionOutcome;
+use crate::sandbox::record::ComputerProvisionOutcome;
 
 /// What a sub-task hands back: its own success value, or the failure class
 /// the machine branches on.
@@ -144,7 +144,7 @@ pub trait ComputerTasks: Send + Sync + 'static {
     async fn restore(
         &self,
         origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)>;
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)>;
 
     /// Capture a checkpoint. `hold` keeps the guest quiesced afterwards (the
     /// pause path): progress past the memory image would diverge from the
