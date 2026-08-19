@@ -275,17 +275,16 @@ fn the_ttl_cap_destroys_everywhere_except_a_resting_removed_or_handed_over_compu
 /// The complement is the point: a computer mid-launch still has its resources
 /// in the boot task rather than on itself, and one mid-teardown was asked to
 /// go away — handing either over would give the successor something its record
-/// does not describe. Everywhere the machine declines, the actor answers, so
-/// declining must also leave the computer exactly where it was.
+/// does not describe. `checkpointing` is excluded for a third reason, pinned
+/// by `a_handover_is_refused_while_a_capture_is_in_flight`. Everywhere the
+/// machine declines, the actor answers, so declining must also leave the
+/// computer exactly where it was.
 #[test]
 fn a_handover_only_acts_where_a_live_handle_is_settled() {
     for node in explore() {
         let (mut sm, mut context) = reach(&node.path);
         let (after, effects) = step(&mut sm, &mut context, &Event::Detach);
-        let acts = matches!(
-            node.state,
-            State::Ready {} | State::Running {} | State::Checkpointing {}
-        );
+        let acts = matches!(node.state, State::Ready {} | State::Running {});
         assert_eq!(
             effects.is_empty(),
             !acts,
@@ -350,6 +349,45 @@ fn a_handed_over_computer_refuses_every_teardown() {
             "{event:?} acted on a handed-over computer: {effects:?}"
         );
     }
+}
+
+/// A capture in flight refuses the handover.
+///
+/// `checkpointing` sits under `active` beside `ready` and `running`, so it
+/// would otherwise inherit the arm. Its capture runs in a sub-task that cloned
+/// the handle before it started, and the driver's detach only stands the
+/// reaper down — the handle stays fully functional — so the task would go on
+/// to freeze, snapshot and resume a guest the successor had already adopted,
+/// while `detached` silently swallowed its `CaptureDone`. Nothing on the
+/// handover path preempts it: `Effect::Detach` is awaited inline and never
+/// reaches `spawn`, and the arm emits no `AbortInflight`.
+#[test]
+fn a_handover_is_refused_while_a_capture_is_in_flight() {
+    let (mut sm, mut context) = ready_machine();
+    let (state, _) = step(&mut sm, &mut context, &Event::Checkpoint);
+    assert!(matches!(state, State::Checkpointing {}));
+
+    let (after, effects) = step(&mut sm, &mut context, &Event::Detach);
+    assert!(
+        matches!(after, State::Checkpointing {}),
+        "the handover moved a computer mid-capture to {after:?}"
+    );
+    assert!(
+        effects.is_empty(),
+        "the handover acted while a capture held the handle: {effects:?}"
+    );
+
+    // And once the capture is done the computer hands over normally.
+    let (state, _) = step(
+        &mut sm,
+        &mut context,
+        &Event::CaptureDone {
+            snapshot_id: "snap".to_owned(),
+        },
+    );
+    assert!(matches!(state, State::Ready {}));
+    let (_, effects) = step(&mut sm, &mut context, &Event::Detach);
+    assert_eq!(effects, vec![Effect::Detach]);
 }
 
 /// The handover cancels both deadline timers, and answers its caller.

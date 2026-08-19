@@ -556,8 +556,14 @@ impl SandboxManager {
     pub async fn detach_all(&self) -> Result<()> {
         // The sweep adopts and kills VMs by the same deterministic names, so
         // racing it is the same class of bug; `stop_sandbox` and
-        // `remove_sandbox` wait it out for exactly this reason.
-        self.await_reconcile().await?;
+        // `remove_sandbox` wait it out for exactly this reason. Its *failure*
+        // is not propagated the way theirs is: this is the process's last
+        // chance to save every guest it holds, and refusing the whole handover
+        // because the sweep failed would kill all of them to report a fault in
+        // something that has already finished.
+        if let Err(error) = self.await_reconcile().await {
+            warn!(%error, "the startup sweep failed; handing over anyway");
+        }
         let computers: Vec<(SandboxId, Mailbox)> = self
             .computers
             .read()

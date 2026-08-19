@@ -238,8 +238,10 @@ impl ComputerLifecycle {
         }
     }
 
-    /// The three states holding a settled live handle — which is exactly the
-    /// set a handover can act on, and why `Detach` sits beside `Stop` here.
+    /// The states holding a settled live handle, which is why `Detach` sits
+    /// beside `Stop` here. `checkpointing` is the one member that refuses it:
+    /// its capture sub-task holds a clone of the handle and would keep driving
+    /// a guest this process had handed over.
     #[superstate(superstate = "computer")]
     fn active(event: &Event, context: &mut Effects) -> Outcome {
         match event {
@@ -355,9 +357,18 @@ impl ComputerLifecycle {
                 context.emit(Effect::ArmTimer(Timer::Idle));
                 Transition(State::ready())
             }
+            // A handover is refused here, unlike in the rest of `active`. The
+            // capture runs in a sub-task that cloned the handle before it
+            // started, and `Detach` stands nothing down — the driver's detach
+            // only releases the reaper, leaving the handle fully functional —
+            // so the task would go on to freeze, snapshot and resume a guest
+            // this process no longer owns. Refusing costs the departing
+            // process's capture; accepting would corrupt the successor's
+            // guest, and the caller hears which computer it lost.
             Event::ClaimWorkload { .. }
             | Event::Pause { .. }
             | Event::Checkpoint
+            | Event::Detach
             | Event::IdleExpired { .. } => Handled,
             _ => Super,
         }

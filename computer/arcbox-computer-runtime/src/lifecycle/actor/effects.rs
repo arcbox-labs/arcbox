@@ -127,7 +127,17 @@ impl ComputerActor {
             Effect::Detach => match self.tasks.detach().await {
                 // The machine has not moved yet: it emitted this effect and
                 // stayed put, so the handover's own outcome is what decides.
-                Ok(()) => self.queued.push_back(Event::Detached),
+                Ok(()) => {
+                    // The data plane reads the agent straight off the snapshot
+                    // and never round-trips the mailbox, so the state alone
+                    // cannot stop it — and `detached` projects `Ready`, which
+                    // is exactly what `require_alive_agent` admits. Dropping
+                    // the agent is what keeps an exec or a file write out of a
+                    // guest the successor now owns; a stop and a release do
+                    // the same for the same reason.
+                    self.forget_agent();
+                    self.queued.push_back(Event::Detached);
+                }
                 // Stay where we are. The VM is still ours and still usable —
                 // it simply dies with this process, which is what a failed
                 // handover has always meant. Failing the computer instead
