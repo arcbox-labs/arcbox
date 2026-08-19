@@ -67,10 +67,11 @@ pub(super) fn ordinal(state: State) -> usize {
         State::Failed {} => 14,
         State::Removing {} => 15,
         State::Gone {} => 16,
+        State::Detached {} => 17,
     }
 }
 
-pub(super) const LEAVES: usize = 17;
+pub(super) const LEAVES: usize = 18;
 
 /// One event of every shape the actor can deliver. `Recovered` and `Adopted`
 /// are excluded: they seed a machine rather than move one, and are roots of
@@ -116,6 +117,8 @@ pub(super) fn alphabet() -> Vec<Event> {
         Event::Remove { force: false },
         Event::Remove { force: true },
         Event::RemoveDone,
+        Event::Detach,
+        Event::Detached,
         Event::Failure,
         Event::Frozen,
         Event::Stranded,
@@ -238,5 +241,17 @@ pub(super) fn ready_machine() -> (Machine, Effects) {
         Event::ResourcesHandedOff,
         Event::AgentReady,
         Event::Gated,
+    ])
+}
+
+/// A computer whose VM has been handed to the next process.
+pub(super) fn detached_machine() -> (Machine, Effects) {
+    reach(&[
+        Event::Provision(Provision::Boot { warm: false }),
+        Event::ResourcesHandedOff,
+        Event::AgentReady,
+        Event::Gated,
+        Event::Detach,
+        Event::Detached,
     ])
 }

@@ -162,6 +162,15 @@ pub trait ComputerTasks: Send + Sync + 'static {
     /// Release the resources `scope` names.
     async fn release(&self, scope: ReleaseScope) -> TaskResult;
 
+    /// Give the VM up without stopping it, so the next process can adopt it.
+    ///
+    /// `Ok` with nothing to hand over — no handle, or a driver that runs its
+    /// VMs in-process and has no `Detach` — is a real success: there is no VM
+    /// this process would have killed on the way out. Unlike the other verbs
+    /// this one is awaited inside the actor's dispatch rather than spawned; see
+    /// [`Effect::Detach`](super::effect::Effect::Detach).
+    async fn detach(&self) -> TaskResult;
+
     /// The agent reaching a computer this process never launched: the one
     /// the startup sweep took back, whose handle it already holds.
     ///

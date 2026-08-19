@@ -28,6 +28,10 @@ impl State {
             Self::Capturing {} | Self::Releasing {} => SandboxState::Pausing,
             Self::Paused {} => SandboxState::Paused,
             Self::Stopping {} | Self::Removing {} => SandboxState::Stopping,
+            // A handed-over computer is still a live, usable guest — it just
+            // belongs to the next process. That is what its record says and
+            // what the successor adopts it as, so it is what a caller sees.
+            Self::Detached {} => SandboxState::Ready,
             // A removed computer is gone from the map; nothing reads `gone`.
             Self::Stopped {} | Self::Gone {} => SandboxState::Stopped,
             Self::Failed {} => SandboxState::Failed,
@@ -60,7 +64,12 @@ impl State {
                 PersistPhase::Starting
             }),
             Self::Gone {} => None,
-            Self::Ready {} | Self::Running {} | Self::Checkpointing {} => Some(PersistPhase::Ready),
+            // A handover writes no record, and that is the point: the successor's
+            // sweep adopts a `Ready` computer, and any other phase would have it
+            // reinstated as `Failed` instead of taken back.
+            Self::Ready {} | Self::Running {} | Self::Checkpointing {} | Self::Detached {} => {
+                Some(PersistPhase::Ready)
+            }
             Self::Capturing {} | Self::Releasing {} => Some(PersistPhase::Pausing),
             Self::Paused {} => Some(PersistPhase::Paused),
             Self::Resuming {} => Some(PersistPhase::Resuming),

@@ -201,6 +201,10 @@ impl ComputerTasks for ComputerFlows {
         self.release_scope(scope).await
     }
 
+    async fn detach(&self) -> TaskResult {
+        self.detach_vm().await
+    }
+
     fn adopted_agent(&self) -> Option<Arc<dyn GuestAgent>> {
         self.agent().ok()
     }

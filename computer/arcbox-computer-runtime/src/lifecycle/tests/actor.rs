@@ -74,6 +74,11 @@ struct Script {
     gate_takes: Mutex<Option<Duration>>,
     /// Whether a boot that never handed off got to finish its own teardown.
     cleanup_finished: AtomicBool,
+    /// The handover the driver refuses: the computer must stay where it was.
+    detach_fails: AtomicBool,
+    /// How long the stop holds the computer in `stopping`, which is how a test
+    /// observes something arriving while a teardown is in flight.
+    stop_takes: Mutex<Option<Duration>>,
 }
 
 impl Script {
@@ -90,6 +95,8 @@ impl Script {
             release_takes: Mutex::new(None),
             gate_takes: Mutex::new(None),
             cleanup_finished: AtomicBool::new(false),
+            detach_fails: AtomicBool::new(false),
+            stop_takes: Mutex::new(None),
         })
     }
 
@@ -194,6 +201,20 @@ impl ComputerTasks for Script {
 
     async fn stop(&self, _budget: Duration, _drain: Drain) -> TaskResult {
         self.record("stop");
+        let takes = *self.stop_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
+        Ok(())
+    }
+
+    async fn detach(&self) -> TaskResult {
+        self.record("detach");
+        if self.detach_fails.load(Ordering::SeqCst) {
+            return Err(TaskFailure::recoverable(VmmError::Process(
+                "the vmm would not be handed over".into(),
+            )));
+        }
         Ok(())
     }
 
@@ -1157,4 +1178,124 @@ async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
         harness.has_journal(),
         "and the journal stays: nothing proved the failure durable"
     );
+}
+
+/// A handover ordered while a stop is in flight is refused (CORE-145).
+///
+/// This is the race the ticket is about: an in-flight `StopSandbox` is the
+/// main reason a composer's drain budget expires, so the trigger for
+/// `detach_all` and the concurrent writer it would race are the same event.
+/// The stop wins because it was asked for first — the guest is meant to go
+/// away — and the actor is what makes that a decision rather than a race.
+#[tokio::test(start_paused = true)]
+async fn a_handover_ordered_during_a_stop_is_refused() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    *harness.script.stop_takes.lock().unwrap() = Some(Duration::from_secs(30));
+
+    let stopping = harness.send(|reply| Command::Stop {
+        budget: Duration::from_secs(60),
+        reply,
+    });
+    harness.settled(SandboxState::Stopping).await;
+
+    let error = harness
+        .send(|reply| Command::Detach { reply })
+        .error()
+        .await;
+    assert!(
+        matches!(error, VmmError::WrongState { .. }),
+        "a handover during a teardown must be refused, not raced: {error}"
+    );
+    assert!(
+        !harness.script.calls().contains(&"detach"),
+        "the port was reached anyway: {:?}",
+        harness.script.calls()
+    );
+
+    // And the stop it stood aside for still finishes.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    stopping.ok().await;
+}
+
+/// Nothing reaches a VM this process has handed over.
+///
+/// Without the terminal state a stop landing here would drive
+/// `handle.shutdown` into a handle whose reaper has stood down, wait out the
+/// whole budget for an exit that is never published, and then SIGKILL the VM
+/// the successor is adopting.
+#[tokio::test(start_paused = true)]
+async fn a_teardown_after_a_handover_never_reaches_the_vm() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+    assert!(harness.script.calls().contains(&"detach"));
+
+    let stop = harness
+        .send(|reply| Command::Stop {
+            budget: Duration::from_secs(1),
+            reply,
+        })
+        .error()
+        .await;
+    assert!(
+        matches!(stop, VmmError::WrongState { .. }),
+        "a stop after a handover must be refused: {stop}"
+    );
+    let removed = harness
+        .send(|reply| Command::Remove { force: true, reply })
+        .error()
+        .await;
+    assert!(
+        matches!(removed, VmmError::WrongState { .. }),
+        "a forced remove after a handover must be refused: {removed}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls = harness.script.calls();
+    assert!(
+        !calls.contains(&"stop") && !calls.contains(&"release"),
+        "a handed-over vm was torn down anyway: {calls:?}"
+    );
+    // A second handover is a no-op rather than an error: `detach_all` fans out
+    // over whatever is in the map, and reporting a failure for a computer that
+    // is already the successor's would have a composer log a loss it did not
+    // take.
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+}
+
+/// A handover the driver refuses leaves a computer that is still ours.
+///
+/// It dies with this process, which is what a failed handover has always
+/// meant — but it must not be recorded `Failed` on the way out, because the
+/// successor's sweep reads that record and would reinstate a perfectly good
+/// guest as failed instead of adopting it.
+#[tokio::test(start_paused = true)]
+async fn a_refused_handover_leaves_the_computer_usable() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness.script.detach_fails.store(true, Ordering::SeqCst);
+
+    let error = harness
+        .send(|reply| Command::Detach { reply })
+        .error()
+        .await;
+    assert!(
+        error.to_string().contains("would not be handed over"),
+        "{error}"
+    );
+    assert_eq!(
+        harness.snapshot.borrow().state,
+        SandboxState::Ready,
+        "a refused handover moved the computer"
+    );
+
+    // Still this process's to stop, and the stop still runs.
+    harness
+        .send(|reply| Command::Stop {
+            budget: Duration::from_secs(1),
+            reply,
+        })
+        .ok()
+        .await;
+    assert!(harness.script.calls().contains(&"stop"));
 }

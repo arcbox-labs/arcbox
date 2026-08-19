@@ -167,6 +167,13 @@ pub enum Command {
         force: bool,
         reply: Reply,
     },
+    /// Give the VM up without stopping it, so the next process can adopt it
+    /// (`detach_all`, on graceful shutdown). A terminal transition like the two
+    /// above, and here for the same reason: it is the actor that serializes
+    /// them, so a handover cannot race the stop of the same computer.
+    Detach {
+        reply: Reply,
+    },
     /// Take the single-workload slot.
     ClaimWorkload {
         claim: WorkloadClaim,
