@@ -1836,7 +1836,8 @@ mod tests {
 
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
-        let manager = super::super::SandboxManager::new(config).unwrap();
+        let environment = crate::testkit::fake_environment(&config).unwrap();
+        let manager = super::super::SandboxManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
 
         assert!(!vm_dir.join(STATE_FILE).exists());
@@ -1903,11 +1904,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let manager = super::super::SandboxManager::with_environment(
-            config,
-            crate::SandboxEnvironment {
-                driver: Some(std::sync::Arc::new(driver)),
-                ..crate::SandboxEnvironment::default()
+        let manager = super::super::SandboxManager::new(
+            config.clone(),
+            crate::NodeEnvironment {
+                driver: std::sync::Arc::new(driver),
+                ..crate::testkit::fake_environment(&config).unwrap()
             },
         )
         .unwrap();
@@ -2088,12 +2089,12 @@ mod tests {
         if !case.network_adopts {
             network.fail_adopt_once();
         }
-        let manager = super::super::SandboxManager::with_environment(
-            config,
-            crate::SandboxEnvironment {
-                driver: Some(std::sync::Arc::new(driver)),
-                network: Some(std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>),
-                ..crate::SandboxEnvironment::default()
+        let manager = super::super::SandboxManager::new(
+            config.clone(),
+            crate::NodeEnvironment {
+                driver: std::sync::Arc::new(driver),
+                network: std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>,
+                ..crate::testkit::fake_environment(&config).unwrap()
             },
         )
         .unwrap();
@@ -2425,12 +2426,12 @@ mod tests {
         record_in_phase(&store, "keeper", PersistPhase::Ready);
         drop(store);
 
-        let manager = super::super::SandboxManager::with_environment(
-            config,
-            crate::SandboxEnvironment {
-                driver: Some(std::sync::Arc::new(driver)),
-                network: Some(std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>),
-                ..crate::SandboxEnvironment::default()
+        let manager = super::super::SandboxManager::new(
+            config.clone(),
+            crate::NodeEnvironment {
+                driver: std::sync::Arc::new(driver),
+                network: std::sync::Arc::clone(&network) as std::sync::Arc<dyn GuestNetwork>,
+                ..crate::testkit::fake_environment(&config).unwrap()
             },
         )
         .unwrap();

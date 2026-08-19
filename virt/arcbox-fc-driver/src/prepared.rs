@@ -43,6 +43,11 @@ pub struct FcPrepared {
 impl FcPrepared {
     /// Spawn the VMM for `id` under `isolation` with `runtime_dir` as its
     /// scratch space, and wait for its API socket.
+    ///
+    /// The scratch space and, under the jailer, the chroot base the jail
+    /// is rooted at are created here — idempotently, at the point this
+    /// driver first needs them. They are this adapter's own layout, so a
+    /// composer never has to know a driver wants a directory made.
     pub async fn spawn(
         config: Arc<FcDriverConfig>,
         id: &VmId,
@@ -51,6 +56,9 @@ impl FcPrepared {
     ) -> Result<Self> {
         let layout = VmLayout::new(id, isolation, &config, runtime_dir)?;
         tokio::fs::create_dir_all(runtime_dir).await?;
+        if let IsolationSpec::Jailer { chroot_base, .. } = isolation {
+            tokio::fs::create_dir_all(chroot_base).await?;
+        }
         let plan = layout.spawn_plan();
         let spawned = async {
             let child = spawn::spawn(&plan, &config).await?;
@@ -413,6 +421,36 @@ mod tests {
     use fc_sdk::types::{DriveCacheType, DriveIoEngine};
 
     use super::*;
+
+    /// The jailer's chroot base is this driver's own layout, so the driver
+    /// makes it rather than expecting a composer to. Asserted on a spawn
+    /// that fails afterwards, because the directory has to exist by the
+    /// time the jailer is executed.
+    #[tokio::test]
+    async fn a_jailed_spawn_creates_the_chroot_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let chroot_base = dir.path().join("srv").join("jailer");
+        let mut config = FcDriverConfig::new(dir.path().join("firecracker"));
+        config.jailer_binary = Some(dir.path().join("no-such-jailer"));
+
+        let spawned = FcPrepared::spawn(
+            Arc::new(config),
+            &VmId::new("boxy").unwrap(),
+            &IsolationSpec::Jailer {
+                uid: 0,
+                gid: 0,
+                chroot_base: chroot_base.clone(),
+                netns: None,
+                new_pid_ns: false,
+                cgroup: None,
+            },
+            &dir.path().join("run"),
+        )
+        .await;
+
+        assert!(spawned.is_err(), "there is no jailer to exec");
+        assert!(chroot_base.is_dir(), "the base is made before the exec");
+    }
 
     fn drive(id: &str, path: &str) -> fc_sdk::types::Drive {
         fc_sdk::types::Drive {

@@ -1,8 +1,4 @@
-//! Helpers shared by the `integration` and `e2e` test binaries.
-#![allow(
-    dead_code,
-    reason = "each test binary compiles this module and uses its own subset"
-)]
+//! Helpers shared by the `integration` test binary.
 
 /// Returns true if the process is running with effective UID 0 (root).
 #[cfg(target_os = "linux")]
@@ -16,15 +12,5 @@ pub fn is_root() -> bool {
                 .map(|uid| uid == "0")
                 .unwrap_or(false)
         })
-        .unwrap_or(false)
-}
-
-/// Returns true if a network interface named `iface` is registered in the kernel.
-#[cfg(target_os = "linux")]
-pub fn iface_exists(iface: &str) -> bool {
-    // /proc/net/dev lists one interface per line as "  <name>: ..."
-    let needle = format!("{iface}:");
-    std::fs::read_to_string("/proc/net/dev")
-        .map(|s| s.lines().any(|line| line.trim_start().starts_with(&needle)))
         .unwrap_or(false)
 }

@@ -29,19 +29,19 @@
 //! # Public API
 //!
 //! - [`SandboxManager`] — top-level sandbox orchestrator
-//! - [`SandboxEnvironment`] — the environment-specific components a
-//!   composer supplies: the VM driver, the guest network, the guest-agent
-//!   factory, block tooling, the packet filter
+//! - [`NodeEnvironment`] — the four environment-specific components a
+//!   composer supplies, all required: the VM driver, the guest network,
+//!   the guest-agent factory, and the copy-on-write rootfs manager
 //! - [`agent`] — the guest-agent port: how the runtime reaches the agent
 //!   inside a Computer (exec, files, clock, readiness), with the
 //!   `arcbox-vm-proto` vsock client as its one implementation
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxState`] — a computer's public lifecycle state
-//! - [`network`] — `arcbox-tap-net`, re-exported: the Linux TAP adapter
-//!   this crate builds when a composer supplies no guest network, and the
-//!   `invariant` addressing the System VM's own port-forward and init code
-//!   still names. Sandboxes reach it only through the driver port's
+//! - [`network`] — `arcbox-tap-net`, re-exported for the `invariant`
+//!   addressing the System VM's own port-forward and init code still
+//!   names, and for the `ExposeTarget` its port-forwarding speaks.
+//!   Sandboxes reach the network only through the driver port's
 //!   `GuestNetwork`; [`NetworkManager`] is that adapter's type, not a
 //!   surface the manager speaks.
 //! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
@@ -71,10 +71,10 @@ pub use arcbox_vm_proto::file as file_proto;
 
 /// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
 /// R2). Sandboxes reach it through the driver port; this path stays for
-/// the two things that are not sandbox lifecycle — building the default
-/// adapter when a composer supplies none, and the System VM's own
-/// port-forward and init code, which still name `invariant` and
-/// `ExposeTarget` until R3 moves those calls to the composition root.
+/// the one thing that is not sandbox lifecycle — the System VM's own
+/// port-forward and init code, which still names `invariant` and
+/// `ExposeTarget` until a later PR moves those calls to the composition
+/// root.
 pub use arcbox_tap_net as network;
 
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these
@@ -85,7 +85,7 @@ pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
 };
-pub use environment::SandboxEnvironment;
+pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};
 pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
 pub use rootfs::{RootfsBuilder, RootfsPaths};

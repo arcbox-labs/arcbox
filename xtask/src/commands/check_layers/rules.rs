@@ -107,18 +107,19 @@ pub const EXCEPTIONS: &[Exception] = &[
     Exception {
         from: "arcbox-computer-runtime",
         to: "arcbox-fc-driver",
-        reason: "the runtime still builds the Firecracker adapter as its own \
-                 default and calls its jailer staging helpers directly, until \
-                 the port grows a Staging capability and a composition root \
-                 supplies the driver",
-        until: "vm-stack-redesign R3 (PR-G)",
+        reason: "the runtime no longer builds the Firecracker adapter, but its \
+                 config still speaks FcDriverConfig, its checkpoints the \
+                 driver's format, and its startup sweep the jailer's chroot \
+                 layout, until a config split moves those to the port",
+        until: "vm-stack-redesign R3 (the config split after PR-G)",
     },
     Exception {
         from: "arcbox-computer-runtime",
         to: "arcbox-tap-net",
-        reason: "the runtime still builds the TAP adapter as its own default \
-                 and re-exports it as `network`, until a composition root \
-                 supplies a GuestNetwork through the port",
-        until: "vm-stack-redesign R3 (PR-G)",
+        reason: "the runtime no longer builds the TAP adapter, but still \
+                 re-exports it as `network` for the System VM's own \
+                 port-forward and init code and aliases its Datapath in the \
+                 config, until a config split moves those to the port",
+        until: "vm-stack-redesign R3 (the config split after PR-G)",
     },
 ];

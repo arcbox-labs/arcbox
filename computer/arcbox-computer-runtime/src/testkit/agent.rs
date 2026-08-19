@@ -7,7 +7,7 @@
 //! recorded so a test can assert it happened.
 //!
 //! The factory is the handle: clone it, hand one clone to
-//! [`SandboxEnvironment::agent`](crate::environment::SandboxEnvironment::agent),
+//! [`NodeEnvironment::agent`](crate::environment::NodeEnvironment::agent),
 //! and script and assert through the other. Every agent it builds shares
 //! the same state.
 

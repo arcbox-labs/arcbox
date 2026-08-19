@@ -243,6 +243,9 @@ jobs:
           sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
           sudo umount /tmp/fc-mnt
 
+      # The suite lives in the composition root: it builds its manager
+      # through `arcbox_agent::sandbox::node_environment`, the same
+      # function the guest agent's SandboxService uses.
       - name: Run E2E tests (as root, one at a time)
         env:
           FC_BINARY: /tmp/fc-assets/firecracker
@@ -251,7 +254,7 @@ jobs:
         run: |
           sudo env PATH="$PATH" HOME="$HOME" \
             FC_BINARY="$FC_BINARY" FC_KERNEL="$FC_KERNEL" FC_ROOTFS="$FC_ROOTFS" \
-            cargo test --test e2e -p arcbox-computer-runtime \
+            cargo test --test sandbox_manager_e2e -p arcbox-agent \
             -- --include-ignored --test-threads=1
 
       # The port's driver contract against the real Firecracker: directly,

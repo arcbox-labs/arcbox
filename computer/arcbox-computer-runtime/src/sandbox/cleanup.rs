@@ -39,17 +39,23 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let cow_probe = Arc::new(CowTestProbe::default());
-        let manager = SandboxManager::with_environment(
+        // The real Firecracker driver, over the fake binary above: what
+        // this test wedges is the SDK's first API request, which no fake
+        // driver has.
+        let manager = SandboxManager::new(
             config.clone(),
-            crate::SandboxEnvironment {
-                cow_manager: Some(Arc::new(
+            crate::NodeEnvironment {
+                driver: Arc::new(arcbox_fc_driver::FcDriver::new(
+                    arcbox_fc_driver::FcDriverConfig::from(&config.firecracker),
+                )),
+                cow_manager: Arc::new(
                     CowManager::new_with_test_probe(
                         CowOptions::new(&config.firecracker.data_dir),
                         Arc::clone(&cow_probe),
                     )
                     .unwrap(),
-                )),
-                ..crate::SandboxEnvironment::default()
+                ),
+                ..crate::testkit::fake_environment(&config).unwrap()
             },
         )
         .unwrap();

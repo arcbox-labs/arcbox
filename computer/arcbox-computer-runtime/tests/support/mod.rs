@@ -20,8 +20,9 @@ use std::time::Duration;
 
 use arcbox_computer_runtime::config::{JailerConfig, VmmConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
+use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
-    OutputChunk, SandboxEnvironment, SandboxEvent, SandboxId, SandboxManager, SandboxSpec,
+    NodeEnvironment, OutputChunk, SandboxEvent, SandboxId, SandboxManager, SandboxSpec,
     SandboxState,
 };
 use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
@@ -153,13 +154,16 @@ struct Ports {
 
 impl Ports {
     async fn manager(&self, config: &VmmConfig) -> Arc<SandboxManager> {
-        let manager = SandboxManager::with_environment(
+        let manager = SandboxManager::new(
             config.clone(),
-            SandboxEnvironment {
-                driver: Some(Arc::new(self.driver.clone())),
-                network: Some(Arc::new(FakeNetwork::with_startup_cleanup("test-boot"))),
-                agent: Some(Arc::new(self.agent.clone())),
-                ..SandboxEnvironment::default()
+            NodeEnvironment {
+                // The fixture's own clones, so a restart hands its
+                // successor the same ports; the startup cleanup is what
+                // `fake_environment`'s network does not hold.
+                driver: Arc::new(self.driver.clone()),
+                network: Arc::new(FakeNetwork::with_startup_cleanup("test-boot")),
+                agent: Arc::new(self.agent.clone()),
+                ..fake_environment(config).expect("a copy-on-write manager over the data dir")
             },
         )
         .expect("the fakes offer every capability the manager requires")

@@ -17,11 +17,15 @@ mod templates;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
+use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    RootfsBuilder, RootfsPaths, SandboxEnvironment, SandboxManager, SandboxMountSpec,
+    NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec, SandboxState, VmmConfig, VmmError,
 };
 use arcbox_connect::sandbox_v1;
+use arcbox_fc_driver::{FcDriver, FcDriverConfig};
+use arcbox_snapshot::snapshot_cow::{BlockTools, BusyboxBlockTools, CowManager, CowOptions};
+use arcbox_tap_net::{IptablesLegacy, TapNetwork};
 use buffa::Message;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -82,18 +86,71 @@ const GUEST_BUSYBOX: &str = "/bin/busybox";
 /// Directory for generated rootfs images (btrfs data volume, writable).
 const ROOTFS_CACHE_DIR: &str = "/var/lib/arcbox/sandbox";
 
+/// The System VM's loop-device and block-size tooling: the busybox its
+/// EROFS rootfs ships, at [`BusyboxBlockTools::DEFAULT_PATH`].
+///
+/// One value per composition, shared by the copy-on-write rootfs manager in
+/// [`node_environment`] and by [`rootfs_builder`], so both mount through the
+/// same busybox.
+pub fn block_tools() -> Arc<dyn BlockTools> {
+    Arc::new(BusyboxBlockTools::default())
+}
+
 /// The rootfs builder over the System VM's layout. Standalone so the
 /// startup sweep of half-written images can run whether or not the sandbox
 /// service comes up.
-pub fn rootfs_builder(environment: &SandboxEnvironment) -> RootfsBuilder {
+pub fn rootfs_builder(block_tools: Arc<dyn BlockTools>) -> RootfsBuilder {
     RootfsBuilder::new(
         RootfsPaths {
             vm_agent: VM_AGENT_BIN.into(),
             cache_dir: ROOTFS_CACHE_DIR.into(),
             busybox: GUEST_BUSYBOX.into(),
         },
-        Arc::clone(&environment.block_tools),
+        block_tools,
     )
+}
+
+/// The environment-specific components the sandbox stack runs on inside
+/// the System VM. This is where they are built: `SandboxManager::new`
+/// builds none of them, so the choice of VMM is made here.
+///
+/// Four components, each from `config`:
+///
+/// - the Firecracker driver over the `[firecracker]` binaries and
+///   process-level flags ([`FcDriverConfig`]);
+/// - the Linux TAP network over the `[network]` pool, with its quarantine
+///   ledger under the data dir, the configured datapath, and
+///   iptables-legacy for the netfilter rendering of the invariant
+///   translation — which is the `Filter` datapath itself and what the
+///   `Ebpf` one falls back to;
+/// - the `arcbox-vm-proto` guest-agent client, which every Firecracker
+///   sandbox speaks;
+/// - the copy-on-write rootfs manager over the data dir, `block_tools`, and
+///   the config's `dmsetup` search list.
+pub fn node_environment(
+    config: &VmmConfig,
+    block_tools: Arc<dyn BlockTools>,
+) -> anyhow::Result<NodeEnvironment> {
+    let data_dir = std::path::Path::new(&config.firecracker.data_dir);
+    let network = TapNetwork::with_quarantine_dir(
+        &config.network.cidr,
+        &config.network.gateway,
+        config.network.dns.clone(),
+        data_dir.join("sandbox-network-quarantine"),
+        config.firecracker.sandbox_datapath,
+        Arc::new(IptablesLegacy::default()),
+    )?;
+    let mut cow_options = CowOptions::new(data_dir);
+    cow_options.block_tools = block_tools;
+    if let Some(candidates) = &config.firecracker.dmsetup_candidates {
+        cow_options.dmsetup_candidates = candidates.iter().map(std::path::PathBuf::from).collect();
+    }
+    Ok(NodeEnvironment {
+        driver: Arc::new(FcDriver::new(FcDriverConfig::from(&config.firecracker))),
+        network: Arc::new(network),
+        agent: Arc::new(VmProtoAgentFactory::default()),
+        cow_manager: Arc::new(CowManager::new(cow_options)?),
+    })
 }
 
 #[derive(Default)]
@@ -137,13 +194,14 @@ impl SandboxService {
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
         let default_rootfs = config.defaults.rootfs.clone();
-        // The System VM is the reference environment; the rootfs builder
-        // shares its block tooling so both mount through the same busybox.
-        let environment = SandboxEnvironment::default();
-        let rootfs = rootfs_builder(&environment);
+        // The rootfs builder shares the environment's block tooling so both
+        // mount through the same busybox.
+        let block_tools = block_tools();
+        let rootfs = rootfs_builder(Arc::clone(&block_tools));
+        let environment = node_environment(&config, block_tools)?;
         // `into_shared` starts the lifecycle monitor driving the idle/TTL
         // expiry timers (CORE-21/60).
-        let manager = SandboxManager::with_environment(config, environment)
+        let manager = SandboxManager::new(config, environment)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_shared();
         let creates = Arc::new(CreateRegistry::default());

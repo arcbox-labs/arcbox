@@ -404,7 +404,8 @@ mod tests {
     async fn manager(data_dir: &Path) -> SandboxManager {
         let mut config = VmmConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
-        let manager = SandboxManager::new(config).unwrap();
+        let environment = crate::testkit::fake_environment(&config).unwrap();
+        let manager = SandboxManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
         manager
     }
