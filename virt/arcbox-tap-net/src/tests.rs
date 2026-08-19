@@ -341,23 +341,49 @@ fn quarantine_survives_reload_past_a_staging_leftover() {
     );
 }
 
+/// A marker whose allocation this pool did not write is skipped, not
+/// fatal: the load runs inside the constructor, so failing takes the whole
+/// network subsystem down over one file — and with it every address that
+/// file was protecting.
+///
+/// Skipped is not forgotten. The entry is not trusted as a pending
+/// cleanup, because nothing here can name the VM a cleanup would finalize;
+/// but an address of *this* pool that it names is withheld anyway, since a
+/// guest may still be on it and `activate` would destroy the TAP that
+/// address names. An address from another network was never in this pool
+/// to withhold, which is what the last column below distinguishes.
 #[test]
-fn quarantine_loader_rejects_foreign_or_inconsistent_allocations() {
-    let mutations: [fn(&mut NetworkAllocation); 4] = [
-        |allocation: &mut NetworkAllocation| {
-            allocation.ip_address = "192.0.2.2".parse().unwrap();
-        },
-        |allocation: &mut NetworkAllocation| {
-            allocation.tap_name = "vmtap-wrong".into();
-        },
-        |allocation: &mut NetworkAllocation| {
-            allocation.mac_address = "02:00:00:00:00:00".into();
-        },
-        |allocation: &mut NetworkAllocation| {
-            allocation.gateway = "10.0.0.9".parse().unwrap();
-        },
+fn quarantine_loader_skips_foreign_or_inconsistent_allocations() {
+    // What the marker gets wrong, and whether this pool's one allocatable
+    // address (`10.0.0.2` in a /30) is still free afterwards.
+    type SkipCase = (fn(&mut NetworkAllocation), bool);
+    let mutations: [SkipCase; 4] = [
+        (
+            |allocation: &mut NetworkAllocation| {
+                allocation.ip_address = "192.0.2.2".parse().unwrap();
+            },
+            true,
+        ),
+        (
+            |allocation: &mut NetworkAllocation| {
+                allocation.tap_name = "vmtap-wrong".into();
+            },
+            false,
+        ),
+        (
+            |allocation: &mut NetworkAllocation| {
+                allocation.mac_address = "02:00:00:00:00:00".into();
+            },
+            false,
+        ),
+        (
+            |allocation: &mut NetworkAllocation| {
+                allocation.gateway = "10.0.0.9".parse().unwrap();
+            },
+            false,
+        ),
     ];
-    for mutate in mutations {
+    for (mutate, address_still_free) in mutations {
         let root = tempfile::tempdir().unwrap();
         let quarantine = root.path().join("network-quarantine");
         std::fs::create_dir(&quarantine).unwrap();
@@ -376,15 +402,30 @@ fn quarantine_loader_rejects_foreign_or_inconsistent_allocations() {
             "10.0.0.0/30",
             "10.0.0.1",
             vec![],
-            quarantine,
+            quarantine.clone(),
             Datapath::default(),
             Arc::new(IptablesLegacy::default()),
         )
         .expect("a marker this pool did not write is skipped, not fatal");
-        // Skipped means *not adopted*: the entry is neither trusted as a
-        // pending cleanup nor allowed to hold an address out of the pool.
-        // Failing the whole load instead would take the network subsystem
-        // down over one file, and with it every address it was protecting.
         assert!(!network.quarantine_pending("box"));
+        assert!(
+            quarantine.join("box.json").exists(),
+            "the entry stays on disk for a version that can read it"
+        );
+
+        // Nothing pending means the startup gate opens as soon as the host
+        // finalizes the sweep — so the withheld address is the only thing
+        // standing between a live guest and the next `reserve`.
+        network.mark_reconciled();
+        let startup = network.startup_cleanup_token().unwrap();
+        network
+            .finalize_startup_cleanup(&startup)
+            .expect("a skipped marker is no pending cleanup, so the gate opens");
+        assert_eq!(
+            network.reserve("fresh").is_ok(),
+            address_still_free,
+            "a skipped marker's own address must not be reissued, and a foreign \
+             one must not take this pool's address with it"
+        );
     }
 }
