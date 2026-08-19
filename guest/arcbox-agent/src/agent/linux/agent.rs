@@ -34,7 +34,7 @@ impl Agent {
         let _ = sandbox_service();
 
         // Drop half-written rootfs build artifacts from a previous crash.
-        crate::sandbox::rootfs_builder(&arcbox_computer_runtime::SandboxEnvironment::default())
+        crate::sandbox::rootfs_builder(crate::sandbox::block_tools())
             .sweep_stale_tmp()
             .await;
 
