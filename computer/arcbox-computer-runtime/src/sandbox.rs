@@ -1,4 +1,4 @@
-//! `ComputerManager` — orchestrates sandbox microVM lifecycle.
+//! `ComputerManager` — orchestrates the lifecycle of computer microVMs.
 //!
 //! A sandbox is a short-lived, strongly-isolated microVM decoupled from its
 //! workload: when the initial `cmd` process exits the sandbox transitions back

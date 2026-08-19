@@ -40,7 +40,7 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_computer_runtime::{NodeEnvironment, RuntimeConfig, ComputerManager, ComputerSpec};
+use arcbox_computer_runtime::{ComputerManager, ComputerSpec, NodeEnvironment, RuntimeConfig};
 
 // `environment` is the composer's; see below.
 let manager = Arc::new(ComputerManager::new(RuntimeConfig::default(), environment)?);

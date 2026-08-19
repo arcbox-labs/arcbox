@@ -28,7 +28,7 @@
 //!
 //! # Public API
 //!
-//! - [`ComputerManager`] — top-level sandbox orchestrator
+//! - [`ComputerManager`] — top-level computer orchestrator
 //! - [`NodeEnvironment`] — the four environment-specific components a
 //!   composer supplies, all required: the VM driver, the guest network,
 //!   the guest-agent factory, and the copy-on-write rootfs manager
