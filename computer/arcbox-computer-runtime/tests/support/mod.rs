@@ -32,13 +32,20 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 /// Where the fixtures' data directories go.
 ///
-/// **Not** `std::env::temp_dir()`, and this is load-bearing rather than
-/// tidiness. A sandbox id has to fit what AF_UNIX leaves of the jailer's
-/// API socket path (`sandbox::max_sandbox_id_len`), and macOS's per-user
-/// `$TMPDIR` (`/var/folders/../T/`) spends ~50 bytes of that on its own —
-/// enough to take the budget to zero, so every `create_sandbox` would be
-/// refused at id validation before reaching anything it meant to
-/// exercise. A short root is also what a real node's `/srv/jailer` is.
+/// **Not** `std::env::temp_dir()`, and short on purpose rather than out of
+/// tidiness. A sandbox id has to fit what AF_UNIX leaves of the jail's
+/// socket paths, and macOS's per-user `$TMPDIR` (`/var/folders/../T/`)
+/// spends ~50 bytes of that on its own — enough to take the budget to
+/// zero, so every `create_sandbox` would be refused at id validation
+/// before reaching anything it meant to exercise. A short root is also
+/// what a real node's jail base is.
+///
+/// The ingress budget is now whatever the driver in use reports
+/// (`VmDriver::id_budget`), and [`FakeDriver`] lays down no jail, so it
+/// reports none and no id here is refused for its length. The short root
+/// stays because that is a property of these fixtures, not of the fake: a
+/// fixture pointed at a real `FcDriver` gets the budget back, and gets it
+/// from this path.
 const SHORT_TMP_ROOT: &str = "/tmp";
 
 /// How a fixture's manager is configured.
