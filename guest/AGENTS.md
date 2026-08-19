@@ -20,6 +20,11 @@ non-obvious invariants and failure signatures.
   substantive modules are `target_os = "linux"` regardless — so the sole gate
   is the `Unit tests` step of `.github/workflows/test-vm-linux.yml`
   (`cargo test --lib --bins … -p arcbox-agent`, unprivileged ubuntu).
+  `cargo fmt --check` is the exception to the exclusions: that same macOS job
+  runs it workspace-wide with no `--exclude`, and cargo-fmt walks every
+  member of a virtual manifest, so rustfmt is the one gate this crate has
+  never escaped — do not add it to another job's `-p` list thinking it is
+  ungated.
   **`--bins` is the load-bearing half.** `lib.rs` re-exports only what the
   integration tests need, so the bin target is a strict superset: of the 184
   distinct test functions, `--lib` reaches 103 and the other 81 exist only
@@ -27,13 +32,21 @@ non-obvious invariants and failure signatures.
   `boot_done`, `init`, `nfs`, `live_exports`, `runtime_materialize`,
   `containerd_config`, `shutdown`, and `main.rs`'s own `parse_mode` tests).
   Every module declared by both targets is compiled and run twice, which is
-  why the job reports 287 executions for 184 functions. That workflow
-  triggers on `guest/arcbox-agent/**`, so a change here is gated; a change
-  that reaches the agent only through a dependency is not. Two integration
-  targets under `tests/` are still gated by nothing: `dns_aliases` (7 tests
-  against the public `dns` API) and `port_forward_cleanup` (a `#[path]` shim
-  that re-includes `agent/linux/port_forward.rs` purely so its tests can run
-  on macOS — on Linux the bin target now runs them anyway).
+  why the job reports 287 executions for 184 functions.
+- **Two holes in that gate, both by omission rather than design.** The
+  workflow is `paths:`-filtered: it covers `guest/arcbox-agent/**` *and* most
+  of the crate's own workspace dependencies (`arcbox-computer-runtime`,
+  `arcbox-fc-driver`, `arcbox-tap-net`, `arcbox-snapshot`,
+  `arcbox-constants`, `Cargo.lock`), so a change to any of those re-runs the
+  agent's tests — but a dependency *absent* from that list does not:
+  `arcbox-connect`, `arcbox-pty`, `arcbox-dns`, `arcbox-logging`. And
+  `--lib --bins` selects no `--test` targets, so two under `tests/` still run
+  nowhere: `dns_aliases` (7 tests against the public `dns` API) and
+  `port_forward_cleanup` (a `#[path]` shim re-including
+  `agent/linux/port_forward.rs` purely so its tests can run on macOS — on
+  Linux the bin target now runs them anyway). A bare `--tests` is not the fix:
+  it would drag in `sandbox_manager_e2e` and `sandbox_service_manager`, which
+  need root, KVM and Firecracker.
 - **CI still never lints the agent — you must, locally.** No job runs clippy
   on it: the macOS gate excludes it, the Linux `Unit tests` job deliberately
   keeps it out of the `-D warnings` clippy step (a pre-existing
