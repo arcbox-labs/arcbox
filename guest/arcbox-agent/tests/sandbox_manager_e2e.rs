@@ -46,8 +46,8 @@ use std::time::Duration;
 use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
-    ComputerEvent, ComputerManager, ComputerNetworkSpec, ComputerSpec, ComputerState,
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig,
+    ComputerConfig, ComputerEvent, ComputerManager, ComputerNetworkSpec, ComputerSpec,
+    ComputerState, DefaultVmConfig, GrpcConfig, NetworkConfig, RuntimeConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ fn try_config(data_dir: &str) -> Option<GuestConfig> {
     let kernel = std::env::var("FC_KERNEL").ok()?;
     let rootfs = std::env::var("FC_ROOTFS").ok()?;
     let runtime = RuntimeConfig {
-        firecracker: FirecrackerConfig {
+        firecracker: ComputerConfig {
             jailer: None,
             data_dir: data_dir.to_owned(),
             // Direct mode cannot restore (and so never pools); keep the

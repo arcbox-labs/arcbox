@@ -73,7 +73,7 @@ pub use arcbox_vm_proto::file as file_proto;
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
+pub use config::{ComputerConfig, DefaultVmConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
 pub use environment::NodeEnvironment;
 pub use error::{ComputerError, Result};
 pub use rootfs::{RootfsBuilder, RootfsPaths};

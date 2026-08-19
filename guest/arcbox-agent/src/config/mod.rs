@@ -15,7 +15,7 @@ pub use adapters::{AdapterConfig, JailerProcess};
 
 use arcbox_computer_runtime::RuntimeConfig;
 use arcbox_computer_runtime::config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, JailerConfig, NetworkConfig,
+    ComputerConfig, DefaultVmConfig, GrpcConfig, JailerConfig, NetworkConfig,
 };
 use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR, JAILER_CHROOT_BASE};
 
@@ -77,7 +77,7 @@ fn guest_defaults() -> GuestConfig {
     let runtime_bin = std::path::Path::new(ARCBOX_RUNTIME_BIN_DIR);
     let runtime_root = std::path::Path::new(ARCBOX_RUNTIME_DIR);
     let runtime = RuntimeConfig {
-        firecracker: FirecrackerConfig {
+        firecracker: ComputerConfig {
             jailer: Some(JailerConfig {
                 uid: 0,
                 gid: 0,

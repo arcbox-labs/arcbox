@@ -12,4 +12,4 @@ mod runtime;
 // it meaning; re-exported so `crate::config::SnapshotType` still resolves.
 pub use arcbox_snapshot::SnapshotType;
 pub use jailer::JailerConfig;
-pub use runtime::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
+pub use runtime::{ComputerConfig, DefaultVmConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
