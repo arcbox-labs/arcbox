@@ -54,6 +54,33 @@ const READY_TIMEOUT: Duration = Duration::from_secs(360);
 /// rootfs build inside the guest).
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often a wait loop re-reads the state it is waiting for.
+///
+/// This is the resolution of every phase timing in `metrics.json`, and it
+/// biases them upward: a phase whose true duration is 1.4 s is reported as
+/// whichever tick first observes it. At the 500 ms this used to be, the
+/// `sandbox_ready` bucket boundary sat at ~1.53 s — directly on top of the
+/// distribution — so the same unchanged code reported 1508 ms on one run and
+/// 2011 ms on the next, and looked *stable* at both, because a bucket has no
+/// variance. Measured 2026-08-19 against `ce4f4e78` and `86ac9e12`: the true
+/// values were 1398 ms and 1327-1462 ms, i.e. indistinguishable, while the
+/// coarse readings differed by 500 ms.
+///
+/// Consequence to keep in mind: **numbers recorded before this change are
+/// not comparable with numbers after it.** Every phase was inflated, by an
+/// amount that depends on where its true value fell inside a bucket — 14 ms
+/// for `sandbox_file_io`, 247 ms for `template_create`, measured the same
+/// day. Re-baseline rather than subtracting.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The same, for a loop whose observation is a guest `exec` round trip
+/// rather than a lock-free read on the host.
+///
+/// The round trip costs tens of milliseconds and runs *inside* the sandbox
+/// being timed, so polling it at [`POLL_INTERVAL`] would not observe sooner —
+/// it would only add load to the thing under measurement.
+const GUEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub struct SandboxSmokeConfig {
     pub skip_build: bool,
     pub keep_test_dir: bool,
@@ -335,7 +362,7 @@ async fn drive_sandboxes(
             if Instant::now() > deadline {
                 bail!("initial cmd never ran (last_exited_at still unset)");
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
     let info = inspect(&mut sandboxes, "smoke1").await?;
@@ -870,7 +897,7 @@ async fn template_catalog_scenario(
         if Instant::now() > deadline {
             bail!("template defaults not observable in the guest: {out:?}");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(GUEST_POLL_INTERVAL).await;
     }
     metrics.record("template_create", create_started.elapsed().as_secs_f64());
     info!("bare-name create resolved the published version and applied its default cmd + env");
@@ -1753,7 +1780,7 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         {
             Err(status) if status.code() == tonic::Code::NotFound => break,
             Ok(_) | Err(_) if Instant::now() < reap_deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             Ok(info) => bail!(
                 "sandbox never TTL-reaped (state: {:?})",
@@ -1771,7 +1798,7 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         match std::net::TcpListener::bind(("127.0.0.1", host_port)) {
             Ok(_) => break,
             Err(_) if Instant::now() < release_deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             Err(error) => {
                 bail!("host port {host_port} never released after the TTL reap: {error}")
@@ -2372,7 +2399,7 @@ async fn wait_for_state(
                 info.state()
             );
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
