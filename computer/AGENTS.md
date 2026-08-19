@@ -26,9 +26,11 @@ restructure plan and its locked decisions live in the company repo:
 - **Mechanically checked**: `cargo xtask check-layers` (the `linux-engine`
   job) fails on a direct edge from `computer/` into `app/`, `arcbox-vmm`,
   `arcbox-hypervisor`, a macOS-only crate or a VMM adapter — the rules
-  live in `xtask/src/commands/check_layers/rules.rs`. Two of those edges
-  are grandfathered for `arcbox-computer-runtime` (below); an `Exception`
-  whose edge disappears **fails** the gate, which is what retires them.
+  live in `xtask/src/commands/check_layers/rules.rs`. Nothing in this
+  layer is grandfathered any more — the last two were
+  `arcbox-computer-runtime`'s adapter edges, and because an `Exception`
+  whose edge disappears **fails** the gate, deleting the edges is what
+  deleted them.
 - Errors speak `arcbox_engine::EngineError` **in `arcbox-computer`**;
   predicates like `EngineError::Agent { code }` carry the agent's
   HTTP-style wire codes (404/412 obsolete-ticket, 423 paused, 503 retry)
