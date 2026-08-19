@@ -1150,7 +1150,10 @@ async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
         .resume_sandbox(&id, pause_reason::RESUME)
         .await
         .expect_err("an adopted computer's checkpoint records no kernel to stage");
-    assert!(matches!(error, VmmError::Io(_)), "{error}");
+    assert!(
+        matches!(&error, VmmError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "the kernel path the checkpoint recorded is empty, so staging it is ENOENT: {error}"
+    );
     fixture.await_state(&id, SandboxState::Paused).await;
     assert!(parked.exists(), "a failed resume leaves the disk parked");
 }

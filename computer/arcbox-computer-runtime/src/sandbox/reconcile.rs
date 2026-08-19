@@ -697,6 +697,12 @@ async fn reap_orphans(
     // What every VMM on this node runs under, and so where the driver will
     // look for the area of one that is gone: read from this process's own
     // config, because nothing can be read back off a dead process.
+    //
+    // Read once, up front, so it is read even when there is nothing to
+    // reap. That moves the one way it can fail — a `cgroup_version` that is
+    // neither "1" nor "2" — from the first create to startup, which is
+    // where a node that could not have booted a VMM anyway should hear
+    // about it.
     let isolation = super::isolation_spec(config)?;
     // Every VM this sweep does not keep must be dead before the global CoW
     // sweep runs: a live VMM pins its dm device, and a pinned device turns
