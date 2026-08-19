@@ -317,6 +317,124 @@ mod rootfs {
         })
         .unwrap();
     }
+
+    /// 32 GiB, the Computer image capacity — and 256 whole block groups.
+    /// Note GiB, not decimal GB: 32_000_000_000 is not a whole number of
+    /// groups and would be refused.
+    #[cfg(feature = "remote-image")]
+    const COMPUTER_CAPACITY: u64 = 32 * 1024 * 1024 * 1024;
+
+    /// The node's own pipeline, rehearsed end to end: a registry reference
+    /// in, a 32 GiB bootable Computer image out at a digest-addressed path,
+    /// with the `ImageConfig` the caller records beside it.
+    ///
+    /// Ignored, and behind `remote-image`: it reaches a registry, needs root,
+    /// and writes a 32 GiB (sparse) file. Run it by hand —
+    ///
+    /// ```text
+    /// sudo -E cargo test -p arcbox-computer-runtime --features remote-image \
+    ///   --test integration -- --ignored --nocapture a_computer_image
+    /// ```
+    ///
+    /// It prints the apparent and allocated sizes, which is the claim worth
+    /// re-measuring whenever the ext4 writer changes: a 32 GiB image must not
+    /// cost 32 GiB of disk.
+    #[cfg(feature = "remote-image")]
+    #[tokio::test]
+    #[ignore = "pulls from a registry, needs root, writes a 32 GiB sparse image"]
+    async fn a_computer_image_comes_out_of_a_registry_reference() {
+        use std::os::unix::fs::MetadataExt;
+
+        use arcbox_computer_runtime::oci2rootfs::RemoteRef;
+
+        const TEST: &str = "a_computer_image_comes_out_of_a_registry_reference";
+
+        if !common::is_root() {
+            skipped(TEST, "requires root");
+            return;
+        }
+        let tools = match block_tools() {
+            Ok(tools) => tools,
+            Err(reason) => {
+                skipped(TEST, &reason);
+                return;
+            }
+        };
+        let reference =
+            std::env::var("ARCBOX_TEST_IMAGE").unwrap_or_else(|_| "debian:12".to_owned());
+
+        let source = RemoteRef::new(&reference).fetch().await.unwrap();
+        // Everything the node records next to the digest, off the same pull
+        // that feeds the image — this is why the API takes a resolved source.
+        let digest = source
+            .manifest_digest()
+            .expect("a registry manifest resolves to a digest")
+            .to_string();
+        let config = source
+            .config()
+            .cloned()
+            .expect("a registry image has a config");
+        eprintln!(
+            "{reference} {digest}\n  user={:?}\n  cmd={:?}\n  entrypoint={:?}\n  env={:?}",
+            config.config.as_ref().and_then(|c| c.user.as_deref()),
+            config.cmd(),
+            config.entrypoint(),
+            config.env(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("vm-agent");
+        std::fs::write(&staged, b"#!the-staged-agent").unwrap();
+        // Digest-addressed, the way a node's image store is.
+        let image = dir
+            .path()
+            .join("images")
+            .join(digest.replace(':', "-"))
+            .join("rootfs.ext4");
+
+        let started = std::time::Instant::now();
+        builder(&staged, Arc::clone(&tools))
+            .build_rootfs(RootfsSpec {
+                source: RootfsSource::Image(source),
+                out: image.clone(),
+                size: COMPUTER_CAPACITY,
+            })
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        let meta = std::fs::metadata(&image).unwrap();
+        let allocated = meta.blocks() * 512;
+        eprintln!(
+            "  built in {elapsed:?}: {} apparent, {allocated} allocated",
+            meta.len()
+        );
+        assert_eq!(meta.len(), COMPUTER_CAPACITY);
+        assert!(
+            allocated < COMPUTER_CAPACITY / 8,
+            "a 32 GiB image must be sparse, not {allocated} bytes of real disk"
+        );
+
+        with_mounted(&*tools, &image, |root| {
+            if std::fs::read(root.join("sbin/vm-agent")).map_err(|e| e.to_string())?
+                != b"#!the-staged-agent"
+            {
+                return Err("the staged agent is not in the image".into());
+            }
+            let resolv = std::fs::read_link(root.join("etc/resolv.conf"))
+                .map_err(|e| format!("read_link resolv.conf: {e}"))?;
+            if resolv != Path::new("../run/resolv.conf") {
+                return Err(format!("resolv.conf points at {}", resolv.display()));
+            }
+            // The distro's own init is left where it was: `init=` is what
+            // makes the agent PID 1.
+            if !root.join("sbin/init").exists() {
+                return Err("the image lost its own /sbin/init".into());
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
 }
 
 /// The two real userlands, driven through the [`BlockTools`] seam: attach a
