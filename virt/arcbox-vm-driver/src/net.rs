@@ -60,6 +60,29 @@ pub trait GuestNetwork: Send + Sync {
     /// Returns the address to the pool outright, skipping quarantine.
     async fn release(&self, lease: NetworkLease) -> Result<()>;
 
+    /// Withholds `address` from this process's pool without creating,
+    /// claiming or touching any host state.
+    ///
+    /// For durable state a restart could not read: nothing can name that
+    /// record's lease through this port, so nothing can adopt, quarantine
+    /// or release it — yet its guest may still be running on that address
+    /// with its interface up. Handing the address to the next VM would
+    /// take that interface out from under the guest, since
+    /// [`GuestNetwork::activate`] replaces a device of the same name, and
+    /// forwarding rules installed for the previous occupant outlive the
+    /// process that installed them. So the address is held for this
+    /// process's lifetime instead.
+    ///
+    /// Deliberately neither a lease nor a quarantine: it cannot be listed
+    /// by [`NetworkReconcile::pending_cleanups`], finalized, or released,
+    /// because nothing can prove whose it is. An adapter whose pool does
+    /// not contain `address` has nothing to withhold and does nothing.
+    ///
+    /// Infallible and idempotent, unlike everything above it: this is what
+    /// a caller reaches for once every richer answer has already failed,
+    /// and "could not hold it" would leave that caller nothing to do.
+    fn hold_address(&self, address: IpAddr);
+
     /// The network as the guest sees it under `mode`: what goes on the
     /// kernel command line or into a net-reconfigure command.
     ///

@@ -629,6 +629,23 @@ impl TapNetwork {
         }
     }
 
+    /// Withhold `ip` from the pool for this manager's lifetime, without
+    /// touching any host state.
+    ///
+    /// For an address named by durable state this build cannot read: the
+    /// entry cannot be quarantined (nothing can name its VM) and cannot be
+    /// released (nothing can prove its guest is gone), but a guest may
+    /// still be on it. `next_ip` skips whatever `allocated` holds, so this
+    /// is what keeps the address from being handed to a fresh sandbox
+    /// whose [`TapNetwork::activate`] would then destroy the live TAP that
+    /// address names. There is no matching un-hold: the whole reason to
+    /// hold it is that nothing here can tell when it would be safe.
+    pub fn hold_address(&self, ip: Ipv4Addr) {
+        if self.allocated.lock().unwrap().insert(u32::from(ip)) {
+            debug!(%ip, "holding an address named by durable state this build cannot read");
+        }
+    }
+
     /// Release the TAP interface and guest IP associated with `vm_id`.
     pub fn release(&self, alloc: &NetworkAllocation) {
         if let Err(error) = self.release_checked(alloc) {

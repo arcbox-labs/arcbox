@@ -154,6 +154,16 @@ impl GuestNetwork for TapNetwork {
         Ok(self.release_checked(&allocation)?)
     }
 
+    /// An IPv6 address cannot have come from this pool, so there is
+    /// nothing to withhold — the same reasoning [`TapNetwork::allocation`]
+    /// refuses one on, without an error to report to a caller that has no
+    /// answer for it.
+    fn hold_address(&self, address: IpAddr) {
+        if let IpAddr::V4(ip) = address {
+            Self::hold_address(self, ip);
+        }
+    }
+
     fn identity(&self, lease: &NetworkLease, mode: AttachMode) -> NetworkIdentity {
         Self::identity_for(lease, mode)
     }
