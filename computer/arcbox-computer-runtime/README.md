@@ -92,9 +92,8 @@ port's fakes, for tests that must not need a VMM.
 The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
 invariant NAT (eBPF TCX or netfilter), and the quarantine ledger — is
 [`arcbox-tap-net`](../../virt/arcbox-tap-net), the Linux adapter of the
-`arcbox-vm-driver` `GuestNetwork` port; the composer builds it, and
-`arcbox_computer_runtime::network` re-exports the crate for the System
-VM's own port-forward and init code. Rendering the invariant translation
+`arcbox-vm-driver` `GuestNetwork` port; the composer builds it, and this
+crate does not depend on it at all. Rendering the invariant translation
 in the host's netfilter framework is that adapter's own seam
 (`arcbox_tap_net::PacketFilter`: `IptablesLegacy` in the System VM,
 `Nftables` on a stock distro — legacy and nft rulesets are mutually

@@ -32,10 +32,12 @@ owns:
   cannot name may still be on it.
 
 It moved here from `arcbox-vm/src/network` (vm-stack-redesign R2a,
-D-VM6). `arcbox_computer_runtime::network` re-exports the crate and
-`NetworkManager` is an alias of `TapNetwork` until R2b moves the sandbox
-manager onto the port; `invariant::GUEST_IP` and friends stay exported
-for the guest agent's port-forward and init code.
+D-VM6). The sandbox runtime reaches it only through the `GuestNetwork`
+port and no longer re-exports it; consumers that need this crate's own
+vocabulary — the guest agent's port-forward and init code, for
+`invariant::GUEST_IP` and `ExposeTarget` — depend on it directly.
+`NetworkManager` is an alias of `TapNetwork`, kept for this crate's own
+integration tests.
 
 ## The `GuestNetwork` mapping
 

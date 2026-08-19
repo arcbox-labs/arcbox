@@ -33,8 +33,8 @@ use std::process::Output;
 
 use anyhow::{Context, Result, bail};
 use arcbox_computer_runtime::SandboxNetworkIdentity;
-use arcbox_computer_runtime::network::invariant;
 use arcbox_tap_net::ExposeTarget;
+use arcbox_tap_net::invariant;
 use tokio::process::Command;
 
 /// First port of the reserved guest relay range.
