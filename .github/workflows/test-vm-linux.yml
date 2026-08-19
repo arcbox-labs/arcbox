@@ -88,19 +88,20 @@ jobs:
         # --bins covers the vm-agent guest handlers, whose tests are
         # target_os = "linux" and never run under the macOS workspace job.
         #
-        # arcbox-agent is here for both halves of that same reason, and it
-        # needs both flags. The macOS workspace job excludes it by name
-        # (`cargo test --workspace --exclude arcbox-agent`, ci.yml) and its
-        # substantive modules are target_os = "linux" anyway, so this
-        # unprivileged runner is the only place its unit tests can execute
-        # at all — they never had until now. Its lib target re-exports only
-        # what the integration tests need; the larger module tree (agent/,
-        # init, nfs, supervisor) hangs off the bin, so dropping --bins
-        # would silently take most of that suite with it. The crate is
-        # deliberately NOT in the clippy step above: it carries a
-        # pre-existing pedantic backlog no gate has ever caught, and
-        # -D warnings on it would fail this job for reasons unrelated to
-        # the change under test (see guest/AGENTS.md).
+        # arcbox-agent is here for both halves of that same reason. The
+        # macOS workspace job excludes it by name (`cargo test --workspace
+        # --exclude arcbox-agent`, ci.yml) and its substantive modules are
+        # target_os = "linux" anyway, so this unprivileged runner is the
+        # only place its unit tests can execute at all — and until now
+        # nothing asked it to. --bins is what makes that real: lib.rs
+        # re-exports only what the integration tests need, so most of the
+        # crate's test modules are declared by main.rs and --lib alone
+        # reaches just over half of them (counts in guest/AGENTS.md).
+        #
+        # The crate is deliberately NOT in the clippy step above: it
+        # carries a pre-existing pedantic backlog no gate has ever caught,
+        # and -D warnings on it would fail this job for reasons unrelated
+        # to the change under test (see guest/AGENTS.md).
         run: cargo test --lib --bins -p arcbox-computer-runtime -p arcbox-vm-proto -p arcbox-vm-driver -p arcbox-fc-driver -p arcbox-tap-net -p arcbox-vm-agent -p arcbox-snapshot -p arcbox-agent
 
       - name: Manager lifecycle over the fakes

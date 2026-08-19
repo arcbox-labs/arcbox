@@ -19,12 +19,21 @@ non-obvious invariants and failure signatures.
   (`--workspace --exclude arcbox-agent`, `.github/workflows/ci.yml`), and the
   substantive modules are `target_os = "linux"` regardless — so the sole gate
   is the `Unit tests` step of `.github/workflows/test-vm-linux.yml`
-  (`cargo test --lib --bins … -p arcbox-agent`, unprivileged ubuntu). **Both
-  flags are load-bearing**: `lib.rs` re-exports only what the integration
-  tests need, so most of the suite — `agent/`, `init`, `nfs`, `supervisor` —
-  hangs off the *bin* target and `--lib` alone would miss it. That workflow
+  (`cargo test --lib --bins … -p arcbox-agent`, unprivileged ubuntu).
+  **`--bins` is the load-bearing half.** `lib.rs` re-exports only what the
+  integration tests need, so the bin target is a strict superset: of the 184
+  distinct test functions, `--lib` reaches 103 and the other 81 exist only
+  under `--bins` (`agent/` incl. `linux/port_forward` and `linux/runtime`,
+  `boot_done`, `init`, `nfs`, `live_exports`, `runtime_materialize`,
+  `containerd_config`, `shutdown`, and `main.rs`'s own `parse_mode` tests).
+  Every module declared by both targets is compiled and run twice, which is
+  why the job reports 287 executions for 184 functions. That workflow
   triggers on `guest/arcbox-agent/**`, so a change here is gated; a change
-  that reaches the agent only through a dependency is not.
+  that reaches the agent only through a dependency is not. Two integration
+  targets under `tests/` are still gated by nothing: `dns_aliases` (7 tests
+  against the public `dns` API) and `port_forward_cleanup` (a `#[path]` shim
+  that re-includes `agent/linux/port_forward.rs` purely so its tests can run
+  on macOS — on Linux the bin target now runs them anyway).
 - **CI still never lints the agent — you must, locally.** No job runs clippy
   on it: the macOS gate excludes it, the Linux `Unit tests` job deliberately
   keeps it out of the `-D warnings` clippy step (a pre-existing
