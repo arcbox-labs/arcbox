@@ -153,6 +153,21 @@ impl PreparedFake {
         Ok(Box::new(FakeVm::new(vm)))
     }
 
+    /// Parks forever when [`FakeDriver::park_next_boot`] armed it, after
+    /// telling the test the boot got here.
+    ///
+    /// Before the phase lock, deliberately: a park holding that lock would
+    /// block the `discard` the parked boot exists to be torn down by.
+    ///
+    /// [`FakeDriver::park_next_boot`]: super::FakeDriver::park_next_boot
+    async fn park_if_armed(&self) {
+        let reached = lock(&self.driver.park_boot).take();
+        if let Some(reached) = reached {
+            let _ = reached.send(());
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// Kills whatever `phase` says is running: the booted VM, or the bare
     /// process itself.
     fn kill(&self, phase: &mut Phase) -> ExitStatus {
@@ -206,6 +221,7 @@ impl PreparedVm for PreparedFake {
     }
 
     async fn boot(&self, spec: VmSpec) -> Result<Box<dyn VmHandle>> {
+        self.park_if_armed().await;
         let balloon_target_bytes = u64::from(spec.memory_mib) << 20;
         self.launch(spec, balloon_target_bytes, false)
     }
@@ -215,6 +231,7 @@ impl PreparedVm for PreparedFake {
         image: &CheckpointImage,
         spec: RestoreSpec,
     ) -> Result<Box<dyn VmHandle>> {
+        self.park_if_armed().await;
         if !self.driver.caps.checkpoint || image.format.as_str() != CHECKPOINT_FORMAT {
             return Err(Error::ForeignCheckpoint(image.format.clone()));
         }
@@ -253,7 +270,9 @@ impl PreparedVm for PreparedFake {
     }
 
     async fn discard(&self) -> Result<ExitStatus> {
-        Ok(self.kill(&mut lock(&self.phase)))
+        let status = self.kill(&mut lock(&self.phase));
+        lock(&self.driver.discarded_processes).push(self.record.id.clone());
+        Ok(status)
     }
 }
 

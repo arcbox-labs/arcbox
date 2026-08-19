@@ -544,3 +544,93 @@ async fn the_area_of_a_running_vm_is_refused_and_a_dead_ones_is_not() {
         [(record.id.clone(), IsolationSpec::None)]
     );
 }
+
+/// The budget is the isolation's: a jail bounds the id, direct mode does
+/// not — the shape a real adapter answers in, so a consumer tested here
+/// exercises both branches.
+#[test]
+fn the_jailed_id_budget_is_answered_only_under_a_jail() {
+    let driver = FakeDriver::builder().jailed_id_budget(12).build();
+    assert_eq!(driver.id_budget(&IsolationSpec::None), None);
+    assert_eq!(
+        driver.id_budget(&IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: "/srv/jailer".into(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        }),
+        Some(12)
+    );
+    // Unset is the port's default: no bound of this driver's own.
+    assert_eq!(
+        FakeDriver::new().id_budget(&IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: "/srv/jailer".into(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        }),
+        None
+    );
+}
+
+/// A parked boot leaves the prepared VM standing and never returns, and
+/// the process it holds dies only when someone discards it — which is what
+/// makes it the wedge a forced teardown is tested against.
+#[tokio::test]
+async fn a_parked_boot_never_returns_and_leaves_its_process_to_be_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let prepared = driver
+        .prepare()
+        .unwrap()
+        .prepare(
+            &VmId::new("wedged").unwrap(),
+            &IsolationSpec::None,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+    let reached = driver.park_next_boot();
+    let booting = tokio::spawn({
+        let spec = spec("wedged");
+        async move { prepared.boot(spec).await.map(|_| ()) }
+    });
+    reached.await.expect("the boot must reach the park");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut { booting })
+            .await
+            .is_err(),
+        "a parked boot must not return"
+    );
+    assert!(driver.discarded_processes().is_empty());
+}
+
+/// Only an explicit `discard` is recorded; a prepared VM merely dropped
+/// dies the same way, and the distinction is the point.
+#[tokio::test]
+async fn only_an_explicit_discard_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let prepare = driver.prepare().unwrap();
+    let id = VmId::new("prep").unwrap();
+
+    drop(
+        prepare
+            .prepare(&id, &IsolationSpec::None, dir.path())
+            .await
+            .unwrap(),
+    );
+    assert!(driver.discarded_processes().is_empty());
+
+    let prepared = prepare
+        .prepare(&id, &IsolationSpec::None, dir.path())
+        .await
+        .unwrap();
+    prepared.discard().await.unwrap();
+    assert_eq!(driver.discarded_processes(), [id]);
+}
