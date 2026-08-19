@@ -3,12 +3,13 @@ use super::record::{ProvisionIntent, SandboxProvisionOutcome};
 use super::*;
 use crate::lifecycle::tasks::CaptureSpec;
 
-/// The image format the reference driver writes, for tests that seed the
-/// catalog by hand. Production never names it: [`checkpoint_impl`] records
-/// whatever format the driver's `CheckpointImage` reports, and a restore
-/// hands that back to the driver, which refuses any other.
+/// The image format for tests that seed the catalog by hand — the format
+/// of the driver those tests actually run, which is the testkit fake.
+/// Production never names a format: [`checkpoint_impl`] records whatever
+/// the driver's `CheckpointImage` reports, and a restore hands that back to
+/// the driver, which refuses any other.
 #[cfg(test)]
-pub(super) const CHECKPOINT_FORMAT: &str = arcbox_fc_driver::CHECKPOINT_FORMAT;
+pub(super) const CHECKPOINT_FORMAT: &str = arcbox_vm_driver::testkit::CHECKPOINT_FORMAT;
 
 /// Parameters for the internal restore path
 /// ([`SandboxManager::restore_from_snapshot`]), shared by the Restore RPC

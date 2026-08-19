@@ -133,9 +133,18 @@ mod tests {
 
     use super::*;
 
+    /// The fixed invariant addressing a guest on the System VM's TAP
+    /// network is told to use — `arcbox-tap-net`'s `invariant::GUEST_*`,
+    /// written out because these fixtures stand in for *a* guest network,
+    /// not for that one: nothing in this module names an adapter, and the
+    /// identity production reads comes from the port's `NetworkIdentity`.
+    const GUEST_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 100, 2);
+    const GUEST_GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 100, 1);
+    const GUEST_PREFIX_LEN: u8 = 30;
+    const GUEST_NETMASK: std::net::Ipv4Addr = std::net::Ipv4Addr::new(255, 255, 255, 252);
+
     /// What a guest network hands back from activating a lease: the NIC,
-    /// and the fixed invariant addressing a guest on the System VM's TAP
-    /// network is told to use over it.
+    /// and the fixed invariant addressing above.
     fn attachment() -> NetworkAttachment {
         NetworkAttachment {
             lease: NetworkLease {
@@ -154,10 +163,10 @@ mod tests {
                 },
             },
             identity: NetworkIdentity {
-                ip: crate::network::invariant::GUEST_IP.into(),
-                prefix_len: crate::network::invariant::GUEST_PREFIX_LEN,
-                gateway: crate::network::invariant::GUEST_GATEWAY.into(),
-                dns: vec![crate::network::invariant::GUEST_GATEWAY.into()],
+                ip: GUEST_IP.into(),
+                prefix_len: GUEST_PREFIX_LEN,
+                gateway: GUEST_GATEWAY.into(),
+                dns: vec![GUEST_GATEWAY.into()],
                 mac: "02:fc:00:00:00:07".parse().unwrap(),
             },
             invariant_identity: true,
@@ -195,18 +204,9 @@ mod tests {
         // The whole `ip=` comes from the network's identity, netmask
         // included: the TAP network's /30 renders as the fixed netmask its
         // guests have always booted with.
-        assert!(
-            cmdline.contains(&crate::network::invariant::GUEST_IP.to_string()),
-            "{cmdline}"
-        );
-        assert!(
-            cmdline.contains(&crate::network::invariant::GUEST_NETMASK.to_string()),
-            "{cmdline}"
-        );
-        assert_eq!(
-            netmask(crate::network::invariant::GUEST_PREFIX_LEN),
-            crate::network::invariant::GUEST_NETMASK
-        );
+        assert!(cmdline.contains(&GUEST_IP.to_string()), "{cmdline}");
+        assert!(cmdline.contains(&GUEST_NETMASK.to_string()), "{cmdline}");
+        assert_eq!(netmask(GUEST_PREFIX_LEN), GUEST_NETMASK);
         assert_eq!(vm.disks.len(), 1);
         assert!(vm.disks[0].root && !vm.disks[0].read_only);
         assert_eq!(vm.disks[0].path, Path::new("/jail/rootfs.ext4"));

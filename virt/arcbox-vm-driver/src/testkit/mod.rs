@@ -26,7 +26,7 @@ mod fake_vsock;
 pub use contract::{ContractHarness, FakeHarness};
 pub use fake_driver::{FakeDriver, FakeDriverBuilder};
 pub use fake_network::FakeNetwork;
-pub use fake_vm::FakeVm;
+pub use fake_vm::{CHECKPOINT_FORMAT, FakeVm};
 
 /// Locks `mutex`, tolerating poison: a fake that panicked while holding a
 /// lock has already failed the test, and the state behind it is still the
