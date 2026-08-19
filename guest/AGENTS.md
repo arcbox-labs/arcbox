@@ -26,13 +26,15 @@ non-obvious invariants and failure signatures.
   never escaped — do not add it to another job's `-p` list thinking it is
   ungated.
   **`--bins` is the load-bearing half.** `lib.rs` re-exports only what the
-  integration tests need, so the bin target is a strict superset: of the 184
-  distinct test functions, `--lib` reaches 103 and the other 81 exist only
+  integration tests need, so the bin target is a strict superset: of the 189
+  distinct test functions, `--lib` reaches 108 and the other 81 exist only
   under `--bins` (`agent/` incl. `linux/port_forward` and `linux/runtime`,
   `boot_done`, `init`, `nfs`, `live_exports`, `runtime_materialize`,
   `containerd_config`, `shutdown`, and `main.rs`'s own `parse_mode` tests).
   Every module declared by both targets is compiled and run twice, which is
-  why the job reports 287 executions for 184 functions.
+  why the job reports 297 executions for 189 functions. (Counts read off the
+  job on 2026-08-19; they drift as tests are added, but the *shape* — bin a
+  strict superset, ~81 of them unreachable via `--lib` — is the durable part.)
 - **One hole left in that gate, by omission rather than design.** The
   workflow is `paths:`-filtered: it covers `guest/arcbox-agent/**` *and* most
   of the crate's own workspace dependencies (`arcbox-computer-runtime`,
@@ -42,7 +44,7 @@ non-obvious invariants and failure signatures.
   `arcbox-connect`, `arcbox-pty`, `arcbox-dns`, `arcbox-logging`.
 - **An integration target runs nowhere until a step names it.**
   `--lib --bins` selects no `--test` targets, so each one needs asking for:
-  `dns_aliases`, the compose-alias tests against the public `dns` API, has
+  `dns_aliases`, the 7 compose-alias tests against the public `dns` API, has
   its own step beside `Manager lifecycle over the fakes`. A bare `--tests` is
   not the shortcut — it would pull in `sandbox_manager_e2e` and
   `sandbox_service_manager`, which need root, KVM and Firecracker and are
