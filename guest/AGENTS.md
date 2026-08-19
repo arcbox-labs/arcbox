@@ -14,12 +14,23 @@ non-obvious invariants and failure signatures.
   `cargo test -p arcbox-agent` only exercises the stub + pure helpers and proves
   *nothing* about guest behavior. Build for `aarch64-unknown-linux-musl` (recipe
   in `guest/arcbox-agent/README.md` / root CLAUDE.md) and validate through e2e.
-- **CI never lints the agent — you must, locally.** The workspace gate excludes
-  it (`cargo clippy --workspace --exclude arcbox-agent -- -D warnings`,
-  `.github/workflows/ci.yml`; the build and test steps exclude it too) and no
-  job runs clippy against `aarch64-unknown-linux-musl` (`release.yml` only
-  `cargo build`s that target). So `agent/linux` carries a pre-existing
-  pedantic/nursery warning backlog no gate catches. Run
+- **The unit tests run on Linux only, and in exactly one job.** The macOS
+  workspace gate excludes the crate by name from clippy, build *and* test
+  (`--workspace --exclude arcbox-agent`, `.github/workflows/ci.yml`), and the
+  substantive modules are `target_os = "linux"` regardless — so the sole gate
+  is the `Unit tests` step of `.github/workflows/test-vm-linux.yml`
+  (`cargo test --lib --bins … -p arcbox-agent`, unprivileged ubuntu). **Both
+  flags are load-bearing**: `lib.rs` re-exports only what the integration
+  tests need, so most of the suite — `agent/`, `init`, `nfs`, `supervisor` —
+  hangs off the *bin* target and `--lib` alone would miss it. That workflow
+  triggers on `guest/arcbox-agent/**`, so a change here is gated; a change
+  that reaches the agent only through a dependency is not.
+- **CI still never lints the agent — you must, locally.** No job runs clippy
+  on it: the macOS gate excludes it, the Linux `Unit tests` job deliberately
+  keeps it out of the `-D warnings` clippy step (a pre-existing
+  pedantic/nursery backlog would fail that job for reasons unrelated to the
+  change under test), and nothing lints `aarch64-unknown-linux-musl` at all
+  (`release.yml` only `cargo build`s that target). Run
   `cargo clippy -p arcbox-agent --target aarch64-unknown-linux-musl --all-targets`
   and hold *your changed lines* to zero new warnings; do NOT bulk-fix the
   backlog in an unrelated PR — it buries your diff.
