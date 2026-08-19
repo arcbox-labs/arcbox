@@ -181,7 +181,18 @@ impl ComputerActor {
                     // exits. That is worth reporting rather than skipping: a
                     // caller told `Ok` would believe a guest survived a
                     // handover that never happened.
-                    _ => Err(self.wrong_state("Ready or Running")),
+                    //
+                    // Phrased as a property rather than a state list, because
+                    // `wrong_state` reads `actual` off the public projection
+                    // and two states here project into any list this arm could
+                    // name: `checkpointing` reads `Ready` and a `gating` whose
+                    // own `cmd` has claimed the slot reads `Running`. Naming
+                    // the states would tell a composer "expected Ready or
+                    // Running, actual Ready" — and `detach_all` folds this
+                    // verbatim into the failure string someone diagnoses a
+                    // lost handover from.
+                    _ => Err(self
+                        .wrong_state("a computer with no launch, capture, or teardown in flight")),
                 };
                 if let Some((_, reply)) = self.waiters.pop() {
                     let _ = reply.send(answer);
