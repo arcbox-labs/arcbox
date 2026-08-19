@@ -59,7 +59,9 @@ use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::network::NetworkAllocation;
-use crate::snapshot_cow::{CowHandle, CowManager};
+use crate::snapshot_cow::{
+    COW_FILE_PREFIX, COW_FILE_SUFFIX, CowHandle, CowManager, DM_NAME_PREFIX,
+};
 
 /// How long the sweep gives the driver to find and reconnect to one
 /// orphaned VMM. Finding one is a `/proc` walk and reconnecting a couple of
@@ -424,12 +426,13 @@ impl SkippedJournals {
     ///
     /// The durable key is the directory alone. The resource names are
     /// every spelling the record offers — the directory it sat in, the id
-    /// it claims, and the pool slot it says its dm/CoW resources are keyed
-    /// by ([`SandboxStateRecord::resource_owner`]) — because one reason a
-    /// journal is unreadable is that those disagree, and holding a name
-    /// that turns out to be nobody's costs a leaked device this sweep
-    /// would have reaped, while missing the real one aborts the whole
-    /// reconciliation on a device a live VMM still pins.
+    /// it claims, the pool slot it says its dm/CoW resources are keyed by
+    /// ([`SandboxStateRecord::resource_owner`]), and the owners its
+    /// journaled CoW names spell out. One reason a journal is unreadable
+    /// is that those disagree, so holding a name that turns out to be
+    /// nobody's costs a leaked device this sweep would have reaped, while
+    /// missing the real one aborts the whole reconciliation on a device a
+    /// live VMM still pins.
     fn hold(&mut self, dir: &Path, record: &SandboxStateRecord) {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
             self.ids.insert(name.to_owned());
@@ -437,6 +440,29 @@ impl SkippedJournals {
         }
         self.owners.insert(record.id.clone());
         self.owners.insert(record.resource_owner().to_owned());
+        // A record names its dm device and its overlay outright, and those
+        // names need not agree with `resource_owner()` on a record this
+        // process refused to read — `validate_state_record`'s check that
+        // they do is one of the checks that can have failed. The reap keys
+        // on owners, so take the owner back out of each name exactly the
+        // way `CowManager::reconcile_stale` derives it.
+        if let Some(cow) = &record.cow {
+            if let Some(owner) = cow.dm_name.strip_prefix(DM_NAME_PREFIX) {
+                self.owners.insert(owner.to_owned());
+            }
+            if let Some(rest) = cow
+                .cow_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(COW_FILE_PREFIX))
+            {
+                self.owners.insert(
+                    rest.strip_suffix(COW_FILE_SUFFIX)
+                        .unwrap_or(rest)
+                        .to_owned(),
+                );
+            }
+        }
     }
 }
 
@@ -1329,10 +1355,10 @@ fn validate_state_record(
     }
     if let Some(cow) = &record.cow {
         let owner = record.resource_owner();
-        let expected_name = format!("arcbox-snap-{owner}");
+        let expected_name = format!("{DM_NAME_PREFIX}{owner}");
         let expected_file = Path::new(&config.firecracker.data_dir)
             .join("cow")
-            .join(format!("arcbox-cow-{owner}.img"));
+            .join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}"));
         if cow.dm_name != expected_name
             || cow.dm_device != format!("/dev/mapper/{expected_name}")
             || cow.cow_file != expected_file
@@ -2236,7 +2262,7 @@ mod tests {
         };
         let broken_dir = data_dir.path().join("sandboxes").join("broken");
         std::fs::create_dir_all(&broken_dir).unwrap();
-        let stray = SandboxStateRecord::new(
+        let mut stray = SandboxStateRecord::new(
             "not-broken",
             None,
             Some(JournaledLease::cold_boot(&lease, true)),
@@ -2245,24 +2271,41 @@ mod tests {
             None,
         )
         .unwrap();
+        // A third owner, named by the journal's own CoW record: the check
+        // that it agrees with `resource_owner()` is one of the ones an
+        // unreadable record can have failed, so it cannot be derived.
+        let cow_dir = data_dir.path().join("cow");
+        stray.cow = Some(CowRecord {
+            dm_name: format!("{DM_NAME_PREFIX}journaled"),
+            dm_device: format!("/dev/mapper/{DM_NAME_PREFIX}journaled"),
+            cow_loop: "/dev/loop9".into(),
+            cow_file: cow_dir.join(format!("{COW_FILE_PREFIX}journaled{COW_FILE_SUFFIX}")),
+            template_path: "/templates/rootfs.img".into(),
+        });
         write_state_record(&broken_dir, &stray).unwrap();
 
-        // Both spellings: an unreadable record is exactly the case where
-        // the directory it sits in and the id it claims are not the same
-        // sandbox, so neither can be ruled out as the overlay's owner.
-        let cow_dir = data_dir.path().join("cow");
+        // Every spelling: an unreadable record is exactly the case where
+        // the directory it sits in, the id it claims and the resources it
+        // names need not be the same sandbox, so none can be ruled out as
+        // the overlay's owner.
         std::fs::create_dir_all(&cow_dir).unwrap();
-        for owner in ["broken", "not-broken"] {
-            std::fs::write(cow_dir.join(format!("arcbox-cow-{owner}.img")), b"overlay").unwrap();
+        for owner in ["broken", "not-broken", "journaled"] {
+            std::fs::write(
+                cow_dir.join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}")),
+                b"overlay",
+            )
+            .unwrap();
         }
 
         let (_vm, _manager, network, reconciled) =
             sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
         reconciled.expect("one unreadable journal does not fail the reconciliation");
 
-        for owner in ["broken", "not-broken"] {
+        for owner in ["broken", "not-broken", "journaled"] {
             assert!(
-                cow_dir.join(format!("arcbox-cow-{owner}.img")).exists(),
+                cow_dir
+                    .join(format!("{COW_FILE_PREFIX}{owner}{COW_FILE_SUFFIX}"))
+                    .exists(),
                 "the global reap deleted the overlay of a sandbox it could not identify: {owner}"
             );
         }
