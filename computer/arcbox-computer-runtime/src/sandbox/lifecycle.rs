@@ -543,25 +543,37 @@ impl SandboxManager {
     /// nothing to hand over — the same reasoning the sweep applies to
     /// `Adopt`. The `PreparedVm` a booted sandbox also holds needs no such
     /// step: it kills on drop only while it is still unconsumed.
+    ///
+    /// Each handover goes through its computer's actor (CORE-145). Detach is a
+    /// terminal transition, and the actor is what serializes those: taking the
+    /// handles straight out of the map let a handover run concurrently with the
+    /// `Stop` of the same computer — the very stop whose 30s budget is why a
+    /// composer's drain deadline expires and this gets called at all. Either
+    /// order damaged the guest: a stop reaching a detached handle waits out a
+    /// stood-down reaper and then SIGKILLs the VM it was just told had been
+    /// handed over, and its release hands TAP, the CoW device and the jail back
+    /// while the successor is adopting them.
     pub async fn detach_all(&self) -> Result<()> {
-        let live: Vec<(SandboxId, Arc<dyn VmHandle>)> = self
+        // The sweep adopts and kills VMs by the same deterministic names, so
+        // racing it is the same class of bug; `stop_sandbox` and
+        // `remove_sandbox` wait it out for exactly this reason.
+        self.await_reconcile().await?;
+        let computers: Vec<(SandboxId, Mailbox)> = self
             .computers
             .read()
             .unwrap()
             .iter()
-            .filter_map(|(id, computer)| {
-                let handle = computer.snapshot.borrow().handle.clone();
-                handle.map(|handle| (id.clone(), handle))
-            })
+            .map(|(id, computer)| (id.clone(), computer.mailbox.clone()))
             .collect();
 
         let mut failures = Vec::new();
-        for (id, handle) in live {
-            let Some(detach) = handle.detach() else {
-                continue;
-            };
-            match detach.detach().await {
-                Ok(_) => info!(sandbox_id = %id, "handed the sandbox's vm to the next process"),
+        for (id, mailbox) in computers {
+            match mailbox.ask(&id, |reply| Command::Detach { reply }).await {
+                Ok(()) => info!(sandbox_id = %id, "handed the sandbox's vm to the next process"),
+                // The actor finished between the snapshot and the ask, so its
+                // computer is already gone — there is nothing left to hand
+                // over and nothing was lost.
+                Err(VmmError::NotFound(_)) => {}
                 Err(error) => failures.push(format!("{id}: {error}")),
             }
         }

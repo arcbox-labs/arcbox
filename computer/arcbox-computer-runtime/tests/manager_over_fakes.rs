@@ -19,6 +19,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arcbox_computer_runtime::testkit::agent::Reply;
 use arcbox_computer_runtime::{
@@ -1234,6 +1235,90 @@ async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
     );
     fixture.await_state(&id, SandboxState::Paused).await;
     assert!(parked.exists(), "a failed resume leaves the disk parked");
+}
+
+/// Nothing this process does may reach a VM it has handed over (CORE-145).
+///
+/// `detach_all` used to clone handles straight out of the map, so a handover
+/// and the `Stop` of the same computer had no mutual exclusion. This is the
+/// expensive half: the stop drives `handle.shutdown` into a handle whose
+/// reaper has stood down, waits out its whole budget for an exit that is never
+/// published, and then SIGKILLs the VM the successor is adopting — while its
+/// release hands TAP and the CoW device back underneath it.
+#[tokio::test]
+async fn a_teardown_after_a_handover_never_reaches_the_vm() {
+    let fixture = Fixture::jailed().await;
+    let id = fixture.ready("handed-over").await;
+    let vm = arcbox_vm_driver::VmId::new(&id).unwrap();
+
+    fixture.manager.detach_all().await.unwrap();
+    assert!(
+        !fixture.driver().owned_vms().contains(&vm),
+        "the handover did not reach the driver"
+    );
+
+    let stopped = fixture.manager.stop_sandbox(&id, 30).await.unwrap_err();
+    assert!(
+        matches!(stopped, VmmError::WrongState { .. }),
+        "a stop after a handover must be refused: {stopped}"
+    );
+    let removed = fixture.manager.remove_sandbox(&id, true).await.unwrap_err();
+    assert!(
+        matches!(removed, VmmError::WrongState { .. }),
+        "a forced remove after a handover must be refused: {removed}"
+    );
+
+    assert!(
+        fixture.driver().shutdowns(&vm).is_empty(),
+        "the handed-over vm was asked to die: {:?}",
+        fixture.driver().shutdowns(&vm)
+    );
+    assert!(
+        fixture.settle_network_cleanups().await.is_empty(),
+        "the successor's guest had its address taken back"
+    );
+}
+
+/// And the handover stands aside for a teardown already in flight.
+///
+/// The trigger and the race are the same event: an in-flight `StopSandbox`
+/// carrying a 30s budget is the main reason a composer's drain deadline
+/// expires and `detach_all` gets called at all. The stop was asked for first
+/// and the guest is meant to go away, so it wins — and the computer is
+/// reported as one that could not be handed over rather than silently raced.
+#[tokio::test]
+async fn a_handover_during_a_stop_is_refused_and_reported() {
+    let fixture = Fixture::jailed().await;
+    fixture.agent().on(&["/bin/wedged"], Reply::NeverExits);
+    let id = fixture.booted(never_exits("draining")).await;
+    fixture.await_state(&id, SandboxState::Running).await;
+
+    // The workload never exits, so the stop sits in its drain for the whole
+    // budget — the window the handover used to be able to reach into.
+    let manager = Arc::clone(&fixture.manager);
+    let stopping = tokio::spawn({
+        let id = id.clone();
+        // Shorter than the 30s a real `StopSandbox` carries: what this test
+        // needs is the window, and the drain polls every 100ms inside it.
+        async move { manager.stop_sandbox(&id, 5).await }
+    });
+    fixture.await_state(&id, SandboxState::Stopping).await;
+
+    let error = fixture.manager.detach_all().await.unwrap_err();
+    assert!(
+        error.to_string().contains(&*id),
+        "the handover failure must name the computer it lost: {error}"
+    );
+    assert!(
+        fixture
+            .driver()
+            .owned_vms()
+            .contains(&arcbox_vm_driver::VmId::new(&id).unwrap()),
+        "a computer mid-teardown was handed over anyway"
+    );
+
+    stopping.await.unwrap().unwrap();
+    fixture.await_state(&id, SandboxState::Stopped).await;
 }
 
 /// A computer whose VMM did not survive the gap comes back `Failed`, not
