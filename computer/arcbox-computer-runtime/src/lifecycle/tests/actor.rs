@@ -79,6 +79,9 @@ struct Script {
     /// How long the stop holds the computer in `stopping`, which is how a test
     /// observes something arriving while a teardown is in flight.
     stop_takes: Mutex<Option<Duration>>,
+    /// How long the handover's port call takes, which is how a test observes
+    /// the snapshot during the one await that transfers ownership.
+    detach_takes: Mutex<Option<Duration>>,
 }
 
 impl Script {
@@ -97,6 +100,7 @@ impl Script {
             cleanup_finished: AtomicBool::new(false),
             detach_fails: AtomicBool::new(false),
             stop_takes: Mutex::new(None),
+            detach_takes: Mutex::new(None),
         })
     }
 
@@ -210,6 +214,10 @@ impl ComputerTasks for Script {
 
     async fn detach(&self) -> TaskResult {
         self.record("detach");
+        let takes = *self.detach_takes.lock().unwrap();
+        if let Some(takes) = takes {
+            tokio::time::sleep(takes).await;
+        }
         if self.detach_fails.load(Ordering::SeqCst) {
             return Err(TaskFailure::recoverable(VmmError::Process(
                 "the vmm would not be handed over".into(),
@@ -1288,6 +1296,14 @@ async fn a_refused_handover_leaves_the_computer_usable() {
         SandboxState::Ready,
         "a refused handover moved the computer"
     );
+    // Usable includes dialable. The agent comes off the snapshot before the
+    // port call, so a handover that then fails has to put it back — nothing
+    // changed hands, and the data plane must not lose a guest to a handover
+    // that did not happen.
+    assert!(
+        harness.snapshot.borrow().agent.is_some(),
+        "a refused handover left the computer undialable"
+    );
 
     // Still this process's to stop, and the stop still runs.
     harness
@@ -1395,4 +1411,37 @@ async fn a_handover_during_a_capture_is_refused() {
     // The capture it stood aside for still owns the guest and still answers.
     tokio::time::sleep(Duration::from_secs(31)).await;
     capture.await.unwrap().unwrap();
+}
+
+/// The agent comes off the snapshot *before* the port call, not after.
+///
+/// Detach is the one flow whose ownership transfer happens inside an await, so
+/// forgetting afterwards leaves the whole call open for a reader to take the
+/// agent out of the snapshot and dial a VM that has already changed hands. It
+/// does not close the race — a reader holding an `Arc` cloned a moment earlier
+/// still has a working agent, and revoking that would mean routing the data
+/// plane through the mailbox — but it bounds the exposure to callers already
+/// in flight rather than every caller for the duration of the handover.
+#[tokio::test(start_paused = true)]
+async fn the_agent_is_gone_before_the_handover_reaches_the_driver() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    *harness.script.detach_takes.lock().unwrap() = Some(Duration::from_secs(30));
+
+    let detaching = harness.send(|reply| Command::Detach { reply });
+    // Far enough in for the effect to have reached the port call and parked
+    // there, and nowhere near its completion.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        harness.script.calls().last().copied(),
+        Some("detach"),
+        "the port call has not started yet"
+    );
+    assert!(
+        harness.snapshot.borrow().agent.is_none(),
+        "the data plane could still dial a vm that is changing hands"
+    );
+
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    detaching.ok().await;
 }
