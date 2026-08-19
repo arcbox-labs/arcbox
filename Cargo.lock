@@ -769,6 +769,7 @@ dependencies = [
 name = "arcbox-fc-driver"
 version = "0.7.0"
 dependencies = [
+ "arcbox-constants",
  "arcbox-vm-driver",
  "arcbox-vm-proto",
  "async-trait",
