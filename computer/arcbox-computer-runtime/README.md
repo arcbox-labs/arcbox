@@ -40,10 +40,10 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_computer_runtime::{NodeEnvironment, SandboxManager, SandboxSpec, VmmConfig};
+use arcbox_computer_runtime::{NodeEnvironment, RuntimeConfig, SandboxManager, SandboxSpec};
 
 // `environment` is the composer's; see below.
-let manager = Arc::new(SandboxManager::new(VmmConfig::default(), environment)?);
+let manager = Arc::new(SandboxManager::new(RuntimeConfig::default(), environment)?);
 
 let (id, ip) = manager
     .create_sandbox(SandboxSpec {
@@ -54,10 +54,16 @@ let (id, ip) = manager
     .await?;
 ```
 
-`VmmConfig` loads from TOML (`VmmConfig::from_file`) or is built
+`RuntimeConfig` loads from TOML (`RuntimeConfig::from_file`) or is built
 programmatically; `[firecracker]`, `[network]`, and `[defaults]` are the
 sections that matter, and `[firecracker.jailer]` opts into jailer mode.
-See `config.rs` for the fields.
+See `config/runtime.rs` for the fields.
+
+`[firecracker]` is named for the VMM a deployed `vmm.toml` has always run,
+not for anything this crate knows: the keys that configure a VMM adapter
+live in the same section and are read by whoever builds it (for the System
+VM, `arcbox_agent::config::AdapterConfig`). serde ignores unknown fields,
+so one section serves both halves.
 
 What the stack needs from its *environment* — the pieces that differ
 between the System VM's busybox userland and a stock distro — is a
@@ -86,9 +92,8 @@ port's fakes, for tests that must not need a VMM.
 The sandbox network itself — the IPv4 pool, the per-sandbox TAP, the
 invariant NAT (eBPF TCX or netfilter), and the quarantine ledger — is
 [`arcbox-tap-net`](../../virt/arcbox-tap-net), the Linux adapter of the
-`arcbox-vm-driver` `GuestNetwork` port; the composer builds it, and
-`arcbox_computer_runtime::network` re-exports the crate for the System
-VM's own port-forward and init code. Rendering the invariant translation
+`arcbox-vm-driver` `GuestNetwork` port; the composer builds it, and this
+crate does not depend on it at all. Rendering the invariant translation
 in the host's netfilter framework is that adapter's own seam
 (`arcbox_tap_net::PacketFilter`: `IptablesLegacy` in the System VM,
 `Nftables` on a stock distro — legacy and nft rulesets are mutually

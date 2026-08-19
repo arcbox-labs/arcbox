@@ -16,7 +16,7 @@ use arcbox_vm_driver::{IsolationSpec, PreparedVm, VmDriver, VmHandle, VmId};
 use tracing::{debug, warn};
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
@@ -149,7 +149,7 @@ pub async fn do_boot(
     vm_dir: &Path,
     driver: &dyn VmDriver,
     agents: &dyn GuestAgentFactory,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     cow_manager: &CowManager,
     computer: &Arc<Mutex<ComputerRuntime>>,
     resource_handoff: tokio::sync::oneshot::Sender<()>,

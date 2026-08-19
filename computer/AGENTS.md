@@ -26,9 +26,11 @@ restructure plan and its locked decisions live in the company repo:
 - **Mechanically checked**: `cargo xtask check-layers` (the `linux-engine`
   job) fails on a direct edge from `computer/` into `app/`, `arcbox-vmm`,
   `arcbox-hypervisor`, a macOS-only crate or a VMM adapter — the rules
-  live in `xtask/src/commands/check_layers/rules.rs`. Two of those edges
-  are grandfathered for `arcbox-computer-runtime` (below); an `Exception`
-  whose edge disappears **fails** the gate, which is what retires them.
+  live in `xtask/src/commands/check_layers/rules.rs`. Nothing in this
+  layer is grandfathered any more — the last two were
+  `arcbox-computer-runtime`'s adapter edges, and because an `Exception`
+  whose edge disappears **fails** the gate, deleting the edges is what
+  deleted them.
 - Errors speak `arcbox_engine::EngineError` **in `arcbox-computer`**;
   predicates like `EngineError::Agent { code }` carry the agent's
   HTTP-style wire codes (404/412 obsolete-ticket, 423 paused, 503 retry)
@@ -57,11 +59,18 @@ restructure plan and its locked decisions live in the company repo:
   vm-stack-redesign R3 moved it here; the in-sandbox init is
   `arcbox-vm-agent` and the wire vocabulary `arcbox-vm-proto`, both still
   under `virt/`. Its own README has the crate map.
-  - **It composes two adapters directly** — `arcbox-fc-driver` and
-    `arcbox-tap-net` — which the layer rule forbids, so both edges are
-    grandfathered `until: "vm-stack-redesign R3 (PR-G)"`, when the node
-    composition root supplies them through the port instead. Do not add a
-    third adapter edge; take it through `arcbox-vm-driver`.
+  - **It names no adapter at all** — the last two edges
+    (`arcbox-fc-driver`, `arcbox-tap-net`) died in R3's PR-G5 and their
+    `EXCEPTIONS` entries with them, so `cargo xtask check-layers` now
+    fails on any adapter edge from here with no escape hatch. What used
+    to arrive through those edges arrives from the composition root
+    instead: the adapters themselves as a `NodeEnvironment`, and the
+    `[firecracker]` keys that configure them as the composer's own
+    config type (`arcbox_agent::config::AdapterConfig`), read out of the
+    same TOML section this crate's `FirecrackerConfig` reads. Do not
+    reintroduce an adapter edge, in any dependency section — a test that
+    wants a real adapter belongs to the composer or to the adapter's own
+    contract run.
   - **The on-disk vocabulary is frozen.** `sandbox-records/`,
     `sandboxes/`, `state.json`, `sandbox-network-quarantine`,
     `arcbox-pause`, `paused-rootfs.ext4`, `arcbox.warm_key`, the `pool-`
@@ -70,9 +79,15 @@ restructure plan and its locked decisions live in the company repo:
     upgrade-in-place — the R3 rename deliberately leaves every one of
     them alone.
   - **Transitional naming**: the crate is `arcbox-computer-runtime` but
-    its types still read `SandboxManager` / `SandboxSpec` / `VmmConfig` /
-    `VmmError`. The `Computer*` rename is its own PR, with `compat.rs`
-    aliases for the guest agent. Not an inconsistency to file.
+    its types still read `SandboxManager` / `SandboxSpec` / `VmmError`,
+    and its config still calls the section-shaped struct
+    `FirecrackerConfig` though what is left in it is the runtime's own —
+    a data dir, an isolation spec, pool and CoW policy — the adapter's
+    settings having gone to the composer (the TOML key is frozen; the
+    type name is not, and follows in that rename).
+    `VmmConfig` is already `RuntimeConfig`. The `Computer*` rename is its
+    own PR, with `compat.rs` aliases for the guest agent. Not an
+    inconsistency to file.
 
 ## Reaching the platform without a `#[cfg]`
 

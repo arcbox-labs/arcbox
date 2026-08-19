@@ -51,7 +51,7 @@ pub struct PreparedSlot {
 /// partial resource before returning.
 pub(super) async fn prepare_slot(
     driver: &dyn VmDriver,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     cow_manager: &CowManager,
     snapshot: &SnapshotMeta,
 ) -> Result<PreparedSlot> {
@@ -154,7 +154,7 @@ struct StagedSlot {
 
 async fn stage_slot(
     driver: &dyn VmDriver,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     jc: &JailerConfig,
     cow_manager: &CowManager,
     snapshot: &SnapshotMeta,
@@ -324,7 +324,7 @@ fn spawn_slot_teardown(cow_manager: &Arc<CowManager>, slot: PreparedSlot) {
 pub fn spawn_pool_refill(
     pool: &Arc<SlotPool>,
     driver: &Arc<dyn VmDriver>,
-    config: &Arc<VmmConfig>,
+    config: &Arc<RuntimeConfig>,
     cow_manager: &Arc<CowManager>,
     snapshots: &Arc<SnapshotCatalog>,
     snapshot_id: &str,

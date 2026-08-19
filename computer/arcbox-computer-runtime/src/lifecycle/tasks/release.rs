@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use arcbox_vm_driver::ShutdownMode;
 use arcbox_vm_driver::net::GuestNetwork;
 
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox;
@@ -149,7 +149,7 @@ pub async fn release_everything(
     id: &str,
     arc: &Arc<Mutex<ComputerRuntime>>,
     network: &Arc<dyn GuestNetwork>,
-    config: &Arc<VmmConfig>,
+    config: &Arc<RuntimeConfig>,
     cow_manager: &Arc<CowManager>,
     snapshots: &Arc<crate::snapshot::SnapshotCatalog>,
 ) -> Result<()> {

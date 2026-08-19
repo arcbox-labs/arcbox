@@ -174,7 +174,8 @@ impl GuestNetwork for TapNetwork {
     /// policy-routing table (CORE-81/CORE-83).
     ///
     /// [`TryFrom<HostIngress> for ExposeTarget`](ExposeTarget::try_from) is
-    /// the inverse, for the System VM code that still names the local type.
+    /// the inverse, for the composition root that renders the answer as
+    /// this network's forwarding rules.
     fn host_ingress(&self, lease: &NetworkLease) -> Result<HostIngress> {
         let allocation = self.allocation(lease)?;
         Ok(match self.expose_target(&allocation.tap_name) {
@@ -252,9 +253,9 @@ impl NetworkReconcile for TapNetwork {
     }
 }
 
-/// The port's answer as this crate's own vocabulary, for the System VM
-/// code that still names [`ExposeTarget`] (R3 moves that call to the
-/// composition root and this impl goes with it).
+/// The port's answer as this crate's own vocabulary, for the composition
+/// root that built this network and renders its forwarding rules — the
+/// System VM's guest agent, which calls this where it decides the DNAT.
 ///
 /// Lossy in one direction only: a mark travels with
 /// [`HostIngress::GuestAddress`] and [`ExposeTarget`] has no room for it.

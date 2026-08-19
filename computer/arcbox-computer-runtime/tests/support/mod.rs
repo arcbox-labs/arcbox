@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arcbox_computer_runtime::config::{JailerConfig, VmmConfig};
+use arcbox_computer_runtime::config::{JailerConfig, RuntimeConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
@@ -105,7 +105,7 @@ impl Setup {
         std::fs::write(dir.path().join("k"), b"kernel").unwrap();
         std::fs::write(dir.path().join("r.ext4"), b"rootfs").unwrap();
 
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
         config.firecracker.warm_create = self.warm;
         // A node without device-mapper, said explicitly rather than left to
@@ -119,7 +119,6 @@ impl Setup {
         config.defaults.kernel = dir.path().join("k").to_string_lossy().into_owned();
         config.defaults.rootfs = dir.path().join("r.ext4").to_string_lossy().into_owned();
         config.firecracker.jailer = self.jailer.then(|| JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: nix::unistd::geteuid().as_raw(),
             gid: nix::unistd::getegid().as_raw(),
             chroot_base_dir: Some(dir.path().join("j").to_string_lossy().into_owned()),
@@ -127,7 +126,6 @@ impl Setup {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec![],
         });
 
         let ports = Ports {
@@ -153,7 +151,7 @@ struct Ports {
 }
 
 impl Ports {
-    async fn manager(&self, config: &VmmConfig) -> Arc<SandboxManager> {
+    async fn manager(&self, config: &RuntimeConfig) -> Arc<SandboxManager> {
         let manager = SandboxManager::new(
             config.clone(),
             NodeEnvironment {
@@ -190,7 +188,7 @@ impl Ports {
 pub struct Fixture {
     pub manager: Arc<SandboxManager>,
     ports: Ports,
-    config: VmmConfig,
+    config: RuntimeConfig,
     /// The data dir, kept alive for the fixture's life.
     dir: tempfile::TempDir,
 }

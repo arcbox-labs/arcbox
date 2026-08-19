@@ -711,11 +711,8 @@ exit 0
     /// marked packet still falls through to the DROP.
     fn setup_sandbox_forwarding() {
         let config = crate::config::load();
-        let subnet = &config.network.cidr;
-        let guest_ip = format!(
-            "{}/32",
-            arcbox_computer_runtime::network::invariant::GUEST_IP
-        );
+        let subnet = &config.runtime.network.cidr;
+        let guest_ip = format!("{}/32", arcbox_tap_net::invariant::GUEST_IP);
 
         run_iptables(
             &["-I", "FORWARD", "-d", subnet, "-j", "ACCEPT"],
@@ -735,7 +732,7 @@ exit 0
         );
 
         // Insert DROP first so the gateway ACCEPT lands above it.
-        let gateway = format!("{}/32", config.network.gateway);
+        let gateway = format!("{}/32", config.runtime.network.gateway);
         run_iptables(
             &[
                 "-t",

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 
 use super::fake_prepared::Preparer;
 use super::fake_staging::StagingArea;
@@ -69,11 +70,18 @@ pub(super) struct DriverInner {
     pub(super) caps: DriverCapabilities,
     pub(super) knobs: Arc<Knobs>,
     next_pid: AtomicU32,
+    /// What `id_budget` answers under jailer isolation.
+    jailed_id_budget: Option<usize>,
     /// Every VM booted or restored and not yet seen exited.
     vms: Mutex<HashMap<VmId, Arc<VmInner>>>,
     /// Every `Adopt::discard_area`, in order, with what it was told the VM
     /// ran under.
     discarded_areas: Mutex<Vec<(VmId, IsolationSpec)>>,
+    /// Armed by [`FakeDriver::park_next_boot`], consumed by the next boot
+    /// or restore: it sends, then parks.
+    pub(super) park_boot: Mutex<Option<oneshot::Sender<()>>>,
+    /// Every prepared VM torn down through `PreparedVm::discard`, in order.
+    pub(super) discarded_processes: Mutex<Vec<VmId>>,
 }
 
 /// Configures a [`FakeDriver`].
@@ -81,6 +89,7 @@ pub(super) struct DriverInner {
 pub struct FakeDriverBuilder {
     caps: DriverCapabilities,
     knobs: Knobs,
+    jailed_id_budget: Option<usize>,
 }
 
 impl FakeDriverBuilder {
@@ -90,14 +99,28 @@ impl FakeDriverBuilder {
         self
     }
 
+    /// What [`VmDriver::id_budget`] answers under jailer isolation;
+    /// direct mode keeps the port's default of no bound.
+    ///
+    /// Shaped like a real adapter's, where the bound comes from the path a
+    /// jail lays down and running the VMM directly lays none — so a
+    /// consumer tested over this fake exercises both answers.
+    pub fn jailed_id_budget(mut self, budget: usize) -> Self {
+        self.jailed_id_budget = Some(budget);
+        self
+    }
+
     /// Builds the driver.
     pub fn build(self) -> FakeDriver {
         let inner = Arc::new(DriverInner {
             caps: self.caps,
             knobs: Arc::new(self.knobs),
             next_pid: AtomicU32::new(FIRST_PID),
+            jailed_id_budget: self.jailed_id_budget,
             vms: Mutex::new(HashMap::new()),
             discarded_areas: Mutex::new(Vec::new()),
+            park_boot: Mutex::new(None),
+            discarded_processes: Mutex::new(Vec::new()),
         });
         FakeDriver {
             adopter: Adopter(Arc::clone(&inner)),
@@ -130,6 +153,7 @@ impl FakeDriver {
                 nested_virt: NestedVirt::unsupported("the fake driver runs no hypervisor"),
             },
             knobs: Knobs::default(),
+            jailed_id_budget: None,
         }
     }
 
@@ -153,6 +177,33 @@ impl FakeDriver {
     pub fn fail_next_boot(&self) -> &Self {
         self.inner.knobs.fail_boot.store(true, Ordering::Release);
         self
+    }
+
+    /// The next `boot` or `restore` never returns: it signals the
+    /// returned receiver and then parks until the task awaiting it is
+    /// dropped.
+    ///
+    /// The wedge a caller cannot script any other way. `fail_next_boot`
+    /// ends the boot, which releases everything the half-built VM took;
+    /// this one leaves it standing — the VMM prepared and journalled, the
+    /// disks staged, the boot task still in flight — which is the state a
+    /// forced teardown has to preempt. Hands back the signal rather than
+    /// taking one, so a scenario cannot arm the park without a way to
+    /// observe that a boot reached it.
+    #[must_use = "the receiver is how a test learns a boot reached the park"]
+    pub fn park_next_boot(&self) -> oneshot::Receiver<()> {
+        let (reached, park) = oneshot::channel();
+        *lock(&self.inner.park_boot) = Some(reached);
+        park
+    }
+
+    /// Every prepared VM torn down through `PreparedVm::discard`, in order.
+    ///
+    /// The prepared-VM counterpart of [`Self::shutdowns`]: a teardown that
+    /// merely dropped the prepared VM kills the process just the same, so
+    /// only this says the teardown *asked*.
+    pub fn discarded_processes(&self) -> Vec<VmId> {
+        lock(&self.inner.discarded_processes).clone()
     }
 
     /// The next `Checkpoint::checkpoint` on any VM fails with
@@ -352,6 +403,13 @@ impl VmDriver for FakeDriver {
             .prepare_sync(&spec.id, &spec.isolation, runtime_dir)
             .restore(image, spec)
             .await
+    }
+
+    fn id_budget(&self, isolation: &IsolationSpec) -> Option<usize> {
+        match isolation {
+            IsolationSpec::Jailer { .. } => self.inner.jailed_id_budget,
+            IsolationSpec::None => None,
+        }
     }
 
     fn adopt(&self) -> Option<&dyn Adopt> {

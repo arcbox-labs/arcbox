@@ -30,7 +30,12 @@ use crate::spec::{ConsoleSpec, VmId, VmSpec};
 const SIGKILL: i32 = 9;
 
 /// The on-disk format the fake writes and the only one it restores.
-pub(super) const CHECKPOINT_FORMAT: &str = "fake/v1";
+///
+/// Public so a test that seeds a checkpoint catalog by hand — rather than
+/// by taking one through this driver — can name the format the driver it
+/// runs on will accept back, instead of a literal copied from an adapter
+/// that is not in the test at all.
+pub const CHECKPOINT_FORMAT: &str = "fake/v1";
 
 /// The machine-state file every checkpoint writes, and the one `restore`
 /// reads back.

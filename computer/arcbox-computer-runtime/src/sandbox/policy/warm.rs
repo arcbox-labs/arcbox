@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::sandbox::SandboxSpec;
 
@@ -95,7 +95,7 @@ pub(in crate::sandbox) fn warm_key(
 /// which net-invariant snapshots make free); an explicit `ip=` would bake a
 /// caller-chosen identity into the snapshot, so it disqualifies too.
 pub(in crate::sandbox) fn warm_eligible(
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     spec: &SandboxSpec,
     caller_supplied_boot: bool,
 ) -> bool {
@@ -240,10 +240,9 @@ mod tests {
         }
     }
 
-    fn warm_config() -> VmmConfig {
-        let mut config = VmmConfig::default();
+    fn warm_config() -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
         config.firecracker.jailer = Some(JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: 0,
             gid: 0,
             chroot_base_dir: None,
@@ -251,7 +250,6 @@ mod tests {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec![],
         });
         config
     }
@@ -349,7 +347,11 @@ mod tests {
 
         // Restore needs jailer isolation; direct mode must never checkpoint
         // a snapshot it cannot restore.
-        assert!(!warm_eligible(&VmmConfig::default(), &base_spec(), false));
+        assert!(!warm_eligible(
+            &RuntimeConfig::default(),
+            &base_spec(),
+            false
+        ));
 
         let mut no_net = base_spec();
         no_net.network.mode = "none".into();

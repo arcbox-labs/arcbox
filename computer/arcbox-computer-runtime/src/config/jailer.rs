@@ -5,11 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::VmmError;
 
-/// Configuration for running Firecracker under the Jailer sandbox.
+/// The per-VM isolation half of `[firecracker.jailer]`.
+///
+/// Who the VMM runs as, where its chroot lives, which namespaces and
+/// cgroup it enters — everything [`IsolationSpec`] carries. The jailer
+/// binary and the rlimits it applies are node-wide and belong to whoever
+/// builds the adapter that spawns it; they stay in the same TOML table,
+/// read by that composer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JailerConfig {
-    /// Path to the `jailer` binary.
-    pub binary: String,
     /// UID the Firecracker process runs as inside the jail.
     pub uid: u32,
     /// GID the Firecracker process runs as inside the jail.
@@ -25,9 +29,6 @@ pub struct JailerConfig {
     pub cgroup_version: Option<String>,
     /// Parent cgroup path.
     pub parent_cgroup: Option<String>,
-    /// Resource limits in `rlimit` format (e.g., `"fsize=2048"`).
-    #[serde(default)]
-    pub resource_limits: Vec<String>,
 }
 
 impl JailerConfig {
@@ -48,10 +49,8 @@ impl JailerConfig {
 impl TryFrom<&JailerConfig> for IsolationSpec {
     type Error = VmmError;
 
-    /// The per-VM half of the jailer config: who the VMM runs as, where its
-    /// chroot lives, which namespaces and cgroup it enters. The jailer
-    /// binary and the resource limits are node-wide and belong to the
-    /// driver config instead.
+    /// Who the VMM runs as, where its chroot lives, which namespaces and
+    /// cgroup it enters.
     ///
     /// A `parent_cgroup` without a `cgroup_version` keeps the jailer's own
     /// default, version 1, made explicit here because the spec's
@@ -90,7 +89,6 @@ mod tests {
 
     fn jailer() -> JailerConfig {
         JailerConfig {
-            binary: "/usr/bin/jailer".into(),
             uid: 1000,
             gid: 1000,
             chroot_base_dir: None,
@@ -98,7 +96,6 @@ mod tests {
             new_pid_ns: false,
             cgroup_version: None,
             parent_cgroup: None,
-            resource_limits: vec!["fsize=2048".into()],
         }
     }
 

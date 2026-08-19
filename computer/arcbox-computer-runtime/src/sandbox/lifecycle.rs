@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn a_probing_agent_does_not_require_a_listening_driver() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = VmmConfig::default();
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = dir.path().to_string_lossy().into_owned();
         let driver = arcbox_vm_driver::testkit::FakeDriver::builder()
             .capabilities(arcbox_vm_driver::DriverCapabilities {

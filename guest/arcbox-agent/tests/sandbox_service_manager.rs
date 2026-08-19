@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
+use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::error::SandboxError;
 use arcbox_agent::sandbox::SandboxService;
-use arcbox_computer_runtime::VmmConfig;
+use arcbox_computer_runtime::RuntimeConfig;
 use arcbox_computer_runtime::config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
 };
@@ -19,25 +20,17 @@ fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("required env var is missing: {name}"))
 }
 
-fn test_config() -> VmmConfig {
+fn test_config() -> GuestConfig {
     let firecracker = required_env("FC_BINARY");
     let kernel = required_env("FC_KERNEL");
     let rootfs = required_env("FC_ROOTFS");
 
     let data_dir = format!("/tmp/arcbox-agent-test-{}", std::process::id());
 
-    VmmConfig {
+    let runtime = RuntimeConfig {
         firecracker: FirecrackerConfig {
-            binary: firecracker,
             jailer: None,
             data_dir: data_dir.clone(),
-            log_level: Some("Error".to_string()),
-            no_seccomp: true,
-            seccomp_filter: None,
-            http_api_max_payload_size: None,
-            mmds_size_limit: None,
-            socket_timeout_secs: Some(15),
-            sandbox_datapath: arcbox_computer_runtime::config::SandboxDatapath::default(),
             // Direct mode cannot restore (and so never pools or serves
             // warm creates); keep the run free of background checkpoint
             // and pre-warm work regardless.
@@ -60,6 +53,20 @@ fn test_config() -> VmmConfig {
             kernel,
             rootfs,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vm-agent".to_string(),
+        },
+    };
+    GuestConfig {
+        runtime,
+        adapters: AdapterConfig {
+            binary: firecracker,
+            jailer: None,
+            log_level: Some("Error".to_string()),
+            no_seccomp: true,
+            seccomp_filter: None,
+            http_api_max_payload_size: None,
+            mmds_size_limit: None,
+            socket_timeout_secs: Some(15),
+            sandbox_datapath: arcbox_tap_net::Datapath::default(),
         },
     }
 }

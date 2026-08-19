@@ -278,6 +278,50 @@ mod tests {
         );
     }
 
+    /// CORE-140's length half. The layout an ArcBox node deploys must leave
+    /// room for the ids its control plane mints, or every create fails on a
+    /// socket-connect timeout with nothing tying it back to the id.
+    ///
+    /// Measured off the constants the guest agent configures the jail with,
+    /// not off a copy of their values: a fixture holding its own copy would
+    /// keep passing while the node it claims to describe refuses every id.
+    ///
+    /// The id is spelled out because its *length* is the property under
+    /// test: the control plane's `inst_<uuid v7>` with the `_` the VMM
+    /// refuses turned into a `-`, which a bare `Uuid` is 5 bytes short of —
+    /// the gap that let a 39-byte budget look sufficient.
+    #[test]
+    fn the_deployed_jail_layout_admits_the_ids_a_node_mints() {
+        use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, JAILER_CHROOT_BASE};
+
+        const CONTROL_PLANE_ID: &str = "inst-019e409e-7546-7a3e-8b2c-1f2e3d4c5b6a";
+        assert_eq!(
+            CONTROL_PLANE_ID.len(),
+            41,
+            "the node's ids are `inst-` plus a UUID"
+        );
+
+        let deployed = FcDriver::new(FcDriverConfig::new(format!(
+            "{ARCBOX_RUNTIME_BIN_DIR}/firecracker"
+        )));
+        let budget = deployed
+            .id_budget(&IsolationSpec::Jailer {
+                uid: 0,
+                gid: 0,
+                chroot_base: JAILER_CHROOT_BASE.into(),
+                netns: None,
+                new_pid_ns: false,
+                cgroup: None,
+            })
+            .expect("a jailed layout bounds the id");
+        assert!(
+            budget >= CONTROL_PLANE_ID.len(),
+            "the deployed jail layout leaves {budget} bytes, short of the {} \
+             the node's ids need",
+            CONTROL_PLANE_ID.len()
+        );
+    }
+
     /// The startup-sweep route: a VM whose process died with the agent
     /// leaves its jail, and the driver is the only thing that knows where
     /// that is. A second sweep finding it already cleared is not an error,

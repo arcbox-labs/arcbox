@@ -38,13 +38,12 @@
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxState`] — a computer's public lifecycle state
-//! - [`network`] — `arcbox-tap-net`, re-exported for the `invariant`
-//!   addressing the System VM's own port-forward and init code still
-//!   names, and for the `ExposeTarget` its port-forwarding speaks.
-//!   Sandboxes reach the network only through the driver port's
-//!   `GuestNetwork`; [`NetworkManager`] is that adapter's type, not a
-//!   surface the manager speaks.
-//! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
+//! - [`RuntimeConfig`] / [`SandboxSpec`] — configuration types
+//!
+//! This crate names no VMM and no network implementation. Sandboxes reach
+//! both only through `arcbox-vm-driver`'s ports, and the composer supplies
+//! the implementations as a [`NodeEnvironment`]; a consumer that needs an
+//! adapter's own vocabulary depends on that adapter itself.
 //!
 //! Snapshot lineage — the checkpoint catalog, the copy-on-write rootfs
 //! manager, and the template catalog — lives in `arcbox-snapshot` in the
@@ -69,25 +68,14 @@ pub use arcbox_vm_proto::boot as boot_proto;
 /// the stat/event DTOs and the size caps a caller validates against.
 pub use arcbox_vm_proto::file as file_proto;
 
-/// The sandbox TAP network lives in `arcbox-tap-net` (vm-stack-redesign
-/// R2). Sandboxes reach it through the driver port; this path stays for
-/// the one thing that is not sandbox lifecycle — the System VM's own
-/// port-forward and init code, which still names `invariant` and
-/// `ExposeTarget` until a later PR moves those calls to the composition
-/// root.
-pub use arcbox_tap_net as network;
-
 // The snapshot lineage moved to the engine layer (arcbox-snapshot); these
 // paths stay so `arcbox-agent` and this crate's own modules keep compiling.
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-pub use config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, SandboxDatapath, VmmConfig,
-};
+pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
 pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};
-pub use network::{ExposeTarget, NetworkAllocation, NetworkManager};
 pub use rootfs::{RootfsBuilder, RootfsPaths};
 pub use sandbox::pause_reason;
 pub use sandbox::{

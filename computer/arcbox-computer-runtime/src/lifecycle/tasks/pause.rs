@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use arcbox_vm_driver::net::GuestNetwork;
 
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pause::PAUSED_ROOTFS_FILE;
@@ -52,7 +52,7 @@ use crate::snapshot_cow::CowManager;
 pub async fn release_for_pause(
     id: &SandboxId,
     arc: &Arc<Mutex<ComputerRuntime>>,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
 ) -> Result<()> {
@@ -240,8 +240,8 @@ mod tests {
         }
     }
 
-    fn config(data_dir: &std::path::Path) -> VmmConfig {
-        let mut config = VmmConfig::default();
+    fn config(data_dir: &std::path::Path) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         config
     }

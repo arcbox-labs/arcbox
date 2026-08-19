@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
 
-use crate::config::VmmConfig;
+use crate::config::RuntimeConfig;
 use crate::environment::NodeEnvironment;
 use crate::error::Result;
 use crate::snapshot_cow::{CowManager, CowOptions};
@@ -26,7 +26,7 @@ use crate::testkit::agent::FakeAgentFactory;
 ///     ..fake_environment(&config)?
 /// }
 /// ```
-pub fn fake_environment(config: &VmmConfig) -> Result<NodeEnvironment> {
+pub fn fake_environment(config: &RuntimeConfig) -> Result<NodeEnvironment> {
     let mut cow_options = CowOptions::new(&config.firecracker.data_dir);
     if let Some(candidates) = &config.firecracker.dmsetup_candidates {
         cow_options.dmsetup_candidates = candidates.iter().map(std::path::PathBuf::from).collect();

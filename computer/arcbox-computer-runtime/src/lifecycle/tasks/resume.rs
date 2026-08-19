@@ -19,7 +19,7 @@ use arcbox_vm_driver::{DiskSource, IsolationSpec, NicSpec, PreparedVm, VmDriver,
 use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgentFactory};
-use crate::config::{JailerConfig, VmmConfig};
+use crate::config::{JailerConfig, RuntimeConfig};
 use crate::error::{Result, VmmError};
 use crate::sandbox::pause::{PAUSED_ROOTFS_FILE, ResumeFailure, ResumedRuntime};
 use crate::sandbox::reconcile::JournaledLease;
@@ -44,7 +44,7 @@ pub async fn restore_paused(
     snap_meta: &SnapshotMeta,
     vm_dir: &Path,
     networked: bool,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     cow_manager: &CowManager,
     driver: &dyn VmDriver,
     network: &dyn GuestNetwork,
@@ -260,7 +260,7 @@ pub async fn restore_paused(
 async fn park_copy_mode_rootfs(
     id: &SandboxId,
     vm_dir: &Path,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     prepared: Option<&Arc<dyn PreparedVm>>,
 ) -> bool {
     let Some(prepared) = prepared else {
@@ -292,7 +292,7 @@ async fn park_copy_mode_rootfs(
 async fn unwind_resume(
     id: &SandboxId,
     vm_dir: &Path,
-    config: &VmmConfig,
+    config: &RuntimeConfig,
     cow_manager: &CowManager,
     network: &dyn GuestNetwork,
     prepared: Option<Arc<dyn PreparedVm>>,
