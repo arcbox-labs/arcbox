@@ -77,7 +77,9 @@ pub trait PreparedVm: Send + Sync {
     }
 
     /// Bring the files this VM boots from into the area its VMM can reach.
-    /// `Some` iff [`crate::DriverCapabilities::staging`].
+    /// `Some` iff [`crate::DriverCapabilities::staging`]. The handle of the
+    /// VM booted on this process reaches the same area through
+    /// [`VmHandle::staging`](crate::VmHandle::staging).
     fn staging(&self) -> Option<&dyn Staging> {
         None
     }
@@ -112,11 +114,17 @@ pub trait PreparedVm: Send + Sync {
 /// the caller says what a file is, and gets back the path its spec must
 /// name for it. It never learns whether a confinement exists.
 ///
-/// Present iff [`crate::DriverCapabilities::staging`]. A driver whose VMs
-/// read host paths as they are still offers it, as the identity: staging
-/// such a file is a no-op that answers with the path it was given. That is
-/// what lets an orchestrator stage unconditionally instead of branching on
-/// a confinement it is not supposed to know about.
+/// Present iff [`crate::DriverCapabilities::staging`], and reachable from
+/// both grips on a VM — the prepared VM the driver spawned
+/// ([`PreparedVm::staging`]) and the handle to the VM running on it
+/// ([`VmHandle::staging`](crate::VmHandle::staging)) — naming the same area
+/// either way. That is what lets a VM this driver *adopted*, whose prepared
+/// half died with the process that made it, still take a disk back out. A
+/// driver whose VMs read host paths as they are still offers it, as the
+/// identity: staging such a file is a no-op that answers with the path it
+/// was given. That is what lets an orchestrator stage unconditionally
+/// instead of branching on a confinement it is not supposed to know
+/// about.
 ///
 /// Staging a file that is already in the VM's area leaves it alone and
 /// names it where it is — so a caller may stage what an earlier stage, or

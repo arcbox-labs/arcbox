@@ -19,10 +19,10 @@
 //! - [`capability`] — everything optional, one trait each: [`Vsock`],
 //!   [`VsockListen`], [`Checkpoint`], [`Adopt`]/[`Detach`], [`Prepare`],
 //!   [`Staging`], [`Balloon`], [`Console`], [`DebugSnapshot`]. A handle —
-//!   or the driver, for `Adopt` and `Prepare`; or the prepared VM, for
-//!   `Staging` — exposes each through an `Option<&dyn Cap>` accessor,
-//!   `Some` only when the driver can and the spec asked;
-//!   `capabilities()` must agree with the accessors.
+//!   or the driver, for `Adopt` and `Prepare`; or the prepared VM *and*
+//!   the handle, for `Staging` — exposes each through an
+//!   `Option<&dyn Cap>` accessor, `Some` only when the driver can and the
+//!   spec asked; `capabilities()` must agree with the accessors.
 //! - [`net`] — the second port: [`net::GuestNetwork`] plans and builds
 //!   what a NIC is attached to and hands the driver a [`NicSpec`];
 //!   [`net::NetworkReconcile`] is its token-guarded cleanup protocol.

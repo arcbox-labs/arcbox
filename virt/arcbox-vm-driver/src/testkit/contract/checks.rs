@@ -81,9 +81,10 @@ pub async fn capabilities_agree_with_accessors(h: &dyn ContractHarness) {
     assert_eq!(caps.console, vm.console().is_some(), "console");
     assert_eq!(caps.debug, vm.debug().is_some(), "debug");
     assert_eq!(caps.prepare, driver.prepare().is_some(), "prepare");
-    // Staging is reached through a prepared VM, so its accessor is checked
-    // in `a_staged_spec_boots`; claiming it without `Prepare` leaves no way
-    // to reach it at all.
+    assert_eq!(caps.staging, vm.staging().is_some(), "staging");
+    // The prepared VM's accessor is checked in `a_staged_spec_boots`, which
+    // has one; claiming staging without `Prepare` leaves nothing to stage
+    // into before a boot.
     assert!(caps.prepare || !caps.staging, "staging without prepare");
     vm.shutdown(ShutdownMode::Kill).await.expect("kill");
 }
