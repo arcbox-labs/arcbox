@@ -25,7 +25,11 @@ owns:
   (`[A-Za-z0-9._-]`, at most 64 bytes, not `.`/`..`), checked at `reserve`
   and on every ledger write and load, so whatever is reserved can be
   quarantined and every entry is one `NetworkReconcile` can list and
-  finalize.
+  finalize. A marker that fails those checks is skipped rather than
+  fatal — the load runs inside the constructor, and a host that cannot
+  build its network reaps nothing — but its address is still withheld
+  from the pool for the manager's lifetime, because a guest this build
+  cannot name may still be on it.
 
 It moved here from `arcbox-vm/src/network` (vm-stack-redesign R2a,
 D-VM6). `arcbox_computer_runtime::network` re-exports the crate and
