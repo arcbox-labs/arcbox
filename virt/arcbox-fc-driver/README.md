@@ -11,11 +11,11 @@ taking one back out afterwards, from the prepared VM or from a handle —
 `Adopt`/`Detach` for VMs that outlive the process that booted them, and
 `Adopt::discard_area` for the jail of one that did not.
 
-Nothing above this crate names Firecracker. The sandbox manager
-(`arcbox-computer-runtime`) reaches it through `dyn VmDriver` — during the
-R1 migration it also calls the moved staging helpers directly, an edge R3
-removes — and the only other things it depends on are the port and
-`fc-sdk`: no snapshot catalog, no engine, no orchestrator.
+Nothing above this crate names Firecracker except the composition root
+that picks it. The sandbox manager (`arcbox-computer-runtime`) reaches
+every VM through `dyn VmDriver`, jail layout included; the only other
+things this crate depends on are the port and `fc-sdk`: no snapshot
+catalog, no engine, no orchestrator.
 
 ## Layout
 

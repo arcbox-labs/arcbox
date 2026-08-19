@@ -160,6 +160,15 @@ pub struct SandboxStateRecord {
     #[serde(default)]
     cow: Option<CowRecord>,
     /// Whether a jailer chroot was created for this sandbox.
+    ///
+    /// Written, never read. This sweep asks the driver to discard a dead
+    /// VM's area instead ([`arcbox_vm_driver::Adopt::discard_area`]): the
+    /// flag records what the *writing* process's config said, while the
+    /// only area this process can name is the one its own config
+    /// describes. It stays in the record because an agent that predates
+    /// that route still gates its chroot removal on it, and the field
+    /// defaults to `false` — so dropping it would make a downgrade skip
+    /// every removal.
     #[serde(default)]
     pub jailer: bool,
     /// For restored sandboxes: the recreated origin directory to remove.
@@ -524,7 +533,8 @@ impl OrphanSweep {
 ///
 /// Runs once per manager construction, in the background. Ordering per
 /// killed sandbox mirrors live teardown: kill the VMM → wait for exit → dm
-/// teardown → TAP release → chroot + directory removal.
+/// teardown → TAP release → the VM's own area, discarded through the
+/// driver → directory removal.
 pub(super) async fn sweep_orphans(
     config: &VmmConfig,
     driver: &dyn VmDriver,
@@ -684,6 +694,10 @@ async fn reap_orphans(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) -> Result<(HashSet<String>, Vec<PathBuf>)> {
+    // What every VMM on this node runs under, and so where the driver will
+    // look for the area of one that is gone: read from this process's own
+    // config, because nothing can be read back off a dead process.
+    let isolation = super::isolation_spec(config)?;
     // Every VM this sweep does not keep must be dead before the global CoW
     // sweep runs: a live VMM pins its dm device, and a pinned device turns
     // a reap into an error that fails the whole reconciliation.
@@ -748,18 +762,23 @@ async fn reap_orphans(
             network.quarantine(lease).await.map_err(VmmError::from)?;
         }
 
-        if record.jailer
-            && let Some(ref jc) = config.firecracker.jailer
-        {
-            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-            let chroot = arcbox_fc_driver::jail::chroot_root(
-                &config.firecracker.binary,
-                base,
-                record.resource_owner(),
-            );
-            if let Some(parent) = chroot.parent() {
-                remove_dir_if_present(parent).await?;
-            }
+        // The VM's own area — under the jailer, a whole chroot holding the
+        // guest's rootfs. Only the driver knows where that is, and the VM
+        // is already dead: the loop above either adopted it (and `continue`d
+        // past here) or killed it.
+        //
+        // The journal's `jailer` flag is deliberately not consulted. It
+        // says what the config of the process that *wrote* it had, while
+        // the only area this process can name is the one described by
+        // `isolation` — its own config — and a driver that confines nothing
+        // answers that there is no area rather than failing. Gating on the
+        // flag would skip the removal for a record written by a
+        // differently-configured process, leaving an area nothing else will
+        // ever collect.
+        if let Some(adopt) = driver.adopt() {
+            adopt
+                .discard_area(&vm_record(driver, dir, record)?, &isolation)
+                .await?;
         }
 
         runtime_dirs.push(dir.clone());
@@ -1182,18 +1201,7 @@ async fn adopt_or_kill(
     let Some(adopt) = driver.adopt() else {
         return Ok(None);
     };
-    let vm_record = VmRecord {
-        id: VmId::new(record.resource_owner())?,
-        driver: driver.name().to_owned(),
-        runtime_dir: runtime_dir.to_path_buf(),
-        process: record
-            .pid
-            .and_then(|pid| u32::try_from(pid).ok())
-            .map(|pid| ProcessRecord {
-                pid,
-                api_socket: None,
-            }),
-    };
+    let vm_record = vm_record(driver, runtime_dir, record)?;
     let adopted = tokio::time::timeout(ADOPT_TIMEOUT, adopt.adopt(&vm_record))
         .await
         .map_err(|_| {
@@ -1229,6 +1237,33 @@ async fn adopt_or_kill(
             Ok(None)
         }
     }
+}
+
+/// The VM a crash journal names, in the port's own vocabulary — what
+/// [`arcbox_vm_driver::Adopt`] takes both to find that VM and to discard
+/// what it left.
+///
+/// Keyed by the id its resources are named after, which for a sandbox that
+/// claimed a pre-warmed slot is the slot's, not its own. The id is already
+/// known to parse: [`sweep_orphans`] refuses a journal whose ids do not,
+/// before any of them reaches this far.
+fn vm_record(
+    driver: &dyn VmDriver,
+    runtime_dir: &Path,
+    record: &SandboxStateRecord,
+) -> Result<VmRecord> {
+    Ok(VmRecord {
+        id: VmId::new(record.resource_owner())?,
+        driver: driver.name().to_owned(),
+        runtime_dir: runtime_dir.to_path_buf(),
+        process: record
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .map(|pid| ProcessRecord {
+                pid,
+                api_socket: None,
+            }),
+    })
 }
 
 /// Take this live VM and the host state it was running on back, or say why
@@ -2663,6 +2698,95 @@ mod tests {
             let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
             assert_eq!(keeper.state, SandboxState::Failed, "{what}");
             assert!(keeper.handle.is_none(), "{what}");
+        }
+    }
+
+    /// Every VM the sweep does not keep loses its host area through the
+    /// driver — once, and under this process's own isolation. The journal's
+    /// `jailer` flag decides nothing, which is the point: it records what
+    /// the config of the process that *wrote* it had, and a record written
+    /// by a differently-configured process would otherwise keep an area
+    /// nothing else will ever collect.
+    ///
+    /// What the sweep keeps, it does not touch: a reclaimed VM is still
+    /// running on its area (the fake refuses the call outright), and a
+    /// journal this process could not read names resources it must leave
+    /// entirely alone.
+    #[tokio::test]
+    async fn a_dead_vms_area_goes_whatever_its_journal_says_about_the_jailer() {
+        use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
+
+        for journaled_jailer in [false, true] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let driver = FakeDriver::new();
+            let probe = driver.clone();
+            let network = FakeNetwork::new();
+
+            let mut config = VmmConfig::default();
+            config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+            config.firecracker.jailer = Some(crate::config::JailerConfig {
+                binary: "/usr/bin/jailer".into(),
+                uid: 0,
+                gid: 0,
+                chroot_base_dir: Some(data_dir.path().join("jail").to_string_lossy().into_owned()),
+                netns: None,
+                new_pid_ns: false,
+                cgroup_version: None,
+                parent_cgroup: None,
+                resource_limits: vec![],
+            });
+            let isolation = super::super::isolation_spec(&config).unwrap();
+
+            // Unadoptable: no vsock means the driver could only ever kill
+            // it, which is every refusal's fallback.
+            let goner_dir = data_dir.path().join("sandboxes").join("goner");
+            let goner = boot_previous_vm(&driver, &goner_dir, "goner", false, true).await;
+            let mut journal =
+                SandboxStateRecord::new("goner", None, None, None, &config, None).unwrap();
+            journal.jailer = journaled_jailer;
+            write_state_record(&goner_dir, &journal).unwrap();
+
+            // Reclaimed, so its area is still in use.
+            let keeper_dir = data_dir.path().join("sandboxes").join("keeper");
+            let keeper = boot_previous_vm(&driver, &keeper_dir, "keeper", true, true).await;
+            write_state_record(
+                &keeper_dir,
+                &SandboxStateRecord::new("keeper", None, None, None, &config, None).unwrap(),
+            )
+            .unwrap();
+
+            // Unreadable — the id does not match the directory holding it —
+            // so nothing it names may be acted on, its area included.
+            let odd_dir = data_dir.path().join("sandboxes").join("zzz-odd");
+            let _odd = boot_previous_vm(&driver, &odd_dir, "zzz-odd", true, true).await;
+            write_state_record(
+                &odd_dir,
+                &SandboxStateRecord::new("someone-else", None, None, None, &config, None).unwrap(),
+            )
+            .unwrap();
+
+            let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+            record_in_phase(&store, "goner", PersistPhase::Ready);
+            record_in_phase(&store, "keeper", PersistPhase::Ready);
+            let cow_manager =
+                CowManager::new(crate::snapshot_cow::CowOptions::new(data_dir.path())).unwrap();
+            let snapshots = crate::snapshot::SnapshotCatalog::new(&config.firecracker.data_dir);
+
+            let sweep = sweep_orphans(&config, &driver, &network, &cow_manager, &snapshots, &store)
+                .await
+                .expect("the sweep");
+
+            assert_eq!(
+                probe.discarded_areas(),
+                [(VmId::new("goner").unwrap(), isolation)],
+                "journaled jailer flag {journaled_jailer}"
+            );
+            assert_eq!(
+                goner.state(),
+                VmState::Exited(arcbox_vm_driver::ExitStatus::signaled(9))
+            );
+            assert!(sweep.adopted.contains_key("keeper"));
+            assert_eq!(keeper.state(), VmState::Running);
         }
     }
 
