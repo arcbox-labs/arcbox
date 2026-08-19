@@ -123,7 +123,11 @@ this.
 A VM `id` and a disk `id` must each be a plain name: the first is the jail's
 directory, the second a device id in the API URL and the file the disk is
 staged as. Anything that could name a path outside the jail — `.`, `..`, a
-separator — is refused.
+separator — is refused. The VM id is held to less than that, and by the
+port rather than here: it is also Firecracker's `--id`, which takes
+`[A-Za-z0-9-]` and panics on anything else, so a `.` or a `_` never
+reaches this layout at all. A disk id keeps the wider path-safe alphabet,
+never being handed to the VMM as an identity.
 
 Console files and sockets, virtiofs shares, and the balloon are refused
 with `Error::InvalidSpec` — the driver claims none of those capabilities.
