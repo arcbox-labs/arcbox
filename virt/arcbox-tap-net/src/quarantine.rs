@@ -242,9 +242,10 @@ pub fn load_quarantines(
         }
         let path = entry.path();
         match path.extension().and_then(|value| value.to_str()) {
-            // A staging file (`.{id}-{uuid}.tmp`) a crash left mid-write. The
-            // skip is keyed on that shape, not on a leading dot: a `VmId` may
-            // start with one, and its marker `.{id}.json` must load.
+            // A staging file (`.{id}-{uuid}.tmp`) a crash left mid-write.
+            // Keyed on the `.tmp` extension the writer gives it, not on the
+            // leading dot it happens to carry: the dot is the writer's, and
+            // the shape it wrote is the honest thing to match.
             Some("tmp") => continue,
             Some("json") => {}
             _ => {
@@ -371,11 +372,10 @@ fn quarantine_path(dir: &Path, sandbox_id: &str) -> PathBuf {
 }
 
 /// The network's id contract is the driver port's: a VM id is a `VmId`
-/// (`[A-Za-z0-9._-]`, non-empty, at most [`VmId::MAX_LEN`] bytes, not `.`
-/// or `..`), which also makes it a safe ledger path component
-/// (`{id}.json`; a leading dot is fine — the loader skips staging files by
-/// their `.tmp` extension, not by dotfile). Checked where an id enters the
-/// network (`reserve`), on
+/// (`[A-Za-z0-9-]`, non-empty, at most [`VmId::MAX_LEN`] bytes), which also
+/// makes it a safe ledger path component (`{id}.json` — it carries no `.`
+/// of its own, so the only dot in a marker's name is the extension).
+/// Checked where an id enters the network (`reserve`), on
 /// every ledger write, and on every ledger load, so a reserved address can
 /// always be quarantined, every entry the ledger holds is one the port can
 /// name, and a file from outside the contract fails at load with its id in

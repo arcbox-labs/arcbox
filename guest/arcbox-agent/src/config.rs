@@ -11,7 +11,7 @@ use arcbox_computer_runtime::VmmConfig;
 use arcbox_computer_runtime::config::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
 };
-use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR};
+use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, ARCBOX_RUNTIME_DIR, JAILER_CHROOT_BASE};
 
 /// Persistent Btrfs mount that owns sandbox images, snapshots, and VM state.
 pub const SANDBOX_DATA_DIR: &str = "/var/lib/arcbox/sandbox";
@@ -36,7 +36,7 @@ fn guest_defaults() -> VmmConfig {
                 binary: runtime_bin.join("jailer").to_string_lossy().into(),
                 uid: 0,
                 gid: 0,
-                chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+                chroot_base_dir: Some(JAILER_CHROOT_BASE.into()),
                 netns: None,
                 new_pid_ns: false,
                 cgroup_version: None,

@@ -149,7 +149,7 @@ impl SandboxManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        super::validate_new_sandbox_id(&new_id, &self.config)?;
+        super::validate_new_sandbox_id(&new_id, &*self.services.driver, &self.config)?;
         // The snapshot id is caller-supplied and flows into snapshot dir paths
         // (create_dir_all / copy / remove_dir_all) — validate it too, or a
         // `../` id would traverse out of the snapshots directory.

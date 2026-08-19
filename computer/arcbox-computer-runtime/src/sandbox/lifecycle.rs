@@ -120,9 +120,10 @@ impl SandboxManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Restrict caller-supplied ids to a safe charset (path components,
-        // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
-        super::validate_new_sandbox_id(&id, &self.config)?;
+        // Hold a caller-supplied id to what the driver can actually run it
+        // as — its VM identity and its socket-path budget. Auto-generated
+        // UUIDs pass unchanged.
+        super::validate_new_sandbox_id(&id, &*self.services.driver, &self.config)?;
         spec.id = Some(id.clone());
 
         // Template warm-restore (CORE-107): a catalog template carrying a

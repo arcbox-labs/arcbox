@@ -17,22 +17,41 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// The identity of a VM: a plain name — non-empty, at most 64 characters,
-/// `[A-Za-z0-9._-]`, and not `.` or `..`.
+/// and `[A-Za-z0-9-]`.
 ///
-/// Drivers use it as a runtime-directory and socket-name component, which is
-/// what the rule protects; [`DiskSpec::id`] is held to the same one.
+/// Drivers use it as a runtime-directory and socket-name component, and hand
+/// it to the VMM as the instance id it runs under. The alphabet is therefore
+/// the *intersection* of what those uses allow, not the union: Firecracker
+/// validates its `--id` as `[A-Za-z0-9-]`, 1..=64, and **panics** on anything
+/// else — `Invalid instance ID: InvalidChar('_', 4)`, raised from inside
+/// whatever task spawned the VMM, with nothing tying it back to the request
+/// that supplied the id. A separator this type accepted but a driver could
+/// not run would be a promise the port cannot keep, so it accepts only `-`.
+/// [`MAX_LEN`](Self::MAX_LEN) is that same VMM-imposed 64.
+///
+/// A driver-internal name that never becomes a VMM identity — [`DiskSpec::id`]
+/// is the one here — keeps the wider path-safe alphabet (`.` and `_` too).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct VmId(String);
 
 impl VmId {
-    /// The longest id a driver has to fit into a path or socket name.
+    /// The longest id a driver has to fit into a path or socket name, and
+    /// the longest a VMM will take as its instance id.
     pub const MAX_LEN: usize = 64;
 
     /// Validates `id` and wraps it.
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
-        require_plain_name("vm id", &id)?;
+        require_name_length("vm id", &id)?;
+        if let Some(bad) = id
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-'))
+        {
+            return Err(Error::InvalidSpec(format!(
+                "vm id `{id}` contains `{bad}`; allowed: A-Z a-z 0-9 -"
+            )));
+        }
         Ok(Self(id))
     }
 
@@ -194,11 +213,11 @@ pub struct VmSpec {
 impl VmSpec {
     /// Checks the invariants no driver can repair.
     ///
-    /// CPU and memory are at least 1; disk ids are plain names under the
-    /// [`VmId`] rule and unique; NIC ids and share tags are non-empty and
-    /// unique; at most one disk is the root; every MAC is a non-nil unicast
-    /// address; every boot, disk and share path is non-empty; the vsock
-    /// guest CID is 3 or above.
+    /// CPU and memory are at least 1; disk ids are plain names (the path-safe
+    /// alphabet, wider than [`VmId`]'s) and unique; NIC ids and share tags are
+    /// non-empty and unique; at most one disk is the root; every MAC is a
+    /// non-nil unicast address; every boot, disk and share path is non-empty;
+    /// the vsock guest CID is 3 or above.
     pub fn validate(&self) -> Result<()> {
         if self.cpus == 0 {
             return Err(Error::InvalidSpec("cpus must be at least 1".into()));
@@ -271,10 +290,9 @@ fn require_path(what: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The rule for anything a driver may turn into a path component, a socket
-/// name, or a URL segment: non-empty, at most [`VmId::MAX_LEN`] bytes,
-/// `[A-Za-z0-9._-]`, and not the `.` / `..` traversal names.
-fn require_plain_name(what: &str, name: &str) -> Result<()> {
+/// The half of the name rules that does not depend on the alphabet:
+/// non-empty and at most [`VmId::MAX_LEN`] bytes.
+fn require_name_length(what: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidSpec(format!("{what} must not be empty")));
     }
@@ -284,6 +302,15 @@ fn require_plain_name(what: &str, name: &str) -> Result<()> {
             VmId::MAX_LEN
         )));
     }
+    Ok(())
+}
+
+/// The rule for a driver-internal name — one a driver may turn into a path
+/// component or a URL segment, but never hands to a VMM as its instance id:
+/// [`require_name_length`] plus `[A-Za-z0-9._-]`, and not the `.` / `..`
+/// traversal names. Wider than [`VmId`]'s alphabet, which a VMM constrains.
+fn require_plain_name(what: &str, name: &str) -> Result<()> {
+    require_name_length(what, name)?;
     if let Some(bad) = name
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
@@ -547,10 +574,8 @@ mod tests {
 
     #[test]
     fn vm_id_accepts_the_documented_alphabet_and_nothing_else() {
-        assert!(VmId::new("a.b_c-D9").is_ok());
+        assert!(VmId::new("a-b-c-D9").is_ok());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN)).is_ok());
-        assert!(VmId::new(".hidden").is_ok());
-        assert!(VmId::new("...").is_ok());
         assert!(VmId::new("").is_err());
         assert!(VmId::new("x".repeat(VmId::MAX_LEN + 1)).is_err());
         assert!(VmId::new("has space").is_err());
@@ -558,15 +583,26 @@ mod tests {
         assert!(VmId::new("ünïcode").is_err());
     }
 
+    /// A VMM validates the id it is given and refuses it late and loudly —
+    /// Firecracker `panic!`s on `--id inst_abc` from inside whatever task
+    /// spawned it. The separators a path would tolerate are refused here so
+    /// no such id can be built in the first place.
     #[test]
-    fn vm_id_refuses_the_traversal_names() {
-        for bad in [".", ".."] {
+    fn vm_id_refuses_the_separators_a_vmm_will_not_take() {
+        for bad in ["inst_abc", "a.b", ".hidden", "...", ".", ".."] {
             match VmId::new(bad) {
-                Err(Error::InvalidSpec(msg)) => assert!(msg.contains("traversal"), "{msg}"),
+                Err(Error::InvalidSpec(msg)) => {
+                    assert!(msg.contains("allowed: A-Z a-z 0-9 -"), "{msg}");
+                }
                 other => panic!("`{bad}` gave {other:?}"),
             }
             assert!(serde_json::from_str::<VmId>(&format!("\"{bad}\"")).is_err());
         }
+        // A disk id is a driver-internal name, never a VMM identity, so it
+        // keeps the wider alphabet.
+        let mut spec = spec();
+        spec.disks[0].id = "root_disk.img".to_owned();
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
