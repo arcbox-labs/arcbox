@@ -238,12 +238,30 @@ impl ComputerLifecycle {
         }
     }
 
+    /// The three states holding a settled live handle — which is exactly the
+    /// set a handover can act on, and why `Detach` sits beside `Stop` here.
     #[superstate(superstate = "computer")]
     fn active(event: &Event, context: &mut Effects) -> Outcome {
         match event {
             Event::Stop { budget_ms } => {
                 context.stop(*budget_ms, false);
                 Transition(State::stopping())
+            }
+            // No transition: the port call decides. A handover that fails
+            // leaves a computer that is still ours and still usable, so the
+            // machine must not have moved off the state it came from.
+            Event::Detach => {
+                context.emit(Effect::Detach);
+                Handled
+            }
+            Event::Detached => {
+                context.emit(Effect::Answer(Answer::Detached));
+                // The TTL and idle windows belong to whoever owns the VM, and
+                // that is no longer this process; leaving them armed would have
+                // an expiry tear down a guest the successor is adopting.
+                context.emit(Effect::CancelTimer(Timer::Ttl));
+                context.emit(Effect::CancelTimer(Timer::Idle));
+                Transition(State::detached())
             }
             _ => Super,
         }
@@ -491,6 +509,21 @@ impl ComputerLifecycle {
             | Event::VmExited => Handled,
             _ => Super,
         }
+    }
+
+    /// Handed to the next process: this one no longer owns the VM.
+    ///
+    /// Deliberately **not** under `computer`, unlike every other resting state.
+    /// A `Remove` or a TTL expiry reaching that superstate would release TAP,
+    /// the CoW device and the jail out from under a live guest the successor
+    /// has adopted, and a `Stop` would drive `handle.shutdown` into a handle
+    /// whose waiter has stood down — burning the budget and then SIGKILLing the
+    /// VM that was just reported as handed over. Swallowing everything here is
+    /// what makes the handover final. The record is left exactly as it was,
+    /// which is what the successor's sweep adopts from.
+    #[state]
+    fn detached() -> Outcome {
+        Handled
     }
 
     /// The record is forgotten; the actor is on its way out.

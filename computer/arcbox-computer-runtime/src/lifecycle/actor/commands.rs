@@ -132,6 +132,42 @@ impl ComputerActor {
                     }
                 }
             }
+            Command::Detach { reply } => {
+                // Parked *before* the dispatch, like a removal and for a
+                // sharper reason: the handover is awaited inside the effect
+                // rather than spawned, so `Answer::Detached` always lands
+                // before this dispatch returns.
+                self.waiters.push((Answer::Detached, reply));
+                if self.dispatch(machine, Event::Detach).await {
+                    return;
+                }
+                // The machine had nothing to do, which is two different
+                // answers — and the state is what tells them apart, not the
+                // handle: a computer halfway through a stop still holds one.
+                let answer = match machine.state() {
+                    // Nothing to hand over, which is a real success: there is
+                    // no guest here this process would have killed on its way
+                    // out. A paused computer gave its VM up to its checkpoint
+                    // and a resting one has none, so the successor reinstates
+                    // all of them from the record alone. An already-detached
+                    // one is the successor's twice over — reporting a failure
+                    // would have a composer log a loss it did not take.
+                    State::Paused {}
+                    | State::Stopped {}
+                    | State::Failed {}
+                    | State::Gone {}
+                    | State::Detached {} => Ok(()),
+                    // Mid-launch or mid-teardown. The launch's resources are
+                    // still in its task rather than on the computer, and a
+                    // teardown was asked for — either way a caller that heard
+                    // `Ok` would believe a guest survived a handover that
+                    // never happened.
+                    _ => Err(self.wrong_state("Ready, Running, or Checkpointing")),
+                };
+                if let Some((_, reply)) = self.waiters.pop() {
+                    let _ = reply.send(answer);
+                }
+            }
             Command::ClaimWorkload { claim, reply } => {
                 let taken = self.dispatch(machine, Event::ClaimWorkload { claim }).await;
                 let _ = reply.send(if taken {

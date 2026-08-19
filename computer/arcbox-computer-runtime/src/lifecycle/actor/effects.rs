@@ -124,6 +124,19 @@ impl ComputerActor {
                     }
                 });
             }
+            Effect::Detach => match self.tasks.detach().await {
+                // The machine has not moved yet: it emitted this effect and
+                // stayed put, so the handover's own outcome is what decides.
+                Ok(()) => self.queued.push_back(Event::Detached),
+                // Stay where we are. The VM is still ours and still usable —
+                // it simply dies with this process, which is what a failed
+                // handover has always meant. Failing the computer instead
+                // would write `Failed` over a record the successor's sweep
+                // still has to read as `Ready`.
+                Err(failure) => {
+                    self.fail_waiters(failure.into_error());
+                }
+            },
             Effect::AbortInflight => return self.abort_inflight().await,
             Effect::Publish(notify) => self.publish(notify),
             Effect::ArmTimer(timer) => self.arm(timer, state),

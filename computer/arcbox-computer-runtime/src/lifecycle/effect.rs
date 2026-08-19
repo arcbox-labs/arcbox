@@ -87,6 +87,7 @@ pub(super) enum Answer {
     Paused,
     Stopped,
     Removed,
+    Detached,
 }
 
 /// A side effect emitted by a transition, executed by the actor.
@@ -128,6 +129,14 @@ pub(super) enum Effect {
     SpawnRelease {
         scope: ReleaseScope,
     },
+    /// Hand the VM to the next process. Unlike every other flow this is not a
+    /// `Spawn*`: releasing ownership has no wait in it, so the actor awaits it
+    /// in the same dispatch and raises [`Event::Detached`] only if it worked —
+    /// which is what lets a failed handover leave the computer where it was
+    /// instead of needing a state to come back from.
+    ///
+    /// [`Event::Detached`]: super::event::Event::Detached
+    Detach,
     /// Wait out the boot task's resource handoff, then abort it.
     AbortInflight,
     Publish(Notify),

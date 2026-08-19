@@ -103,6 +103,32 @@ impl ComputerFlows {
         Ok(())
     }
 
+    /// Hand this computer's VM to the next process.
+    ///
+    /// The handle deliberately stays on the computer: the read path still
+    /// describes the guest it names, and after the driver has released it a
+    /// drop no longer kills. Nothing durable is written — the record already
+    /// says `Ready`, which is what the successor's sweep adopts from.
+    pub(super) async fn detach_vm(&self) -> TaskResult {
+        let handle = self.computer.lock().unwrap().handle.clone();
+        // No VM to hand over, or a driver that runs its VMs in-process and
+        // never produced a handle a successor could pick up — the same
+        // reasoning the startup sweep applies to `Adopt`.
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        let Some(detach) = handle.detach() else {
+            return Ok(());
+        };
+        detach.detach().await.map_err(|error| {
+            TaskFailure::recoverable(VmmError::Process(format!(
+                "hand computer {} to the next process: {error}",
+                self.id
+            )))
+        })?;
+        Ok(())
+    }
+
     pub(super) async fn release_scope(&self, scope: ReleaseScope) -> TaskResult {
         let services = &self.services;
         let outcome = match scope {

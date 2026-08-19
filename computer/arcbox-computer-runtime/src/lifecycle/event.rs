@@ -68,6 +68,11 @@ pub(super) enum Event {
     Remove {
         force: bool,
     },
+    /// Give the VM up without stopping it, so the next process can adopt it.
+    /// Only the states holding a settled live handle act on it; everywhere
+    /// else the actor answers, because a computer mid-launch or mid-teardown
+    /// has nothing a successor could take.
+    Detach,
     ClaimWorkload {
         claim: WorkloadClaim,
     },
@@ -95,6 +100,11 @@ pub(super) enum Event {
     ReleasedForPause,
     StopDone,
     RemoveDone,
+    /// The handover succeeded: the VM is the next process's, and dropping this
+    /// process's handle no longer kills it. Raised by the effect rather than by
+    /// a sub-task — a handover that *failed* leaves the computer exactly where
+    /// it was, so there is no failure edge to model.
+    Detached,
     /// A recoverable failure: whatever usable state the computer had survives.
     Failure,
     /// The guest is quiesced with no verb able to thaw it — the port is

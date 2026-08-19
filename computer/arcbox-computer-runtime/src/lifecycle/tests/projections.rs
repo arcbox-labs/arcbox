@@ -46,6 +46,7 @@ fn every_leaf_projects_onto_a_public_state() {
         &[SandboxState::Failed],                          // failed
         &[SandboxState::Stopping],                        // removing
         &[SandboxState::Stopped],                         // gone
+        &[SandboxState::Ready],                           // detached
     ];
     for node in explore() {
         let public = node.state.to_public();
@@ -81,6 +82,7 @@ fn every_leaf_projects_onto_a_durable_phase() {
         &[Some(P::Failed)],                   // failed
         &[Some(P::Removing)],                 // removing
         &[None],                              // gone: the record is forgotten
+        &[Some(P::Ready)],                    // detached: a handover writes nothing
     ];
     for node in explore() {
         let durable = node.state.durable();
