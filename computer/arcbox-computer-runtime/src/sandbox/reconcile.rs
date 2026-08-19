@@ -55,7 +55,7 @@ use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction
 use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
 use super::{LeaseExt, SandboxState};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::snapshot_cow::{
@@ -360,7 +360,10 @@ impl SandboxStateRecord {
                     ip: allocation.ip_address.into(),
                     prefix_len: allocation.prefix_len,
                     gateway: allocation.gateway.into(),
-                    mac: allocation.mac_address.parse().map_err(VmmError::from)?,
+                    mac: allocation
+                        .mac_address
+                        .parse()
+                        .map_err(ComputerError::from)?,
                     cleanup_token: allocation.cleanup_token.clone(),
                 })
             })
@@ -409,13 +412,13 @@ pub fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<
 /// Creates a runtime directory and durably links it from its parent.
 pub(super) fn create_runtime_dir(vm_dir: &Path) -> Result<()> {
     let parent = vm_dir.parent().ok_or_else(|| {
-        crate::error::VmmError::Config(format!(
+        crate::error::ComputerError::Config(format!(
             "sandbox runtime directory has no parent: {}",
             vm_dir.display()
         ))
     })?;
     let data_dir = parent.parent().ok_or_else(|| {
-        crate::error::VmmError::Config(format!(
+        crate::error::ComputerError::Config(format!(
             "sandbox runtime parent has no parent: {}",
             parent.display()
         ))
@@ -641,8 +644,8 @@ pub(super) async fn sweep_orphans(
         // driver will be handed is parsed here, letting `adopt_or_kill` and
         // [`SandboxStateRecord::lease`] rely on it downstream.
         let usable = validate_state_record(config, &sandboxes_dir, &dir, &record)
-            .and_then(|()| VmId::new(record.id.as_str()).map_err(VmmError::from))
-            .and_then(|_| VmId::new(record.resource_owner()).map_err(VmmError::from));
+            .and_then(|()| VmId::new(record.id.as_str()).map_err(ComputerError::from))
+            .and_then(|_| VmId::new(record.resource_owner()).map_err(ComputerError::from));
         if let Err(error) = usable {
             warn!(
                 sandbox_id = %record.id,
@@ -803,7 +806,10 @@ async fn reap_orphans(
         }
 
         if let Some(lease) = record.lease()? {
-            network.quarantine(lease).await.map_err(VmmError::from)?;
+            network
+                .quarantine(lease)
+                .await
+                .map_err(ComputerError::from)?;
         }
 
         // The VM's own area — under the jailer, a whole chroot holding the
@@ -898,14 +904,14 @@ pub(super) fn normalize_durable_records(
         match recovery::plan(record.phase, evidence) {
             RecoveryAction::LeaveResumable => {}
             RecoveryAction::RefuseUnjournaled => {
-                return Err(crate::error::VmmError::Unavailable(format!(
+                return Err(crate::error::ComputerError::Unavailable(format!(
                     "sandbox {} is {} but has no cleanup journal",
                     record.id,
                     record.phase.as_str()
                 )));
             }
             RecoveryAction::RefuseAdopted => {
-                return Err(crate::error::VmmError::Unavailable(format!(
+                return Err(crate::error::ComputerError::Unavailable(format!(
                     "sandbox {} is {}, a phase the startup sweep must not adopt",
                     record.id,
                     record.phase.as_str()
@@ -1250,7 +1256,7 @@ async fn adopt_or_kill(
     let adopted = tokio::time::timeout(ADOPT_TIMEOUT, adopt.adopt(&vm_record))
         .await
         .map_err(|_| {
-            VmmError::Process(format!(
+            ComputerError::Process(format!(
                 "sandbox {}: the driver did not find or reconnect to its vmm within {}s",
                 record.id,
                 ADOPT_TIMEOUT.as_secs()
@@ -1409,7 +1415,7 @@ fn validate_state_record(
 ) -> Result<()> {
     super::validate_id("sandbox id", &record.id)?;
     if directory.file_name().and_then(|name| name.to_str()) != Some(record.id.as_str()) {
-        return Err(crate::error::VmmError::Config(format!(
+        return Err(crate::error::ComputerError::Config(format!(
             "sandbox cleanup record id {} does not match directory {}",
             record.id,
             directory.display()
@@ -1418,7 +1424,7 @@ fn validate_state_record(
     if let Some(network) = &record.network {
         let expected = tap_name_for(network.ip_address);
         if network.tap_name != expected {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has unexpected TAP {}",
                 record.id, network.tap_name
             )));
@@ -1427,7 +1433,7 @@ fn validate_state_record(
     if let Some(slot_id) = &record.pool_slot_id {
         super::validate_id("pool slot id", slot_id)?;
         if !slot_id.starts_with(POOL_SLOT_PREFIX) {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has non-pool slot id {slot_id}",
                 record.id
             )));
@@ -1443,7 +1449,7 @@ fn validate_state_record(
             || cow.dm_device != format!("/dev/mapper/{expected_name}")
             || cow.cow_file != expected_file
         {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has invalid CoW resources",
                 record.id
             )));
@@ -1452,7 +1458,7 @@ fn validate_state_record(
     if let Some(origin) = &record.restore_origin_dir {
         let origin_id = origin.file_name().and_then(|name| name.to_str());
         if origin.parent() != Some(sandboxes_dir) || origin_id.is_none() {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} restore origin escapes {}",
                 record.id,
                 sandboxes_dir.display()
@@ -2873,7 +2879,7 @@ mod tests {
                 Some(&mut SweptRuntime::nothing_kept()),
                 &mut Vec::new()
             ),
-            Err(crate::error::VmmError::Unavailable(_))
+            Err(crate::error::ComputerError::Unavailable(_))
         ));
         assert_eq!(
             store.load("starting").unwrap().unwrap().phase,

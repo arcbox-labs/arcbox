@@ -23,7 +23,7 @@ use super::phase::{
     ExistingProvision, ProvisionIntent, RECORD_VERSION, SandboxPhase, SandboxProvisionOutcome,
     SandboxRecord, SandboxTransition, classify_existing_provision, validate_record,
 };
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::types::IdleAction;
 use crate::sandbox::{SandboxSpec, validate_id};
 
@@ -40,7 +40,7 @@ pub struct DurableCommit<T> {
 impl<T> DurableCommit<T> {
     pub fn confirmed(self, operation: &str) -> Result<T> {
         match self.durability_error {
-            Some(error) => Err(VmmError::Unavailable(format!(
+            Some(error) => Err(ComputerError::Unavailable(format!(
                 "{operation} is visible but its durability is unconfirmed: {error}"
             ))),
             None => Ok(self.value),
@@ -88,19 +88,19 @@ impl SandboxRecordStore {
             .filter(|path| path.extension() == Some(OsStr::new("json")))
             .map(|path| {
                 if !fs::symlink_metadata(&path)?.file_type().is_file() {
-                    return Err(VmmError::Config(format!(
+                    return Err(ComputerError::Config(format!(
                         "sandbox record is not a regular file: {}",
                         path.display()
                     )));
                 }
                 let id = path.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
-                    VmmError::Config(format!(
+                    ComputerError::Config(format!(
                         "sandbox record has an invalid file name: {}",
                         path.display()
                     ))
                 })?;
                 self.load_unlocked(id)?.ok_or_else(|| {
-                    VmmError::Other(format!(
+                    ComputerError::Other(format!(
                         "sandbox record disappeared while loading: {}",
                         path.display()
                     ))
@@ -132,7 +132,7 @@ impl SandboxRecordStore {
             }
             ExistingProvision::Blocked => {
                 self.confirm_root_unlocked("provision collision")?;
-                Err(VmmError::AlreadyExists(id.to_owned()))
+                Err(ComputerError::AlreadyExists(id.to_owned()))
             }
         }
     }
@@ -181,7 +181,7 @@ impl SandboxRecordStore {
         let _guard = self.lock()?;
         let mut record = self
             .load_unlocked(id)?
-            .ok_or_else(|| VmmError::NotFound(id.to_owned()))?;
+            .ok_or_else(|| ComputerError::NotFound(id.to_owned()))?;
         if record.generation != generation {
             return Err(generation_mismatch(id, record.generation, generation));
         }
@@ -209,7 +209,7 @@ impl SandboxRecordStore {
         let _guard = self.lock()?;
         let mut record = self
             .load_unlocked(id)?
-            .ok_or_else(|| VmmError::NotFound(id.to_owned()))?;
+            .ok_or_else(|| ComputerError::NotFound(id.to_owned()))?;
         if record.generation != generation {
             return Err(generation_mismatch(id, record.generation, generation));
         }
@@ -243,7 +243,7 @@ impl SandboxRecordStore {
             return Ok(self.confirm_absence_unlocked());
         };
         if record.phase != SandboxPhase::Creating || record.provision_outcome.is_some() {
-            return Err(VmmError::AlreadyExists(id.to_owned()));
+            return Err(ComputerError::AlreadyExists(id.to_owned()));
         }
         self.delete_unlocked(id)
     }
@@ -251,7 +251,7 @@ impl SandboxRecordStore {
     fn lock(&self) -> Result<MutexGuard<'_, ()>> {
         self.lock
             .lock()
-            .map_err(|_| VmmError::Other("sandbox record store mutex poisoned".into()))
+            .map_err(|_| ComputerError::Other("sandbox record store mutex poisoned".into()))
     }
 
     fn load_unlocked(&self, id: &str) -> Result<Option<SandboxRecord>> {
@@ -263,7 +263,7 @@ impl SandboxRecordStore {
             Err(error) => return Err(error.into()),
         };
         if !metadata.file_type().is_file() {
-            return Err(VmmError::Config(format!(
+            return Err(ComputerError::Config(format!(
                 "sandbox record is not a regular file: {}",
                 path.display()
             )));
@@ -282,7 +282,7 @@ impl SandboxRecordStore {
         }
         let header: RecordHeader = serde_json::from_slice(&bytes)?;
         if header.version != RECORD_VERSION {
-            return Err(VmmError::Config(format!(
+            return Err(ComputerError::Config(format!(
                 "unsupported sandbox record version {} for {id}",
                 header.version
             )));
@@ -325,7 +325,7 @@ impl SandboxRecordStore {
             return Err(generation_mismatch(id, record.generation, generation));
         }
         if record.phase != expected_phase {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: expected_phase.as_str().into(),
                 actual: record.phase.as_str().into(),
@@ -352,7 +352,7 @@ impl SandboxRecordStore {
 
     fn confirm_root_unlocked(&self, operation: &str) -> Result<()> {
         self.sync_root_unlocked().map_err(|error| {
-            VmmError::Unavailable(format!(
+            ComputerError::Unavailable(format!(
                 "{operation} durability could not be confirmed: {error}"
             ))
         })
@@ -372,15 +372,15 @@ impl SandboxRecordStore {
 fn validate_provision_input(id: &str, request_key: &str) -> Result<()> {
     validate_id("sandbox id", id)?;
     if request_key.is_empty() {
-        return Err(VmmError::Config(
+        return Err(ComputerError::Config(
             "sandbox provision request key must not be empty".into(),
         ));
     }
     Ok(())
 }
 
-fn generation_mismatch(id: &str, expected: Uuid, actual: Uuid) -> VmmError {
-    VmmError::WrongState {
+fn generation_mismatch(id: &str, expected: Uuid, actual: Uuid) -> ComputerError {
+    ComputerError::WrongState {
         id: id.to_owned(),
         expected: format!("generation {expected}"),
         actual: format!("generation {actual}"),
@@ -461,7 +461,7 @@ mod tests {
         );
         assert!(matches!(
             reopened.replay_provision("restored", "different-restore-key"),
-            Err(VmmError::AlreadyExists(id)) if id == "restored"
+            Err(ComputerError::AlreadyExists(id)) if id == "restored"
         ));
     }
 
@@ -473,13 +473,13 @@ mod tests {
         let path = store.record_path("box");
 
         fs::write(&path, b"{").unwrap();
-        assert!(matches!(store.load_all(), Err(VmmError::Json(_))));
+        assert!(matches!(store.load_all(), Err(ComputerError::Json(_))));
 
         record.version = RECORD_VERSION + 1;
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(matches!(
             store.load_all(),
-            Err(VmmError::Config(message))
+            Err(ComputerError::Config(message))
                 if message.contains("unsupported sandbox record version")
         ));
     }
@@ -504,11 +504,11 @@ mod tests {
         ));
         assert!(matches!(
             store.provision_intent("box", "other", spec("box")),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
         assert!(matches!(
             store.replay_provision("box", "other"),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
 
         let mut with_secret = spec("box");
@@ -569,7 +569,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.replay_provision("box", "key"),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
         assert!(matches!(
             store.provision_intent("box", "key", spec("box")).unwrap(),
@@ -616,14 +616,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.replay_provision("box", "key"),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
         store
             .transition("box", record.generation, SandboxTransition::Stopped)
             .unwrap();
         assert!(matches!(
             store.replay_provision("box", "key"),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
         store
             .transition("box", record.generation, SandboxTransition::Stopped)
@@ -635,7 +635,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.replay_provision("box", "key"),
-            Err(VmmError::AlreadyExists(id)) if id == "box"
+            Err(ComputerError::AlreadyExists(id)) if id == "box"
         ));
         store.finish_remove("box", record.generation).unwrap();
         assert_eq!(store.load("box").unwrap(), None);
@@ -661,7 +661,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.replay_provision("failed", "key"),
-            Err(VmmError::AlreadyExists(id)) if id == "failed"
+            Err(ComputerError::AlreadyExists(id)) if id == "failed"
         ));
     }
 
@@ -716,7 +716,7 @@ mod tests {
         // A paused id must not replay its (released) provision outcome.
         assert!(matches!(
             store.replay_provision("box", "key"),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
 
         // Resume keeps the snapshot until Ready clears it.

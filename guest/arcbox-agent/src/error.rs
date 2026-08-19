@@ -88,40 +88,40 @@ impl SandboxError {
 /// construction.
 impl From<arcbox_snapshot::SnapshotError> for SandboxError {
     fn from(e: arcbox_snapshot::SnapshotError) -> Self {
-        Self::from(arcbox_computer_runtime::VmmError::from(e))
+        Self::from(arcbox_computer_runtime::ComputerError::from(e))
     }
 }
 
-impl From<arcbox_computer_runtime::VmmError> for SandboxError {
-    fn from(e: arcbox_computer_runtime::VmmError) -> Self {
-        use arcbox_computer_runtime::VmmError;
+impl From<arcbox_computer_runtime::ComputerError> for SandboxError {
+    fn from(e: arcbox_computer_runtime::ComputerError) -> Self {
+        use arcbox_computer_runtime::ComputerError;
         match &e {
             // A missing sandbox path keeps its typed "path not found:"
             // message: the daemon's classifier maps the 404 onto the
             // FILE_NOT_FOUND registry code by that prefix.
             // A missing template keeps its typed "template not found:"
             // message for the same reason (TEMPLATE_NOT_FOUND, CORE-107).
-            VmmError::NotFound(_) | VmmError::PathNotFound(_) | VmmError::TemplateNotFound(_) => {
-                Self::NotFound(e.to_string())
-            }
-            VmmError::AlreadyExists(_) | VmmError::TemplateVersionExists(_) => {
+            ComputerError::NotFound(_)
+            | ComputerError::PathNotFound(_)
+            | ComputerError::TemplateNotFound(_) => Self::NotFound(e.to_string()),
+            ComputerError::AlreadyExists(_) | ComputerError::TemplateVersionExists(_) => {
                 Self::AlreadyExists(e.to_string())
             }
             // A non-empty directory is a precondition failure (412), like a
             // wrong sandbox state: retrying without `recursive` never helps.
-            VmmError::WrongState { .. }
-            | VmmError::DirectoryNotEmpty(_)
-            | VmmError::FailedPrecondition(_) => Self::WrongState(e.to_string()),
-            VmmError::Paused(_) => Self::SandboxPaused(e.to_string()),
-            VmmError::StdinGap { .. } => Self::StdinGap(e.to_string()),
-            VmmError::DeadlineExceeded(_) => Self::Deadline(e.to_string()),
-            VmmError::Unavailable(_) | VmmError::AckUnconfirmed { .. } => {
+            ComputerError::WrongState { .. }
+            | ComputerError::DirectoryNotEmpty(_)
+            | ComputerError::FailedPrecondition(_) => Self::WrongState(e.to_string()),
+            ComputerError::Paused(_) => Self::SandboxPaused(e.to_string()),
+            ComputerError::StdinGap { .. } => Self::StdinGap(e.to_string()),
+            ComputerError::DeadlineExceeded(_) => Self::Deadline(e.to_string()),
+            ComputerError::Unavailable(_) | ComputerError::AckUnconfirmed { .. } => {
                 Self::Unavailable(e.to_string())
             }
             // Invalid caller input (e.g. a rejected sandbox id, or a
             // directory verb aimed at a non-directory) is a 400, not a
             // 500 — otherwise a bad request surfaces as INTERNAL.
-            VmmError::Config(_) | VmmError::NotADirectory(_) => {
+            ComputerError::Config(_) | ComputerError::NotADirectory(_) => {
                 Self::InvalidArgument(e.to_string())
             }
             _ => Self::Internal(e.to_string()),
@@ -135,20 +135,22 @@ mod tests {
 
     #[test]
     fn invalid_config_maps_to_400_not_500() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Config("bad id".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::Config(
+            "bad id".into(),
+        ));
         assert!(matches!(err, SandboxError::InvalidArgument(_)));
         assert_eq!(err.status_code(), 400);
     }
 
     #[test]
     fn runtime_errors_stay_500() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Vsock("boom".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::Vsock("boom".into()));
         assert_eq!(err.status_code(), 500);
     }
 
     #[test]
     fn stdin_gap_maps_to_416() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::StdinGap {
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::StdinGap {
             accepted: 7,
             offset: 9,
         });
@@ -158,14 +160,14 @@ mod tests {
 
     #[test]
     fn paused_maps_to_423_for_the_daemon_auto_resume() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Paused("box".into()));
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::Paused("box".into()));
         assert!(matches!(err, SandboxError::SandboxPaused(_)));
         assert_eq!(err.status_code(), 423);
     }
 
     #[test]
     fn path_not_found_maps_to_404_with_the_classifier_prefix() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::PathNotFound(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::PathNotFound(
             "/a/b".into(),
         ));
         assert!(matches!(err, SandboxError::NotFound(_)));
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn template_errors_keep_their_classifier_prefixes_and_codes() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::TemplateNotFound(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::TemplateNotFound(
             "code:9.9".into(),
         ));
         assert!(matches!(err, SandboxError::NotFound(_)));
@@ -184,12 +186,12 @@ mod tests {
         // The daemon classifier keys on this exact prefix (TEMPLATE_NOT_FOUND).
         assert_eq!(err.to_string(), "template not found: code:9.9");
 
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::TemplateVersionExists(
-            "x".into(),
-        ));
+        let err = SandboxError::from(
+            arcbox_computer_runtime::ComputerError::TemplateVersionExists("x".into()),
+        );
         assert_eq!(err.status_code(), 409);
 
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::FailedPrecondition(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::FailedPrecondition(
             "no draft".into(),
         ));
         assert_eq!(err.status_code(), 412);
@@ -197,7 +199,7 @@ mod tests {
 
     #[test]
     fn directory_not_empty_maps_to_412() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::DirectoryNotEmpty(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::DirectoryNotEmpty(
             "/full".into(),
         ));
         assert_eq!(err.status_code(), 412);
@@ -205,7 +207,7 @@ mod tests {
 
     #[test]
     fn not_a_directory_maps_to_400() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::NotADirectory(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::NotADirectory(
             "/a/file".into(),
         ));
         assert_eq!(err.status_code(), 400);
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn deadline_maps_to_504_for_the_daemon_deadline_code() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::DeadlineExceeded(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::DeadlineExceeded(
             "no listener on port 8080".into(),
         ));
         assert!(matches!(err, SandboxError::Deadline(_)));
@@ -222,7 +224,7 @@ mod tests {
 
     #[test]
     fn durability_uncertainty_maps_to_503() {
-        let err = SandboxError::from(arcbox_computer_runtime::VmmError::Unavailable(
+        let err = SandboxError::from(arcbox_computer_runtime::ComputerError::Unavailable(
             "record fsync failed".into(),
         ));
         assert!(matches!(err, SandboxError::Unavailable(_)));

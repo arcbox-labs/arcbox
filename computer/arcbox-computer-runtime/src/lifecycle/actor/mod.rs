@@ -55,7 +55,7 @@ use arcbox_vm_driver::VmHandle;
 use arcbox_vm_driver::net::NetworkLease;
 
 use crate::agent::{ExitStatus, GuestAgent};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::deadlines;
 use crate::sandbox::record::{
@@ -106,8 +106,10 @@ impl Mailbox {
         let (reply, answer) = oneshot::channel();
         self.0
             .send(command(reply))
-            .map_err(|_| VmmError::NotFound(id.clone()))?;
-        answer.await.map_err(|_| VmmError::NotFound(id.clone()))?
+            .map_err(|_| ComputerError::NotFound(id.clone()))?;
+        answer
+            .await
+            .map_err(|_| ComputerError::NotFound(id.clone()))?
     }
 
     /// Tells the actor something it does not answer.
@@ -419,7 +421,7 @@ pub struct ComputerActor {
     answer_error: Option<String>,
     /// The failure a removal is unwinding, held until that removal ends.
     /// Its caller must not hear before the id is free again.
-    unwinding: Option<VmmError>,
+    unwinding: Option<ComputerError>,
     /// A journal clear owed to a release that is still running: the journal
     /// records exactly the resources a restart would have to reclaim, so it
     /// may only be dropped once they are gone.
@@ -611,10 +613,10 @@ impl ComputerActor {
         // stop deferred behind a launch a removal then preempted, say —
         // would otherwise learn only that its channel closed.
         for (_, reply) in self.waiters.drain(..) {
-            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+            let _ = reply.send(Err(ComputerError::NotFound(self.id.clone())));
         }
         if let Some(reply) = self.capture_reply.take() {
-            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+            let _ = reply.send(Err(ComputerError::NotFound(self.id.clone())));
         }
     }
 

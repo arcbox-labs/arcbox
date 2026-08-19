@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded, WorkloadOutcome,
 };
@@ -126,7 +126,7 @@ impl ComputerTasks for Script {
                 drop(handed_off);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 self.cleanup_finished.store(true, Ordering::SeqCst);
-                Err(TaskFailure::recoverable(VmmError::Process(
+                Err(TaskFailure::recoverable(ComputerError::Process(
                     "the vmm would not spawn".into(),
                 )))
             }
@@ -163,7 +163,7 @@ impl ComputerTasks for Script {
         }
         self.restore_finished.store(true, Ordering::SeqCst);
         if self.restore_fails.load(Ordering::SeqCst) {
-            return Err(TaskFailure::recoverable(VmmError::Process(
+            return Err(TaskFailure::recoverable(ComputerError::Process(
                 "the checkpoint would not load".into(),
             )));
         }
@@ -208,7 +208,7 @@ impl ComputerTasks for Script {
             tokio::time::sleep(takes).await;
         }
         if self.release_fails.load(Ordering::SeqCst) {
-            return Err(TaskFailure::recoverable(VmmError::Process(
+            return Err(TaskFailure::recoverable(ComputerError::Process(
                 "the vmm would not die".into(),
             )));
         }
@@ -392,7 +392,7 @@ impl Waiter {
         self.0.await.unwrap().unwrap();
     }
 
-    async fn error(self) -> VmmError {
+    async fn error(self) -> ComputerError {
         self.0.await.unwrap().unwrap_err()
     }
 }
@@ -779,7 +779,7 @@ async fn a_claim_the_machine_refuses_is_answered_wrong_state() {
         })
         .error()
         .await;
-    assert!(matches!(error, VmmError::WrongState { .. }), "{error}");
+    assert!(matches!(error, ComputerError::WrongState { .. }), "{error}");
 
     // ...and a non-forced remove is refused for the same reason.
     let error = harness
@@ -789,7 +789,7 @@ async fn a_claim_the_machine_refuses_is_answered_wrong_state() {
         })
         .error()
         .await;
-    assert!(matches!(error, VmmError::WrongState { .. }), "{error}");
+    assert!(matches!(error, ComputerError::WrongState { .. }), "{error}");
 }
 
 /// A restore that fails is unwound by a force remove, and its caller must not

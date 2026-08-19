@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::info;
 
 use super::ComputerFlows;
-use crate::error::VmmError;
+use crate::error::ComputerError;
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use crate::lifecycle::tasks::pause::release_for_pause;
@@ -88,7 +88,7 @@ impl ComputerFlows {
                 .shutdown(arcbox_vm_driver::ShutdownMode::Graceful { timeout: remaining })
                 .await
                 .map_err(|error| {
-                    TaskFailure::recoverable(VmmError::Process(format!(
+                    TaskFailure::recoverable(ComputerError::Process(format!(
                         "shut down computer {}: {error}",
                         self.id
                     )))
@@ -119,7 +119,7 @@ impl ComputerFlows {
             // claims anything, because a direct-mode vmstate pins origin
             // paths and could never resume.
             ReleaseScope::KeepDisk if services.config.firecracker.jailer.is_none() => {
-                Err(VmmError::Config(
+                Err(ComputerError::Config(
                     "computer pause requires jailer isolation; direct mode cannot resume".into(),
                 ))
             }

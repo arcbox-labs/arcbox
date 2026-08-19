@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use super::{ComputerFlows, Launch};
 use crate::agent::{GuestAgent, StartCommand};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{Command, Mailbox, WorkloadOutcome};
 use crate::lifecycle::tasks::boot::{do_boot, wait_for_agent};
 use crate::lifecycle::tasks::{TaskFailure, TaskResult};
@@ -130,7 +130,7 @@ impl ComputerFlows {
         let started = self.start_initial_cmd(&spec, agent.as_ref()).await;
         if let Some(probe) = spec.ready_probe.clone() {
             run_ready_probe(&probe, agent.as_ref()).await.map_err(|e| {
-                TaskFailure::recoverable(VmmError::FailedPrecondition(format!(
+                TaskFailure::recoverable(ComputerError::FailedPrecondition(format!(
                     "ready probe failed: {e}"
                 )))
             })?;

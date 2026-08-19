@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::{SandboxId, SandboxSpec, validate_id};
 
 pub(super) const RECORD_VERSION: u32 = 1;
@@ -153,7 +153,7 @@ impl SandboxRecord {
         let atomic_ready = matches!(&transition, SandboxTransition::ReadyWithOutcome(_))
             && self.phase == SandboxPhase::Creating;
         if !atomic_ready && !self.phase.can_transition_to(next) {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: self.id.clone(),
                 expected: format!("a valid transition from {}", self.phase.as_str()),
                 actual: next.as_str().to_owned(),
@@ -165,7 +165,7 @@ impl SandboxRecord {
                 if let Some(existing) = &self.provision_outcome
                     && existing != &outcome
                 {
-                    return Err(VmmError::WrongState {
+                    return Err(ComputerError::WrongState {
                         id: self.id.clone(),
                         expected: format!("provision outcome {existing:?}"),
                         actual: format!("provision outcome {outcome:?}"),
@@ -179,7 +179,7 @@ impl SandboxRecord {
                 if let Some(existing) = &self.provision_outcome
                     && existing != &outcome
                 {
-                    return Err(VmmError::WrongState {
+                    return Err(ComputerError::WrongState {
                         id: self.id.clone(),
                         expected: format!("provision outcome {existing:?}"),
                         actual: format!("provision outcome {outcome:?}"),
@@ -309,7 +309,7 @@ pub(super) fn classify_existing_provision(
     request_key: &str,
 ) -> Result<ExistingProvision> {
     if record.request_key != request_key {
-        return Err(VmmError::AlreadyExists(record.id.clone()));
+        return Err(ComputerError::AlreadyExists(record.id.clone()));
     }
     Ok(match record.phase {
         SandboxPhase::Creating => ExistingProvision::Pending,
@@ -329,29 +329,29 @@ pub(super) fn classify_existing_provision(
 pub(super) fn validate_record(id: &str, record: &SandboxRecord) -> Result<()> {
     validate_id("sandbox id", id)?;
     if record.version != RECORD_VERSION {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "unsupported sandbox record version {} for {id}",
             record.version
         )));
     }
     if record.id != id {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "sandbox record id mismatch: expected {id}, got {}",
             record.id
         )));
     }
     if record.effective_spec.id.as_deref() != Some(id) {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "sandbox record spec id mismatch for {id}"
         )));
     }
     if record.request_key.is_empty() {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "sandbox record provision request key is empty for {id}"
         )));
     }
     if record.phase == SandboxPhase::Creating && record.provision_outcome.is_some() {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "creating sandbox record unexpectedly has a provision outcome for {id}"
         )));
     }
@@ -366,7 +366,7 @@ pub(super) fn validate_record(id: &str, record: &SandboxRecord) -> Result<()> {
             | SandboxPhase::Resuming
     ) && record.provision_outcome.is_none()
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "sandbox record has no provision outcome in phase {} for {id}",
             record.phase.as_str()
         )));
@@ -374,7 +374,7 @@ pub(super) fn validate_record(id: &str, record: &SandboxRecord) -> Result<()> {
     if matches!(record.phase, SandboxPhase::Paused | SandboxPhase::Resuming)
         && record.pause_snapshot_id.is_none()
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "sandbox record has no pause snapshot in phase {} for {id}",
             record.phase.as_str()
         )));

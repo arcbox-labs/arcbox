@@ -7,7 +7,7 @@ use arcbox_vm_driver::Vsock;
 
 use super::{MSG_EXIT, MSG_WAIT_PORT, WaitPortReq, connect_to_agent, read_frame, write_frame};
 use crate::agent::PortWait;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 /// Wait until the guest's TCP listen table has a listener on `port`.
 ///
 /// Sends [`MSG_WAIT_PORT`] to the exec channel; the vm-agent watches
@@ -34,24 +34,24 @@ async fn wait_for_port_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWr
         timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
     };
     let payload = serde_json::to_vec(&req)
-        .map_err(|e| VmmError::Vsock(format!("encode WaitPortReq: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("encode WaitPortReq: {e}")))?;
     write_frame(stream, MSG_WAIT_PORT, &payload)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_WAIT_PORT: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_WAIT_PORT: {e}")))?;
 
     let read_deadline = timeout + Duration::from_secs(5);
     let (msg_type, payload) = tokio::time::timeout(read_deadline, read_frame(stream))
         .await
-        .map_err(|_| VmmError::Vsock("wait for port: timed out waiting for response".into()))?
-        .map_err(|e| VmmError::Vsock(format!("read wait-port response: {e}")))?;
+        .map_err(|_| ComputerError::Vsock("wait for port: timed out waiting for response".into()))?
+        .map_err(|e| ComputerError::Vsock(format!("read wait-port response: {e}")))?;
 
     if msg_type != MSG_EXIT {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "wait for port: unexpected response type 0x{msg_type:02x}"
         )));
     }
     if payload.len() < 4 {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "wait for port: payload too short ({} bytes, expected 4)",
             payload.len()
         )));
@@ -59,7 +59,7 @@ async fn wait_for_port_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWr
     match i32::from_le_bytes(payload[..4].try_into().unwrap()) {
         0 => Ok(PortWait::Listening),
         1 => Ok(PortWait::Deadline),
-        code => Err(VmmError::Vsock(format!(
+        code => Err(ComputerError::Vsock(format!(
             "wait for port: agent returned exit code {code}"
         ))),
     }

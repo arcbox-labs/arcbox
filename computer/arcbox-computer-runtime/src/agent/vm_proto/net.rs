@@ -7,7 +7,7 @@ use arcbox_vm_driver::Vsock;
 use tracing::info;
 
 use super::{MSG_EXIT, MSG_NET_RECONFIG, connect_to_agent, read_frame, write_frame};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 /// Re-address the guest network after a fresh-network snapshot restore.
 ///
 /// Sends [`MSG_NET_RECONFIG`] to the exec channel (vsock port 52) and waits
@@ -39,31 +39,31 @@ async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWri
     cmd: &crate::boot_proto::NetReconfigCommand,
 ) -> Result<()> {
     let payload = serde_json::to_vec(cmd)
-        .map_err(|e| VmmError::Vsock(format!("encode NetReconfigCommand: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("encode NetReconfigCommand: {e}")))?;
 
     write_frame(stream, MSG_NET_RECONFIG, &payload)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_NET_RECONFIG: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_NET_RECONFIG: {e}")))?;
 
     let (msg_type, payload) = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
         .await
-        .map_err(|_| VmmError::Vsock("net reconfig: timed out waiting for response".into()))?
-        .map_err(|e| VmmError::Vsock(format!("read net reconfig response: {e}")))?;
+        .map_err(|_| ComputerError::Vsock("net reconfig: timed out waiting for response".into()))?
+        .map_err(|e| ComputerError::Vsock(format!("read net reconfig response: {e}")))?;
 
     if msg_type != MSG_EXIT {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "net reconfig: unexpected response type 0x{msg_type:02x}"
         )));
     }
     if payload.len() < 4 {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "net reconfig: payload too short ({} bytes, expected 4)",
             payload.len()
         )));
     }
     let code = i32::from_le_bytes(payload[..4].try_into().unwrap());
     if code != 0 {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "net reconfig: agent returned exit code {code}"
         )));
     }

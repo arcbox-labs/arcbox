@@ -23,7 +23,7 @@ use arcbox_vm_driver::ShutdownMode;
 use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox;
 use crate::snapshot_cow::CowManager;
@@ -119,14 +119,14 @@ pub async fn kill_sandbox_process(id: &str, arc: &Arc<Mutex<ComputerRuntime>>) -
     if let Some(prepared) = prepared {
         if let Err(error) = prepared.discard().await {
             arc.lock().unwrap().prepared = Some(prepared);
-            return Err(VmmError::Process(format!(
+            return Err(ComputerError::Process(format!(
                 "release the vmm of sandbox {id}: {error}"
             )));
         }
     } else if let Some(handle) = handle
         && let Err(error) = handle.shutdown(ShutdownMode::Kill).await
     {
-        return Err(VmmError::Process(format!(
+        return Err(ComputerError::Process(format!(
             "release the adopted vmm of sandbox {id}: {error}"
         )));
     }
@@ -168,7 +168,7 @@ pub async fn release_everything(
     if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        return Err(VmmError::Io(e));
+        return Err(ComputerError::Io(e));
     }
     Ok(())
 }

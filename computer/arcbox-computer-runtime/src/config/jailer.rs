@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use arcbox_vm_driver::{CgroupSpec, IsolationSpec};
 use serde::{Deserialize, Serialize};
 
-use crate::error::VmmError;
+use crate::error::ComputerError;
 
 /// The per-VM isolation half of `[firecracker.jailer]`.
 ///
@@ -47,7 +47,7 @@ impl JailerConfig {
 }
 
 impl TryFrom<&JailerConfig> for IsolationSpec {
-    type Error = VmmError;
+    type Error = ComputerError;
 
     /// Who the VMM runs as, where its chroot lives, which namespaces and
     /// cgroup it enters.
@@ -55,7 +55,7 @@ impl TryFrom<&JailerConfig> for IsolationSpec {
     /// A `parent_cgroup` without a `cgroup_version` keeps the jailer's own
     /// default, version 1, made explicit here because the spec's
     /// [`CgroupSpec`] always names a version.
-    fn try_from(jc: &JailerConfig) -> Result<Self, VmmError> {
+    fn try_from(jc: &JailerConfig) -> Result<Self, ComputerError> {
         let cgroup = match (jc.cgroup_version.as_deref(), jc.parent_cgroup.as_deref()) {
             (None, None) => None,
             (version, parent) => Some(CgroupSpec {
@@ -64,7 +64,7 @@ impl TryFrom<&JailerConfig> for IsolationSpec {
                     Some("1") => 1,
                     Some("2") => 2,
                     Some(other) => {
-                        return Err(VmmError::Config(format!(
+                        return Err(ComputerError::Config(format!(
                             "jailer cgroup_version must be \"1\" or \"2\", got {other:?}"
                         )));
                     }
@@ -154,7 +154,7 @@ mod tests {
         jc.cgroup_version = Some("v2".into());
         assert!(matches!(
             IsolationSpec::try_from(&jc),
-            Err(VmmError::Config(_))
+            Err(ComputerError::Config(_))
         ));
     }
 }

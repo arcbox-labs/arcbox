@@ -38,7 +38,7 @@ pub async fn run_ready_probe(
             .await?
         {
             PortWait::Listening => Ok(()),
-            PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+            PortWait::Deadline => Err(ComputerError::DeadlineExceeded(format!(
                 "no listener on port {port} within the ready-probe deadline"
             ))),
         },
@@ -58,7 +58,7 @@ pub async fn run_ready_probe(
                 // this await forever.
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(VmmError::DeadlineExceeded(format!(
+                    return Err(ComputerError::DeadlineExceeded(format!(
                         "ready-probe command did not exit 0 within the deadline ({})",
                         last_status.as_deref().unwrap_or("no attempt completed")
                     )));
@@ -73,14 +73,14 @@ pub async fn run_ready_probe(
                     Ok(Ok(status)) => last_status = Some(format!("last exit: {status:?}")),
                     Ok(Err(error)) => last_status = Some(format!("last error: {error}")),
                     Err(_) => {
-                        return Err(VmmError::DeadlineExceeded(format!(
+                        return Err(ComputerError::DeadlineExceeded(format!(
                             "ready-probe command did not exit within the deadline ({})",
                             last_status.as_deref().unwrap_or("no attempt completed")
                         )));
                     }
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(VmmError::DeadlineExceeded(format!(
+                    return Err(ComputerError::DeadlineExceeded(format!(
                         "ready-probe command did not exit 0 within the deadline ({})",
                         last_status.as_deref().unwrap_or("no attempt completed")
                     )));
@@ -115,7 +115,7 @@ async fn run_probe_command(
             return Ok(status);
         }
     }
-    Err(VmmError::Vsock(
+    Err(ComputerError::Vsock(
         "probe command stream ended without an exit status".into(),
     ))
 }
@@ -123,7 +123,7 @@ async fn run_probe_command(
 /// A failed restore-staging step, carrying whichever CoW resources were
 /// acquired before the failure so the caller can roll them back.
 pub struct StageError {
-    pub error: VmmError,
+    pub error: ComputerError,
     pub cow_handle: Option<CowHandle>,
 }
 
@@ -158,12 +158,13 @@ pub async fn stage_rootfs_cow_or_copy(
     rootfs: &str,
     journal: &(dyn Fn(Option<&CowHandle>) -> Result<()> + Sync),
 ) -> std::result::Result<StagedRootfs, StageError> {
-    let fail = |error: VmmError, cow_handle: Option<CowHandle>| StageError { error, cow_handle };
+    let fail =
+        |error: ComputerError, cow_handle: Option<CowHandle>| StageError { error, cow_handle };
     let copy = async || {
         staging
             .stage_disk(ROOTFS_DISK_ID, DiskSource::Image(Path::new(rootfs)))
             .await
-            .map_err(VmmError::from)
+            .map_err(ComputerError::from)
     };
     match cow_manager.setup(owner_id, rootfs).await {
         Ok(handle) => {
@@ -222,9 +223,9 @@ pub async fn stage_rootfs_cow_or_copy(
 pub fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<String> {
     let link_path = vm_dir.join("rootfs.link");
     let _ = std::fs::remove_file(&link_path);
-    std::os::unix::fs::symlink(dm_device, &link_path).map_err(VmmError::Io)?;
+    std::os::unix::fs::symlink(dm_device, &link_path).map_err(ComputerError::Io)?;
     link_path
         .to_str()
         .map(str::to_owned)
-        .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
+        .ok_or_else(|| ComputerError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }

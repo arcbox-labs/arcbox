@@ -84,7 +84,7 @@ pub struct ResumedRuntime {
 
 /// How a failed resume left the sandbox.
 pub struct ResumeFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     /// True when every re-created resource was released again and the
     /// retained pause state (checkpoint + disk) is intact — the sandbox can
     /// go back to `Paused` and a retry can succeed.
@@ -121,7 +121,7 @@ impl SandboxManager {
         if computer.snapshot.borrow().state == SandboxState::Ready
             && self.config.firecracker.jailer.is_none()
         {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
             ));
         }

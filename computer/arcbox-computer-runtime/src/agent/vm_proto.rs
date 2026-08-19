@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::agent::{ExitStatus, OutputChunk};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 
 // Exec-channel vocabulary, shared with vm-agent through `arcbox-vm-proto`.
 pub use arcbox_vm_proto::exec::{AGENT_PORT, MSG_WAIT_PORT, READY_PORT, StartCommand, WaitPortReq};
@@ -114,7 +114,7 @@ pub(crate) async fn connect_to_port(vsock: &dyn Vsock, port: u32) -> Result<Unix
             Err(error) => return Err(error.into()),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(VmmError::Vsock(format!(
+            return Err(ComputerError::Vsock(format!(
                 "vsock port {port} did not become ready within {}s",
                 AGENT_READY_TIMEOUT.as_secs(),
             )));
@@ -156,7 +156,7 @@ fn into_unix_stream(conn: VsockConn) -> Result<UnixStream> {
             stream.set_nonblocking(true)?;
             Ok(UnixStream::from_std(stream)?)
         }
-        IoMode::Blocking => Err(VmmError::Vsock(
+        IoMode::Blocking => Err(ComputerError::Vsock(
             "vsock connection requires blocking I/O, which the guest-agent client cannot drive"
                 .into(),
         )),
@@ -170,13 +170,13 @@ pub(crate) async fn wait_ready(listener: &mut dyn VsockListener) -> Result<()> {
     let conn = listener
         .accept()
         .await
-        .map_err(|e| VmmError::Vsock(format!("accept on ready socket: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("accept on ready socket: {e}")))?;
     let mut stream = into_unix_stream(conn)?;
     let mut byte = [0u8; 1];
     stream
         .read(&mut byte)
         .await
-        .map_err(|e| VmmError::Vsock(format!("read ready byte: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("read ready byte: {e}")))?;
     Ok(())
 }
 
@@ -249,7 +249,7 @@ async fn drain_output<R: AsyncReadExt + Unpin>(
             }
             Err(e) => {
                 let _ = tx
-                    .send(Err(VmmError::Vsock(format!("agent read error: {e}"))))
+                    .send(Err(ComputerError::Vsock(format!("agent read error: {e}"))))
                     .await;
                 break;
             }
@@ -355,11 +355,11 @@ mod tests {
         // Each final error keeps its native shape through the conversion:
         // an I/O failure stays `Io`, a driver `WrongState` stays
         // `WrongState` (the guest agent maps that to 412, not 500).
-        type Native = fn(&VmmError) -> bool;
+        type Native = fn(&ComputerError) -> bool;
         let finals: [(arcbox_vm_driver::Error, Native); 2] = [
             (
                 arcbox_vm_driver::Error::Io(std::io::ErrorKind::BrokenPipe.into()),
-                |err| matches!(err, VmmError::Io(_)),
+                |err| matches!(err, ComputerError::Io(_)),
             ),
             (
                 arcbox_vm_driver::Error::WrongState {
@@ -369,7 +369,7 @@ mod tests {
                     ),
                     expected: "running",
                 },
-                |err| matches!(err, VmmError::WrongState { expected, actual, .. } if expected == "running" && actual.starts_with("exited")),
+                |err| matches!(err, ComputerError::WrongState { expected, actual, .. } if expected == "running" && actual.starts_with("exited")),
             ),
         ];
         for (error, native) in finals {
@@ -385,7 +385,7 @@ mod tests {
         let vsock = ScriptedVsock::new([]);
         let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
         assert!(
-            matches!(err, VmmError::Vsock(ref m) if m.contains("did not become ready within 30s")),
+            matches!(err, ComputerError::Vsock(ref m) if m.contains("did not become ready within 30s")),
             "unexpected error: {err}"
         );
         assert!(vsock.dials() > 1);
@@ -396,7 +396,7 @@ mod tests {
         let vsock = ScriptedVsock::new([Ok(IoMode::Blocking)]);
         let err = connect_to_port(&vsock, AGENT_PORT).await.unwrap_err();
         assert!(
-            matches!(err, VmmError::Vsock(ref m) if m.contains("blocking I/O")),
+            matches!(err, ComputerError::Vsock(ref m) if m.contains("blocking I/O")),
             "unexpected error: {err}"
         );
     }

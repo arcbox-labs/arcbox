@@ -272,8 +272,8 @@ impl Execution {
     }
 
     /// Error for operations that need the workload alive.
-    fn exited_error(&self) -> VmmError {
-        VmmError::WrongState {
+    fn exited_error(&self) -> ComputerError {
+        ComputerError::WrongState {
             id: format!("execution '{}'", self.id),
             expected: "running".into(),
             actual: "exited".into(),
@@ -301,7 +301,7 @@ impl Execution {
     /// Offset-idempotent stdin write; see [`SandboxManager::write_stdin`].
     async fn write_stdin(&self, offset: u64, data: &[u8], eof: bool) -> Result<StdinState> {
         if eof && self.tty {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "cannot close stdin of a TTY execution; send Ctrl-D (0x04) instead".into(),
             ));
         }
@@ -315,7 +315,7 @@ impl Execution {
                 return Err(self.exited_error());
             }
             if offset > st.stdin_written {
-                return Err(VmmError::StdinGap {
+                return Err(ComputerError::StdinGap {
                     accepted: st.stdin_written,
                     offset,
                 });
@@ -326,7 +326,7 @@ impl Execution {
                 Vec::new()
             } else {
                 if st.stdin_closed {
-                    return Err(VmmError::Config("stdin is already closed".into()));
+                    return Err(ComputerError::Config("stdin is already closed".into()));
                 }
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -360,7 +360,7 @@ impl Execution {
     /// Deliver a POSIX signal to the running workload's process group.
     async fn signal(&self, signal: i32) -> Result<()> {
         if !(1..=64).contains(&signal) {
-            return Err(VmmError::Config(format!("invalid signal {signal}")));
+            return Err(ComputerError::Config(format!("invalid signal {signal}")));
         }
         if self.has_exited() {
             return Err(self.exited_error());
@@ -374,7 +374,9 @@ impl Execution {
     /// Resize the workload's pseudo-TTY.
     async fn resize(&self, width: u16, height: u16) -> Result<()> {
         if !self.tty {
-            return Err(VmmError::Config("execution has no TTY to resize".into()));
+            return Err(ComputerError::Config(
+                "execution has no TTY to resize".into(),
+            ));
         }
         if self.has_exited() {
             return Err(self.exited_error());
@@ -487,7 +489,7 @@ impl ExecutionRegistry {
             if existing.cmd == cmd {
                 return Ok(Reserve::Existing(existing.snapshot()));
             }
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{}' (id reused for a different command)",
                 key.1
             )));
@@ -499,7 +501,7 @@ impl ExecutionRegistry {
                 // contract only holds once the process is already running.
                 return Ok(Reserve::AwaitPending(pending.done.subscribe()));
             }
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{}' (id reused for a different command)",
                 key.1
             )));
@@ -526,7 +528,7 @@ impl ExecutionRegistry {
             .get(&(sandbox_id.to_owned(), execution_id.to_owned()))
             .cloned()
             .ok_or_else(|| {
-                VmmError::NotFound(format!(
+                ComputerError::NotFound(format!(
                     "execution '{execution_id}' in sandbox '{sandbox_id}'"
                 ))
             })
@@ -655,7 +657,7 @@ impl SandboxManager {
             _ => Uuid::new_v4().to_string(),
         };
         if spec.cmd.is_empty() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "execution command must not be empty".into(),
             ));
         }
@@ -681,7 +683,7 @@ impl SandboxManager {
             }
         }
         let Some(reservation) = reservation else {
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{id}' (concurrent starts did not settle)"
             )));
         };
@@ -839,7 +841,7 @@ impl SandboxManager {
     }
 
     /// Wait until something inside an alive sandbox listens on TCP `port`,
-    /// or fail with [`VmmError::DeadlineExceeded`] once `timeout` elapses.
+    /// or fail with [`ComputerError::DeadlineExceeded`] once `timeout` elapses.
     ///
     /// The vm-agent watches the guest's own listen table in-process — no
     /// connect probes that would perturb the workload with spurious
@@ -853,7 +855,7 @@ impl SandboxManager {
         let agent = self.require_alive_agent(id)?;
         match agent.wait_for_port(port, timeout).await? {
             crate::agent::PortWait::Listening => Ok(()),
-            crate::agent::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+            crate::agent::PortWait::Deadline => Err(ComputerError::DeadlineExceeded(format!(
                 "no listener on port {port} in sandbox '{id}' within {}s",
                 timeout.as_secs()
             ))),
@@ -994,7 +996,7 @@ mod tests {
 
         // A gap is rejected with the resume point.
         let err = exec.write_stdin(99, b"x", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::StdinGap { accepted: 11, .. }));
+        assert!(matches!(err, ComputerError::StdinGap { accepted: 11, .. }));
 
         // Exactly the deduplicated byte stream reached the process.
         let mut forwarded = Vec::new();
@@ -1018,7 +1020,7 @@ mod tests {
 
         // Further data after EOF is rejected; a pure duplicate is not.
         let err = exec.write_stdin(2, b"more", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::Config(_)));
+        assert!(matches!(err, ComputerError::Config(_)));
         let st = exec.write_stdin(0, b"in", false).await.unwrap();
         assert_eq!(st.bytes_written, 2);
 
@@ -1029,7 +1031,7 @@ mod tests {
         };
         let (tty_exec, _tty_rx) = test_execution(&tty_spec);
         let err = tty_exec.write_stdin(0, b"", true).await.unwrap_err();
-        assert!(matches!(err, VmmError::Config(_)));
+        assert!(matches!(err, ComputerError::Config(_)));
     }
 
     #[tokio::test]
@@ -1100,18 +1102,18 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(ExecInputMsg::Signal(15))));
         assert!(matches!(
             exec.signal(0).await.unwrap_err(),
-            VmmError::Config(_)
+            ComputerError::Config(_)
         ));
         // Non-TTY executions have nothing to resize.
         assert!(matches!(
             exec.resize(80, 24).await.unwrap_err(),
-            VmmError::Config(_)
+            ComputerError::Config(_)
         ));
 
         exec.mark_exited(&Ok(ExitStatus::Code(0)));
         assert!(matches!(
             exec.signal(9).await.unwrap_err(),
-            VmmError::WrongState { .. }
+            ComputerError::WrongState { .. }
         ));
     }
 
@@ -1177,7 +1179,7 @@ mod tests {
         // Different command under the same id → collision.
         assert!(matches!(
             registry.reserve(key, &["other".to_owned()]),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
 
         // While a start is in flight, a matching retry waits for it instead
@@ -1195,7 +1197,7 @@ mod tests {
             ));
             assert!(matches!(
                 registry.reserve(key2.clone(), &["other".to_owned()]),
-                Err(VmmError::AlreadyExists(_))
+                Err(ComputerError::AlreadyExists(_))
             ));
         }
         // A dropped (uncommitted) reservation frees the slot.

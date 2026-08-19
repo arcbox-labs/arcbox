@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
 use crate::sandbox::spec::build_vm_spec;
@@ -37,7 +37,7 @@ const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
 const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct BootFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     pub prepared: Option<Arc<dyn PreparedVm>>,
     pub cow_handle: Option<CowHandle>,
 }
@@ -74,8 +74,10 @@ pub async fn wait_for_agent(
         Ok(agent) => {
             match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_gate.wait(handle, &agent)).await {
                 Ok(Ok(())) => Ok(agent),
-                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
-                Err(_) => Err(VmmError::Vsock(format!(
+                Ok(Err(error)) => Err(ComputerError::Vsock(format!(
+                    "agent readiness gate: {error}"
+                ))),
+                Err(_) => Err(ComputerError::Vsock(format!(
                     "agent readiness gate: the guest agent did not answer within {}s",
                     AGENT_GATE_TIMEOUT.as_secs()
                 ))),
@@ -204,7 +206,7 @@ pub async fn do_boot(
     if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
-            error: VmmError::WrongState {
+            error: ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
@@ -331,7 +333,7 @@ pub async fn do_boot(
     })?;
     if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
         return Err(BootFailure {
-            error: VmmError::WrongState {
+            error: ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
@@ -347,7 +349,7 @@ pub async fn do_boot(
     // listening — otherwise the guest is reset and the one readiness event
     // is lost. Which observer that is, and whether there is one at all, is
     // the agent port's business.
-    let failed = |error: VmmError| BootFailure {
+    let failed = |error: ComputerError| BootFailure {
         error,
         prepared: None,
         cow_handle: None,

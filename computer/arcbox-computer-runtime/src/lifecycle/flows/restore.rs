@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use super::{ComputerFlows, Launch, RestoreLaunch, warm_create};
 use crate::agent::GuestAgent;
-use crate::error::VmmError;
+use crate::error::ComputerError;
 use crate::lifecycle::event::RestoreOrigin;
 use crate::lifecycle::tasks::restore::{RestoreTimings, RestoreVm, RestoredVm, restore_vm};
 use crate::lifecycle::tasks::resume::restore_paused;
@@ -50,7 +50,7 @@ impl ComputerFlows {
             .unwrap_or_default();
         let vm_dir = self.computer.lock().unwrap().vm_dir.clone();
         let Some(jailer) = services.config.firecracker.jailer.clone() else {
-            return Err(TaskFailure::recoverable(VmmError::Config(
+            return Err(TaskFailure::recoverable(ComputerError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin \
                  paths"
                     .into(),
@@ -180,14 +180,14 @@ impl ComputerFlows {
         };
         let recoverable = TaskFailure::recoverable;
         let snapshot_id = snapshot_id.ok_or_else(|| {
-            recoverable(VmmError::Snapshot(format!(
+            recoverable(ComputerError::Snapshot(format!(
                 "paused computer {} has no pause checkpoint recorded",
                 self.id
             )))
         })?;
         let services = &self.services;
         let jailer = services.config.firecracker.jailer.clone().ok_or_else(|| {
-            recoverable(VmmError::Config(
+            recoverable(ComputerError::Config(
                 "computer resume requires jailer isolation".into(),
             ))
         })?;

@@ -228,7 +228,7 @@ impl SandboxService {
             // whose warm restore points at missing artifacts. Leave the
             // copy; the error is retryable and the referenced-or-orphan
             // outcome is safe either way.
-            Err(error @ arcbox_computer_runtime::VmmError::Unavailable(_)) => {
+            Err(error @ arcbox_computer_runtime::ComputerError::Unavailable(_)) => {
                 Err(SandboxError::from(error))
             }
             Err(error) => {

@@ -30,7 +30,7 @@ use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand
 use crate::agent::{GuestAgent, Readiness};
 use crate::config::RuntimeConfig;
 use crate::environment::NodeEnvironment;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Mailbox, Seeded,
 };
@@ -126,7 +126,7 @@ impl SandboxManager {
     /// Create a new manager from the given configuration, over the
     /// environment-specific components the composer supplies.
     ///
-    /// Fails with [`VmmError::Config`] when the environment's driver lacks a
+    /// Fails with [`ComputerError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
     /// ahead of the guest), `Staging` (every flow brings its computer's
     /// files into the area the VMM can reach), `Vsock` (the guest agent is
@@ -176,7 +176,7 @@ impl SandboxManager {
             ),
         ] {
             if missing {
-                return Err(VmmError::Config(format!(
+                return Err(ComputerError::Config(format!(
                     "VM driver `{}` has no {capability} capability; {need}",
                     driver.name()
                 )));
@@ -187,7 +187,7 @@ impl SandboxManager {
         ))?);
         drop(records.load_all()?);
         if network.reconcile().is_none() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "guest network has no reconcile capability; the quarantine ledger is how a host \
                  releases the addresses a previous process held"
                     .into(),
@@ -266,7 +266,7 @@ impl SandboxManager {
                     reconcile::seed_computers(inactive, &computers, &services, &timers_gate);
                     reconcile::finalize_sweep(swept).await?;
                     reconcile_capability(&*network).replay_complete();
-                    Ok::<_, VmmError>(())
+                    Ok::<_, ComputerError>(())
                 }
                 .await
                 .map_err(|error| Arc::<str>::from(error.to_string()));
@@ -340,7 +340,7 @@ impl SandboxManager {
             .unwrap()
             .get(id)
             .cloned()
-            .ok_or_else(|| VmmError::NotFound(id.clone()))
+            .ok_or_else(|| ComputerError::NotFound(id.clone()))
     }
 
     /// This computer's mailbox.
@@ -367,11 +367,13 @@ impl SandboxManager {
         let result = rx
             .wait_for(Option::is_some)
             .await
-            .map_err(|error| VmmError::Other(format!("sandbox reconciliation stopped: {error}")))?
+            .map_err(|error| {
+                ComputerError::Other(format!("sandbox reconciliation stopped: {error}"))
+            })?
             .clone()
             .expect("wait_for returned only after reconciliation completed");
         result.map_err(|error| {
-            VmmError::Other(format!(
+            ComputerError::Other(format!(
                 "sandbox durable-state reconciliation failed: {error}"
             ))
         })
@@ -380,11 +382,11 @@ impl SandboxManager {
     fn check_reconcile(&self) -> Result<()> {
         let result = self.reconcile_done.borrow().clone();
         match result {
-            None => Err(VmmError::Other(
+            None => Err(ComputerError::Other(
                 "sandbox durable-state reconciliation is still running".into(),
             )),
             Some(Ok(())) => Ok(()),
-            Some(Err(error)) => Err(VmmError::Other(format!(
+            Some(Err(error)) => Err(ComputerError::Other(format!(
                 "sandbox durable-state reconciliation failed: {error}"
             ))),
         }
@@ -398,7 +400,7 @@ impl SandboxManager {
             .reconcile_network()
             .pending_cleanups()
             .await
-            .map_err(VmmError::from)?
+            .map_err(ComputerError::from)?
             .into_iter()
             .map(|(vm, token)| (vm.as_str().to_owned(), token))
             .collect())
@@ -478,7 +480,7 @@ impl SandboxManager {
         let lease = snapshot
             .lease
             .as_ref()
-            .ok_or_else(|| VmmError::WrongState {
+            .ok_or_else(|| ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "sandbox with an active network allocation".into(),
                 actual: snapshot.state.to_string(),
@@ -520,7 +522,7 @@ impl LeaseExt for NetworkLease {
 pub(super) fn ipv4(address: std::net::IpAddr) -> Result<std::net::Ipv4Addr> {
     match address {
         std::net::IpAddr::V4(v4) => Ok(v4),
-        std::net::IpAddr::V6(v6) => Err(VmmError::Network(format!(
+        std::net::IpAddr::V6(v6) => Err(ComputerError::Network(format!(
             "the guest network offered {v6}; this manager's sandboxes are IPv4-only"
         ))),
     }
@@ -644,7 +646,7 @@ pub(crate) fn preserved_cow_file(config: &RuntimeConfig, id: &str) -> PathBuf {
 /// recorded at capture; legacy entries default to the Firecracker format.
 pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointImage> {
     let dir = meta.vmstate_path.parent().ok_or_else(|| {
-        VmmError::Snapshot(format!(
+        ComputerError::Snapshot(format!(
             "checkpoint {} records a vmstate at {}, which is in no directory",
             meta.id,
             meta.vmstate_path.display()
@@ -683,13 +685,13 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
 /// is exactly what the sweep and the quarantine ledger read back.
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
-        return Err(VmmError::Config(format!("{kind} must not be empty")));
+        return Err(ComputerError::Config(format!("{kind} must not be empty")));
     }
     if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "invalid {kind} {id:?}: only ASCII letters, digits, '-' and '_' are allowed"
         )));
     }
@@ -726,7 +728,7 @@ pub(super) fn validate_new_sandbox_id(
     if let Some(budget) = driver.id_budget(&isolation_spec(config)?)
         && id.len() > budget
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "invalid sandbox id {id:?}: at most {budget} characters under this \
              driver's layout (its sockets must fit the AF_UNIX path limit)"
         )));
@@ -758,7 +760,7 @@ pub(crate) fn reserve_actor(
 ) -> Result<ActorReservation> {
     let mut map = computers.write().unwrap();
     if map.contains_key(id) {
-        return Err(VmmError::AlreadyExists(id.clone()));
+        return Err(ComputerError::AlreadyExists(id.clone()));
     }
     let incarnation = Uuid::new_v4();
     let (mailbox_tx, commands) = tokio::sync::mpsc::unbounded_channel();
@@ -963,7 +965,7 @@ mod tests {
             let error = SandboxManager::new(config.clone(), environment(driver))
                 .err()
                 .unwrap_or_else(|| panic!("a driver without {name} is refused"));
-            assert!(matches!(error, VmmError::Config(_)), "{error}");
+            assert!(matches!(error, ComputerError::Config(_)), "{error}");
             assert!(error.to_string().contains(name), "{error}");
         }
 
@@ -980,7 +982,7 @@ mod tests {
         // before either touches the per-id resources they both derive.
         assert!(matches!(
             reserve_actor(&computers, &"dup".to_owned(), placeholder("dup")),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
         drop(first);
         assert!(!computers.read().unwrap().contains_key("dup"));
@@ -1070,7 +1072,7 @@ mod tests {
                 validate_new_sandbox_id(&CONTROL_PLANE_ID.replacen('-', "_", 1), &driver, &config)
                     .expect_err("firecracker would refuse to run under this id");
             assert!(
-                matches!(&error, VmmError::Config(message) if message.contains('_')),
+                matches!(&error, ComputerError::Config(message) if message.contains('_')),
                 "the error should name the offending character, got {error}"
             );
             assert!(validate_new_sandbox_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
@@ -1107,7 +1109,7 @@ mod tests {
 
         assert!(matches!(
             reserve_actor(&computers, &"same".to_owned(), placeholder("same")),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
         forget_computer(&computers, &"same".to_owned(), incarnation);
         let replacement = reserve_actor(&computers, &"same".to_owned(), placeholder("same"))

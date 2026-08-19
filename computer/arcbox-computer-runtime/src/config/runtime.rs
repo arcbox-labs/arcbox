@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 
 use super::JailerConfig;
 
@@ -131,8 +131,9 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     /// Load configuration from a TOML file.
     pub fn from_file(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| VmmError::Config(e.to_string()))?;
-        toml::from_str(&content).map_err(|e| VmmError::Config(e.to_string()))
+        let content =
+            std::fs::read_to_string(path).map_err(|e| ComputerError::Config(e.to_string()))?;
+        toml::from_str(&content).map_err(|e| ComputerError::Config(e.to_string()))
     }
 }
 
@@ -217,7 +218,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            crate::error::VmmError::Config(_)
+            crate::error::ComputerError::Config(_)
         ));
     }
 }

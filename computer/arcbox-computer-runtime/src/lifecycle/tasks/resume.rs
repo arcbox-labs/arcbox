@@ -20,7 +20,7 @@ use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgentFactory};
 use crate::config::{JailerConfig, RuntimeConfig};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::pause::{PAUSED_ROOTFS_FILE, ResumeFailure, ResumedRuntime};
 use crate::sandbox::reconcile::JournaledLease;
 use crate::sandbox::spec::restore_spec;
@@ -112,7 +112,7 @@ pub async fn restore_paused(
         let preserved_cow = sandbox::preserved_cow_file(config, id);
         let rootfs = if preserved_cow.exists() {
             let template = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
-                VmmError::Snapshot(format!(
+                ComputerError::Snapshot(format!(
                     "pause checkpoint for {id} records no rootfs template"
                 ))
             })?;
@@ -132,7 +132,7 @@ pub async fn restore_paused(
             // of a guest rootfs, and nothing else holds a copy of it.
             let parked = vm_dir.join(PAUSED_ROOTFS_FILE);
             if !parked.exists() {
-                return Err(VmmError::Snapshot(format!(
+                return Err(ComputerError::Snapshot(format!(
                     "paused sandbox {id} has neither a preserved overlay nor a parked rootfs"
                 )));
             }
@@ -208,7 +208,7 @@ pub async fn restore_paused(
                 agent.reconfigure_network(&cmd),
             )
             .await
-            .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))
+            .map_err(|_| ComputerError::Vsock("net reconfig after resume timed out".into()))
             .and_then(|r| r)?;
         }
 

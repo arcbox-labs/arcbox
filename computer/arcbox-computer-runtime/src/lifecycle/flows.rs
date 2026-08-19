@@ -28,7 +28,7 @@ use super::event::RestoreOrigin;
 use super::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure, TaskResult};
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pool::SlotPool;
 use crate::sandbox::record::SandboxProvisionOutcome;
@@ -126,7 +126,7 @@ impl ComputerFlows {
             (computer.handle.clone(), computer.net_identity.clone())
         };
         let handle = handle.ok_or_else(|| {
-            VmmError::Vsock(format!("computer {} has no running vm to reach", self.id))
+            ComputerError::Vsock(format!("computer {} has no running vm to reach", self.id))
         })?;
         self.services.agents.connect(handle, identity.as_ref())
     }
@@ -135,7 +135,7 @@ impl ComputerFlows {
     fn mailbox(&self) -> Result<Mailbox> {
         self.mailbox
             .upgrade()
-            .ok_or_else(|| VmmError::NotFound(self.id.clone()))
+            .ok_or_else(|| ComputerError::NotFound(self.id.clone()))
     }
 
     fn take_launch(&self) -> Launch {
@@ -146,7 +146,7 @@ impl ComputerFlows {
     /// `Provision` is missing. Unreachable in practice; reported rather than
     /// panicked so a wiring mistake fails one computer, not the process.
     fn wrong_launch(&self, wanted: &str) -> TaskFailure {
-        TaskFailure::recoverable(VmmError::Other(format!(
+        TaskFailure::recoverable(ComputerError::Other(format!(
             "computer {} was asked to {wanted} with no such launch",
             self.id
         )))

@@ -30,7 +30,7 @@ use arcbox_snapshot::snapshot_cow::BlockTools;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::error::VmmError;
+use crate::error::ComputerError;
 
 /// Capacity of the default busybox rootfs image. The image file is written
 /// sparsely; per-sandbox writes land in the dm-snapshot COW overlay, so this
@@ -86,8 +86,8 @@ impl RootfsBuilder {
     }
 }
 
-fn rootfs_err(error: anyhow::Error) -> VmmError {
-    VmmError::Rootfs(format!("{error:#}"))
+fn rootfs_err(error: anyhow::Error) -> ComputerError {
+    ComputerError::Rootfs(format!("{error:#}"))
 }
 
 /// Check if a file has a valid ext4 superblock magic (0x53EF at offset 0x438).

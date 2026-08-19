@@ -151,12 +151,12 @@ pub async fn publish_after_boot(
 /// its guest is frozen and the boot must fail (see
 /// [`CheckpointFailure`](crate::lifecycle::tasks::checkpoint::CheckpointFailure)).
 enum PublishFailure {
-    Recoverable(VmmError),
-    Frozen(VmmError),
+    Recoverable(ComputerError),
+    Frozen(ComputerError),
 }
 
-impl From<VmmError> for PublishFailure {
-    fn from(error: VmmError) -> Self {
+impl From<ComputerError> for PublishFailure {
+    fn from(error: ComputerError) -> Self {
         Self::Recoverable(error)
     }
 }

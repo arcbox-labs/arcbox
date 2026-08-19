@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::SandboxManager;
 use super::types::{SandboxId, SandboxSpec, SandboxState};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::snapshot::{SnapshotDraft, SnapshotGeometry};
 use crate::template_catalog::{
     ReleasedArtifacts, ResolvedTemplate, TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry,
@@ -99,19 +99,19 @@ impl SandboxManager {
         crate::template_catalog::validate_template_name(template_name)?;
         let source = self.snapshots.find_by_id(source_snapshot_id)?;
         if source.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::FailedPrecondition(format!(
+            return Err(ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} is the internal pause checkpoint of a \
                  paused sandbox; checkpoint the sandbox instead"
             )));
         }
         let geometry = source.geometry.ok_or_else(|| {
-            VmmError::FailedPrecondition(format!(
+            ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} predates geometry recording; \
                  re-checkpoint the sandbox with this agent and promote the new snapshot"
             ))
         })?;
         let rootfs_path = source.rootfs_path.clone().ok_or_else(|| {
-            VmmError::FailedPrecondition(format!(
+            ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} records no rootfs path; \
                  re-checkpoint the sandbox and promote the new snapshot"
             ))
@@ -161,7 +161,7 @@ impl SandboxManager {
         defaults: &TemplateDefaultsSpec,
     ) -> Result<PrewarmOutcome> {
         if self.config.firecracker.jailer.is_none() {
-            return Err(VmmError::FailedPrecondition(
+            return Err(ComputerError::FailedPrecondition(
                 "prewarm requires jailer mode (snapshot restore does)".into(),
             ));
         }
@@ -212,7 +212,7 @@ impl SandboxManager {
             if let Ok((snapshot_id, _)) = &checkpoint {
                 self.discard_promoted_snapshot(snapshot_id).await;
             }
-            return Err(VmmError::Unavailable(format!(
+            return Err(ComputerError::Unavailable(format!(
                 "prewarm builder sandbox {id} could not be removed ({remove_error}); \
                  remove it manually and retry the build"
             )));
@@ -241,13 +241,13 @@ impl SandboxManager {
             match info.state {
                 SandboxState::Ready => break,
                 SandboxState::Failed => {
-                    return Err(VmmError::FailedPrecondition(format!(
+                    return Err(ComputerError::FailedPrecondition(format!(
                         "prewarm boot failed: {}",
                         info.error.unwrap_or_else(|| "unknown boot failure".into())
                     )));
                 }
                 _ if tokio::time::Instant::now() >= deadline => {
-                    return Err(VmmError::DeadlineExceeded(format!(
+                    return Err(ComputerError::DeadlineExceeded(format!(
                         "prewarm builder did not reach READY within {READY_TIMEOUT_SECS}s"
                     )));
                 }
@@ -359,33 +359,33 @@ fn clone_or_copy(src: &Path, dst: &Path) -> Result<u64> {
     {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let source = std::fs::File::open(src).map_err(VmmError::Io)?;
+        let source = std::fs::File::open(src).map_err(ComputerError::Io)?;
         let dest = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(dst)
-            .map_err(VmmError::Io)?;
+            .map_err(ComputerError::Io)?;
         // SAFETY: both fds are open for the duration of the call; FICLONE
         // only clones extents from the source fd into the destination fd.
         let rc = unsafe { libc::ioctl(dest.as_raw_fd(), libc::FICLONE as _, source.as_raw_fd()) };
         if rc == 0 {
-            dest.sync_all().map_err(VmmError::Io)?;
-            return Ok(source.metadata().map_err(VmmError::Io)?.len());
+            dest.sync_all().map_err(ComputerError::Io)?;
+            return Ok(source.metadata().map_err(ComputerError::Io)?.len());
         }
         // Reflink unsupported here (non-Btrfs staging, cross-subvolume
         // boundary) — fall back to a plain copy below.
         drop(dest);
         let _ = std::fs::remove_file(dst);
     }
-    let bytes = std::fs::copy(src, dst).map_err(VmmError::Io)?;
-    let dest = std::fs::File::open(dst).map_err(VmmError::Io)?;
+    let bytes = std::fs::copy(src, dst).map_err(ComputerError::Io)?;
+    let dest = std::fs::File::open(dst).map_err(ComputerError::Io)?;
     std::fs::set_permissions(dst, {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::Permissions::from_mode(0o600)
     })
-    .map_err(VmmError::Io)?;
-    dest.sync_all().map_err(VmmError::Io)?;
+    .map_err(ComputerError::Io)?;
+    dest.sync_all().map_err(ComputerError::Io)?;
     Ok(bytes)
 }
 

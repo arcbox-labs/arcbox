@@ -56,7 +56,7 @@ impl SandboxManager {
         // The pause machinery owns this name: Remove deletes every snapshot
         // carrying it, so a user checkpoint must not squat on it (CORE-21).
         if name == super::pause::PAUSE_SNAPSHOT_NAME {
-            return Err(VmmError::Config(format!(
+            return Err(ComputerError::Config(format!(
                 "checkpoint name {:?} is reserved for sandbox pause",
                 super::pause::PAUSE_SNAPSHOT_NAME
             )));
@@ -174,14 +174,14 @@ impl SandboxManager {
         // cloning it with a fresh overlay would silently discard that disk
         // state. Resume is the only consumer (CORE-21).
         if snap_meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: request.snapshot_id.clone(),
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
         }
         if self.config.firecracker.jailer.is_none() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin \
                  paths"
                     .into(),
@@ -208,16 +208,17 @@ impl SandboxManager {
         {
             ProvisionIntent::Created(record) | ProvisionIntent::Resume(record) => record,
             ProvisionIntent::Replay(record) => {
-                let outcome = record
-                    .provision_outcome
-                    .ok_or_else(|| VmmError::WrongState {
-                        id: new_id.clone(),
-                        expected: "a persisted restore outcome".into(),
-                        actual: "none".into(),
-                    })?;
+                let outcome =
+                    record
+                        .provision_outcome
+                        .ok_or_else(|| ComputerError::WrongState {
+                            id: new_id.clone(),
+                            expected: "a persisted restore outcome".into(),
+                            actual: "none".into(),
+                        })?;
                 return Ok((new_id, outcome.ip_address));
             }
-            ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(new_id)),
+            ProvisionIntent::Blocked(_) => return Err(ComputerError::AlreadyExists(new_id)),
         };
         let generation = record.generation;
         let deadlines = Deadlines {
@@ -253,7 +254,7 @@ impl SandboxManager {
                 Err(error) => {
                     let abort = self.records.abort_provision(&new_id, generation)?;
                     if let Some(durability_error) = abort.durability_error {
-                        return Err(VmmError::Unavailable(format!(
+                        return Err(ComputerError::Unavailable(format!(
                             "{error}; restore rollback is visible, but durability is unconfirmed: {durability_error}"
                         )));
                     }
@@ -300,7 +301,7 @@ impl SandboxManager {
                         .await?,
                 );
             }
-            Ok::<_, VmmError>(())
+            Ok::<_, ComputerError>(())
         }
         .await;
         if let Err(error) = setup {
@@ -320,7 +321,7 @@ impl SandboxManager {
             if unwound.is_empty() {
                 return Err(error);
             }
-            return Err(VmmError::Unavailable(format!(
+            return Err(ComputerError::Unavailable(format!(
                 "{error}; restore rollback incomplete: {}",
                 unwound.join("; ")
             )));
@@ -414,7 +415,7 @@ impl SandboxManager {
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.snapshots.find_by_id(snapshot_id)?;
         if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: snapshot_id.to_owned(),
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
@@ -425,7 +426,7 @@ impl SandboxManager {
         if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL)
             && self.templates.references_snapshot(snapshot_id)?
         {
-            return Err(VmmError::FailedPrecondition(format!(
+            return Err(ComputerError::FailedPrecondition(format!(
                 "snapshot {snapshot_id} is owned by template {owner}; delete the template instead"
             )));
         }

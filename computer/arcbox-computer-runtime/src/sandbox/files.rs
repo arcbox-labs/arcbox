@@ -4,7 +4,7 @@
 //! [`GuestFiles`](crate::agent::GuestFiles): each verb verifies the sandbox
 //! is alive (Ready or Running — file I/O works alongside a running
 //! workload) and forwards to the agent. Paused states surface as
-//! [`VmmError::Paused`] so the daemon's transparent auto-resume applies.
+//! [`ComputerError::Paused`] so the daemon's transparent auto-resume applies.
 
 use super::*;
 use crate::agent::DirWatch;

@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory};
 use crate::config::{JailerConfig, RuntimeConfig};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox;
 use crate::sandbox::boot::{StageError, stage_rootfs_cow_or_copy};
@@ -93,7 +93,7 @@ pub struct RestoreTimings {
 /// A restore that failed before its commit, carrying whatever it had already
 /// acquired so the caller can unwind it (`rollback_restore`).
 pub struct RestoreFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     pub prepared: Option<Arc<dyn PreparedVm>>,
     pub cow_handle: Option<CowHandle>,
 }
@@ -279,7 +279,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                 // gets the same CoW semantics (block-level template
                 // sharing, sparse COW).
                 let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
-                    VmmError::Snapshot(format!(
+                    ComputerError::Snapshot(format!(
                         "checkpoint {} records no rootfs template; there is no disk to restore \
                          it onto",
                         snap_meta.id
@@ -421,7 +421,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             agent.reconfigure_network(&cmd),
         )
         .await
-        .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
+        .map_err(|_| ComputerError::Vsock("net reconfig after restore timed out".into()))
         .and_then(|r| r)
     };
 

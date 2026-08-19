@@ -56,10 +56,9 @@ pub(super) async fn prepare_slot(
     snapshot: &SnapshotMeta,
 ) -> Result<PreparedSlot> {
     let fc_cfg = &config.firecracker;
-    let jc = fc_cfg
-        .jailer
-        .as_ref()
-        .ok_or_else(|| VmmError::Config("restore slot pooling requires jailer isolation".into()))?;
+    let jc = fc_cfg.jailer.as_ref().ok_or_else(|| {
+        ComputerError::Config("restore slot pooling requires jailer isolation".into())
+    })?;
     // Short suffix on purpose: the slot id becomes a VM identity and must
     // fit the driver's own id budget (`VmDriver::id_budget`) under any
     // configured chroot layout — internal mints bypass the ingress
@@ -129,13 +128,13 @@ pub(super) async fn prepare_slot(
 }
 
 struct SlotFailure {
-    error: VmmError,
+    error: ComputerError,
     prepared: Option<Arc<dyn PreparedVm>>,
     cow_handle: Option<CowHandle>,
 }
 
-impl From<VmmError> for SlotFailure {
-    fn from(error: VmmError) -> Self {
+impl From<ComputerError> for SlotFailure {
+    fn from(error: ComputerError) -> Self {
         Self {
             error,
             prepared: None,
@@ -164,12 +163,12 @@ async fn stage_slot(
     let prepared: Arc<dyn PreparedVm> = Arc::from(
         super::prepare_capability(driver)
             .prepare(
-                &VmId::new(slot_id).map_err(VmmError::from)?,
+                &VmId::new(slot_id).map_err(ComputerError::from)?,
                 &IsolationSpec::try_from(jc)?,
                 vm_dir,
             )
             .await
-            .map_err(VmmError::from)?,
+            .map_err(ComputerError::from)?,
     );
     let pid = super::journaled_pid(&*prepared);
     let journal = |cow: Option<&CowHandle>| {
@@ -178,7 +177,7 @@ async fn stage_slot(
             &SandboxStateRecord::new(slot_id, pid, None, cow, config, None)?,
         )
     };
-    let carry = |error: VmmError, prepared, cow_handle| SlotFailure {
+    let carry = |error: ComputerError, prepared, cow_handle| SlotFailure {
         error,
         prepared,
         cow_handle,
@@ -199,7 +198,7 @@ async fn stage_slot(
 
     let Some(rootfs) = snapshot.rootfs_path.as_deref() else {
         return Err(carry(
-            VmmError::Snapshot(format!(
+            ComputerError::Snapshot(format!(
                 "checkpoint {} records no rootfs template; there is no disk to pre-warm a slot \
                  with",
                 snapshot.id
@@ -271,7 +270,7 @@ pub(super) async fn destroy_slot(cow_manager: &CowManager, mut slot: PreparedSlo
     match tokio::fs::remove_dir_all(&slot.vm_dir).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(VmmError::Io(error)),
+        Err(error) => Err(ComputerError::Io(error)),
     }
 }
 

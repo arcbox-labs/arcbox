@@ -13,7 +13,7 @@ use arcbox_vm_driver::{
 };
 
 use crate::boot_proto::KernelIpParam;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
 
 /// The boot recipe as the driver port sees it.
@@ -56,7 +56,7 @@ pub fn build_vm_spec(
         id: VmId::new(id)?,
         cpus: spec.vcpus.max(1),
         memory_mib: u32::try_from(spec.memory_mib).map_err(|_| {
-            VmmError::Config(format!(
+            ComputerError::Config(format!(
                 "memory_mib {} exceeds what a VM spec can carry",
                 spec.memory_mib
             ))

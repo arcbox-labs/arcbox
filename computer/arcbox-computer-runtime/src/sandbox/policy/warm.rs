@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::SandboxSpec;
 
 /// Most distinct warm keys cached at once, mirroring the restore pool's
@@ -112,12 +112,12 @@ pub(in crate::sandbox) fn warm_eligible(
 /// the warm-cache key or the template-catalog ownership marker (CORE-107).
 pub(in crate::sandbox) fn reject_reserved_labels(labels: &HashMap<String, String>) -> Result<()> {
     if labels.contains_key(WARM_KEY_LABEL) {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "snapshot label {WARM_KEY_LABEL} is reserved for the warm-create cache"
         )));
     }
     if labels.contains_key(crate::template_catalog::TEMPLATE_LABEL) {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "snapshot label {} is reserved for the template catalog",
             crate::template_catalog::TEMPLATE_LABEL
         )));

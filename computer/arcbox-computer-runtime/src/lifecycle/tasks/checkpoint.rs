@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use arcbox_vm_driver::{AfterCheckpoint, CheckpointKind, CheckpointOptions, VmHandle};
 use tracing::info;
 
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::settle::{self, Capture, GuestHold, Settlement};
 use crate::sandbox::{CheckpointInfo, SandboxId, SandboxState};
@@ -48,20 +48,20 @@ pub struct CheckpointRequest {
 pub enum CheckpointFailure {
     /// The guest is running — the driver resumed it, or the failure came
     /// before the capture — and the sandbox is as usable as it was.
-    Recoverable(VmmError),
+    Recoverable(ComputerError),
     /// The guest is frozen and nothing can thaw it: the driver's own resume
     /// after the capture failed (it settles the guest before reporting, and
     /// this is the case where that settling itself failed), or the capture
     /// held the guest on request and a later step failed. The port has no
     /// resume verb, so the sandbox is unusable and the caller must fail it —
     /// kill, release, durable `Failed` — rather than report it Ready.
-    Frozen(VmmError),
+    Frozen(ComputerError),
 }
 
 impl CheckpointFailure {
     /// The error, for a caller whose next step disposes of the sandbox
     /// either way.
-    pub fn into_error(self) -> VmmError {
+    pub fn into_error(self) -> ComputerError {
         match self {
             Self::Recoverable(error) | Self::Frozen(error) => error,
         }
@@ -86,17 +86,20 @@ fn checkpoint_source(
 ) -> Result<CheckpointSource> {
     let inst = computer.lock().unwrap();
     if inst.state != expected_state {
-        return Err(VmmError::WrongState {
+        return Err(ComputerError::WrongState {
             id: sandbox_id.clone(),
             expected: expected_state.to_string(),
             actual: inst.state.to_string(),
         });
     }
-    let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
-        id: sandbox_id.clone(),
-        expected: format!("{expected_state} (VM handle available)"),
-        actual: inst.state.to_string(),
-    })?;
+    let handle = inst
+        .handle
+        .clone()
+        .ok_or_else(|| ComputerError::WrongState {
+            id: sandbox_id.clone(),
+            expected: format!("{expected_state} (VM handle available)"),
+            actual: inst.state.to_string(),
+        })?;
     Ok(CheckpointSource {
         kernel_path: inst.spec.kernel.clone(),
         rootfs_path: inst.spec.rootfs.clone(),
@@ -145,7 +148,7 @@ pub async fn checkpoint_impl(
     match (outcome, settlement) {
         (Ok(info), Settlement::AsRequested) => Ok(info),
         (Ok(info), Settlement::Frozen) => {
-            Err(CheckpointFailure::Frozen(VmmError::Process(format!(
+            Err(CheckpointFailure::Frozen(ComputerError::Process(format!(
                 "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
                  resume the guest",
                 info.snapshot_id
@@ -174,7 +177,7 @@ async fn capture(
     // checkpoints only jailed VMs, because a restore reopens the disk paths
     // the checkpoint recorded and only a per-VM chroot makes those private.
     let checkpoint = source.handle.checkpoint().ok_or_else(|| {
-        VmmError::FailedPrecondition(format!(
+        ComputerError::FailedPrecondition(format!(
             "sandbox {sandbox_id} cannot be checkpointed: checkpoints require jailer \
              isolation, and this VM runs without it"
         ))

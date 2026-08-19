@@ -232,7 +232,7 @@ impl ComputerActor {
     fn park(&mut self, answer: Answer, reply: Reply) {
         match self.answer_error.take() {
             Some(detail) => {
-                let _ = reply.send(Err(VmmError::Unavailable(detail)));
+                let _ = reply.send(Err(ComputerError::Unavailable(detail)));
             }
             None => self.waiters.push((answer, reply)),
         }
@@ -247,8 +247,8 @@ impl ComputerActor {
                 let _ = reply.send(match (&failed, &unconfirmed) {
                     // The flow reached its answer, but a step of it failed
                     // loudly on the way; the caller hears that first.
-                    (Some(detail), _) => Err(VmmError::Unavailable(detail.clone())),
-                    (None, Some(detail)) => Err(VmmError::AckUnconfirmed {
+                    (Some(detail), _) => Err(ComputerError::Unavailable(detail.clone())),
+                    (None, Some(detail)) => Err(ComputerError::AckUnconfirmed {
                         id: self.id.clone(),
                         detail: detail.clone(),
                     }),
@@ -266,10 +266,10 @@ impl ComputerActor {
     /// unconfirmed one it left behind.
     fn acknowledged(&mut self) -> Result<()> {
         if let Some(detail) = self.answer_error.take() {
-            return Err(VmmError::Unavailable(detail));
+            return Err(ComputerError::Unavailable(detail));
         }
         match self.unconfirmed.take() {
-            Some(detail) => Err(VmmError::AckUnconfirmed {
+            Some(detail) => Err(ComputerError::AckUnconfirmed {
                 id: self.id.clone(),
                 detail,
             }),
@@ -283,19 +283,19 @@ impl ComputerActor {
     /// A parked `Remove` is the exception: a failure elsewhere is what starts
     /// its teardown, so the removal is what answers it. The removal's own
     /// release failure is [`Self::fail_every_waiter`].
-    pub(super) fn fail_waiters(&mut self, error: VmmError) -> usize {
+    pub(super) fn fail_waiters(&mut self, error: ComputerError) -> usize {
         self.fail_parked(error, false)
     }
 
     /// [`Self::fail_waiters`], including the parked removals — for the one
     /// failure no later answer can reach, a removal's own release.
-    pub(super) fn fail_every_waiter(&mut self, error: VmmError) -> usize {
+    pub(super) fn fail_every_waiter(&mut self, error: ComputerError) -> usize {
         self.fail_parked(error, true)
     }
 
     /// The typed error goes to the first caller; further ones (coalesced
     /// verbs) get its text, since an error is not `Clone`.
-    fn fail_parked(&mut self, error: VmmError, removals_too: bool) -> usize {
+    fn fail_parked(&mut self, error: ComputerError, removals_too: bool) -> usize {
         let text = error.to_string();
         let mut typed = Some(error);
         let mut answered = 0;
@@ -307,15 +307,15 @@ impl ComputerActor {
                 answered += 1;
                 let _ = reply.send(Err(typed
                     .take()
-                    .unwrap_or_else(|| VmmError::Other(text.clone()))));
+                    .unwrap_or_else(|| ComputerError::Other(text.clone()))));
             }
         }
         self.waiters = remaining;
         answered
     }
 
-    fn wrong_state(&self, expected: &str) -> VmmError {
-        VmmError::WrongState {
+    fn wrong_state(&self, expected: &str) -> ComputerError {
+        ComputerError::WrongState {
             id: self.id.clone(),
             expected: expected.to_owned(),
             actual: self.public().to_string(),
