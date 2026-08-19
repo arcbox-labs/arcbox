@@ -113,6 +113,22 @@ jobs:
         # to run here as library tests.
         run: cargo test -p arcbox-computer-runtime --test manager_over_fakes
 
+      - name: Container DNS aliases over the public API
+        # Compose-alias extraction, driven through `arcbox_agent::dns`
+        # rather than from inside the crate. Named for the same reason as
+        # the step above: `--lib --bins` selects no `--test` targets, so an
+        # integration target has to be asked for by name or it runs
+        # nowhere. Pure string handling — no KVM, no root, no Firecracker.
+        #
+        # The crate's other unprivileged `--test` target,
+        # port_forward_cleanup, is deliberately NOT here: it re-includes
+        # src/agent/linux/port_forward.rs by #[path] so those tests run on
+        # a macOS dev host, and on Linux `--bins` above already runs them
+        # from the bin target. The remaining two (sandbox_manager_e2e,
+        # sandbox_service_manager) need root + KVM + Firecracker and belong
+        # to the jobs below.
+        run: cargo test -p arcbox-agent --test dns_aliases
+
   # ---------------------------------------------------------------------------
   # Job 2: integration tests — requires root (TAP interface creation)
   # ---------------------------------------------------------------------------

@@ -33,20 +33,26 @@ non-obvious invariants and failure signatures.
   `containerd_config`, `shutdown`, and `main.rs`'s own `parse_mode` tests).
   Every module declared by both targets is compiled and run twice, which is
   why the job reports 287 executions for 184 functions.
-- **Two holes in that gate, both by omission rather than design.** The
+- **One hole left in that gate, by omission rather than design.** The
   workflow is `paths:`-filtered: it covers `guest/arcbox-agent/**` *and* most
   of the crate's own workspace dependencies (`arcbox-computer-runtime`,
   `arcbox-fc-driver`, `arcbox-tap-net`, `arcbox-snapshot`,
   `arcbox-constants`, `Cargo.lock`), so a change to any of those re-runs the
   agent's tests — but a dependency *absent* from that list does not:
-  `arcbox-connect`, `arcbox-pty`, `arcbox-dns`, `arcbox-logging`. And
-  `--lib --bins` selects no `--test` targets, so two under `tests/` still run
-  nowhere: `dns_aliases` (7 tests against the public `dns` API) and
-  `port_forward_cleanup` (a `#[path]` shim re-including
-  `agent/linux/port_forward.rs` purely so its tests can run on macOS — on
-  Linux the bin target now runs them anyway). A bare `--tests` is not the fix:
-  it would drag in `sandbox_manager_e2e` and `sandbox_service_manager`, which
-  need root, KVM and Firecracker.
+  `arcbox-connect`, `arcbox-pty`, `arcbox-dns`, `arcbox-logging`.
+- **An integration target runs nowhere until a step names it.**
+  `--lib --bins` selects no `--test` targets, so each one needs asking for:
+  `dns_aliases`, the compose-alias tests against the public `dns` API, has
+  its own step beside `Manager lifecycle over the fakes`. A bare `--tests` is
+  not the shortcut — it would pull in `sandbox_manager_e2e` and
+  `sandbox_service_manager`, which need root, KVM and Firecracker and are
+  already driven by the privileged jobs below. `port_forward_cleanup` is left
+  out deliberately and is not a gap: it re-includes
+  `agent/linux/port_forward.rs` by `#[path]`, and what that buys is coverage
+  on the **macOS dev host** — the primary dev platform, where a plain
+  `cargo test -p arcbox-agent` picks up those 11 tests and the Linux job
+  cannot help. On Linux the bin target already runs the same tests, so adding
+  it to this job would buy nothing.
 - **CI still never lints the agent — you must, locally.** No job runs clippy
   on it: the macOS gate excludes it, the Linux `Unit tests` job deliberately
   keeps it out of the `-D warnings` clippy step (a pre-existing
