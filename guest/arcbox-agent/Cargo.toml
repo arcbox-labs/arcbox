@@ -48,12 +48,14 @@ arcbox-connect.workspace = true
 buffa = "0.9.1"
 buffa-types = "0.9.1"
 
-# vsock, the sandbox runtime, and the two adapters this crate composes it
-# over (the Firecracker driver and the TAP network) are Linux-only.
+# vsock, the sandbox runtime, the VM-driver port it speaks, and the two
+# adapters this crate composes it over (the Firecracker driver and the TAP
+# network) are Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
 arcbox-pty.workspace = true
 tokio-vsock = "0.5"
 arcbox-computer-runtime = { workspace = true }
+arcbox-vm-driver = { workspace = true }
 arcbox-fc-driver = { workspace = true }
 arcbox-tap-net = { workspace = true }
 arcbox-snapshot = { workspace = true }

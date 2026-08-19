@@ -206,6 +206,7 @@ dependencies = [
  "arcbox-pty",
  "arcbox-snapshot",
  "arcbox-tap-net",
+ "arcbox-vm-driver",
  "async-trait",
  "buffa",
  "buffa-types",

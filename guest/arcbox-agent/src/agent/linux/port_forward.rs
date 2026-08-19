@@ -15,7 +15,11 @@
 //! installed at boot (`init.rs::setup_sandbox_forwarding`).
 //!
 //! How the DNAT targets the sandbox follows the identity's
-//! [`ExposeTarget`], decided by the datapath applied to its TAP
+//! [`HostIngress`](arcbox_vm_driver::net::HostIngress), the guest network's
+//! own answer for how host-side
+//! forwarding reaches that guest. This composer builds the sandbox network
+//! out of `arcbox-tap-net`, so it reads that answer back as the adapter's
+//! [`ExposeTarget`] — decided by the datapath applied to the sandbox's TAP
 //! (CORE-81/CORE-83): the pool-IP form for legacy guests and for eBPF-datapath
 //! invariant guests (whose TAP egress program rewrites the pool destination
 //! after routing), or the fixed guest IP paired with a mangle `MARK` rule on
@@ -28,8 +32,9 @@ use std::net::Ipv4Addr;
 use std::process::Output;
 
 use anyhow::{Context, Result, bail};
+use arcbox_computer_runtime::SandboxNetworkIdentity;
 use arcbox_computer_runtime::network::invariant;
-use arcbox_computer_runtime::{ExposeTarget, SandboxNetworkIdentity};
+use arcbox_tap_net::ExposeTarget;
 use tokio::process::Command;
 
 /// First port of the reserved guest relay range.
@@ -135,7 +140,7 @@ impl PortForwardManager {
 
         let guest_port = self.allocate_port()?;
         let (rule_args, mangle_args) =
-            expose_rule_specs(identity, guest_port, sandbox_port, protocol);
+            expose_rule_specs(identity, guest_port, sandbox_port, protocol)?;
 
         if let Some(ref mangle) = mangle_args {
             run_iptables(&prepend_table("mangle", "-I", mangle))
@@ -300,13 +305,21 @@ impl PortForwardManager {
 
 /// The nat DNAT spec and optional mangle `MARK` companion for one mapping,
 /// selected by how the sandbox's datapath expects to be targeted.
+///
+/// The identity carries the port's
+/// [`HostIngress`](arcbox_vm_driver::net::HostIngress); this is where it
+/// becomes the TAP network's [`ExposeTarget`], because this is where it
+/// becomes iptables arguments. The conversion can refuse — a variant
+/// this adapter has no rendering for is a network the sandbox stack was not
+/// composed over, and installing the wrong DNAT would strand the mapping
+/// silently.
 fn expose_rule_specs(
     identity: &SandboxNetworkIdentity,
     guest_port: u16,
     sandbox_port: u16,
     protocol: Protocol,
-) -> (Vec<String>, Option<Vec<String>>) {
-    let (target_ip, mangle_args) = match identity.expose {
+) -> Result<(Vec<String>, Option<Vec<String>>)> {
+    let (target_ip, mangle_args) = match ExposeTarget::try_from(identity.expose)? {
         ExposeTarget::PoolIp => (identity.ip, None),
         ExposeTarget::GuestIpWithFwmark => (
             invariant::GUEST_IP,
@@ -318,7 +331,7 @@ fn expose_rule_specs(
             )),
         ),
     };
-    (
+    Ok((
         dnat_rule_args(
             guest_port,
             target_ip,
@@ -327,7 +340,7 @@ fn expose_rule_specs(
             protocol,
         ),
         mangle_args,
-    )
+    ))
 }
 
 /// The protocol/port/destination spec shared by install and delete.
@@ -570,6 +583,8 @@ fn classify_rule_check(output: Output, args: &[String]) -> Result<bool> {
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
 
+    use arcbox_vm_driver::net::HostIngress;
+
     use super::*;
 
     #[test]
@@ -633,7 +648,7 @@ mod tests {
         assert_eq!(args[..8], dnat[..8]);
     }
 
-    fn identity(expose: ExposeTarget) -> SandboxNetworkIdentity {
+    fn identity(expose: HostIngress) -> SandboxNetworkIdentity {
         SandboxNetworkIdentity {
             ip: "172.20.0.2".parse().unwrap(),
             cleanup_token: "generation".into(),
@@ -646,22 +661,35 @@ mod tests {
     /// and, on the eBPF path, the egress program does the rewrite.
     #[test]
     fn pool_ip_expose_targets_the_pool_ip_without_a_mangle_companion() {
-        let (dnat, mangle) =
-            expose_rule_specs(&identity(ExposeTarget::PoolIp), 40000, 8080, Protocol::Tcp);
+        let (dnat, mangle) = expose_rule_specs(
+            &identity(HostIngress::PoolAddress),
+            40000,
+            8080,
+            Protocol::Tcp,
+        )
+        .unwrap();
         assert!(mangle.is_none());
         assert_eq!(dnat.last().unwrap(), "172.20.0.2:8080");
     }
 
     /// Fwmark expose (iptables-datapath invariant guests): DNAT to the fixed
     /// guest IP plus the mark companion that routes it out the right TAP.
+    /// The mark on the wire is the one this composer derives from the pool
+    /// address, not the one the ingress carried: the two agree over the TAP
+    /// network (`invariant::fwmark(pool_ip)` is what its `host_ingress`
+    /// mints), and the derivation is what the per-sandbox routing table is
+    /// keyed by.
     #[test]
     fn fwmark_expose_targets_the_guest_ip_with_the_mark_companion() {
         let (dnat, mangle) = expose_rule_specs(
-            &identity(ExposeTarget::GuestIpWithFwmark),
+            &identity(HostIngress::GuestAddress {
+                fwmark: invariant::fwmark("172.20.0.2".parse().unwrap()),
+            }),
             40000,
             8080,
             Protocol::Tcp,
-        );
+        )
+        .unwrap();
         assert_eq!(
             dnat.last().unwrap(),
             &format!("{}:8080", invariant::GUEST_IP)

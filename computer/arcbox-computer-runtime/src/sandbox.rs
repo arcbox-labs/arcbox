@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arcbox_vm_driver::net::{
-    AttachMode, GuestNetwork, NetworkIdentity, NetworkLease, NetworkMode, NetworkPolicy,
-    NetworkReconcile,
+    AttachMode, GuestNetwork, HostIngress, NetworkIdentity, NetworkLease, NetworkMode,
+    NetworkPolicy, NetworkReconcile,
 };
 use arcbox_vm_driver::{
     CheckpointFormat, CheckpointImage, CheckpointKind, DiskSource, IsolationSpec, NicSpec, Prepare,
@@ -486,9 +486,7 @@ impl SandboxManager {
         Ok(SandboxNetworkIdentity {
             ip: lease.ipv4()?,
             cleanup_token: lease.cleanup_token.clone(),
-            expose: crate::network::ExposeTarget::try_from(
-                self.services.network.host_ingress(lease)?,
-            )?,
+            expose: self.services.network.host_ingress(lease)?,
         })
     }
 }
@@ -568,7 +566,11 @@ pub struct SandboxNetworkIdentity {
     pub cleanup_token: String,
     /// How expose DNAT must target this sandbox, decided by the datapath
     /// actually applied to its TAP (CORE-81/CORE-83).
-    pub expose: crate::network::ExposeTarget,
+    ///
+    /// The guest network's own answer, passed through unchanged: rendering
+    /// it as forwarding rules is the composing host's job, and only that
+    /// host knows which network it built.
+    pub expose: HostIngress,
 }
 
 /// The guest network's cleanup protocol, which [`SandboxManager::new`]
