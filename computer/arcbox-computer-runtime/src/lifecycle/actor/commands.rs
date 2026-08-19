@@ -148,21 +148,24 @@ impl ComputerActor {
                     // Nothing to hand over, which is a real success: there is
                     // no guest here this process would have killed on its way
                     // out. A paused computer gave its VM up to its checkpoint
-                    // and a resting one has none, so the successor reinstates
-                    // all of them from the record alone. An already-detached
-                    // one is the successor's twice over — reporting a failure
-                    // would have a composer log a loss it did not take.
-                    State::Paused {}
+                    // and a resting one has none; `provisioning` has not
+                    // spawned its boot yet, so no VMM exists either. The
+                    // successor reinstates all of them from the record alone.
+                    // An already-detached one is the successor's twice over —
+                    // reporting a failure would have a composer log a loss it
+                    // did not take.
+                    State::Provisioning {}
+                    | State::Paused {}
                     | State::Stopped {}
                     | State::Failed {}
                     | State::Gone {}
                     | State::Detached {} => Ok(()),
-                    // Mid-launch or mid-teardown. The launch's resources are
-                    // still in its task rather than on the computer, and a
-                    // teardown was asked for — either way a caller that heard
-                    // `Ok` would believe a guest survived a handover that
-                    // never happened.
-                    _ => Err(self.wrong_state("Ready, Running, or Checkpointing")),
+                    // Mid-launch, mid-capture or mid-teardown — all of which
+                    // do have a VM, and all of which lose it when this process
+                    // exits. That is worth reporting rather than skipping: a
+                    // caller told `Ok` would believe a guest survived a
+                    // handover that never happened.
+                    _ => Err(self.wrong_state("Ready or Running")),
                 };
                 if let Some((_, reply)) = self.waiters.pop() {
                     let _ = reply.send(answer);
@@ -196,6 +199,18 @@ impl ComputerActor {
                 self.dispatch(machine, Event::WorkloadReleased).await;
             }
             Command::SetLifecycle { update, reply } => {
+                // A handed-over computer refuses too, and the state is what
+                // says so — it projects `Ready`, so the public gate below lets
+                // it through. What that would reach is not a timer but the
+                // record: `persist_lifecycle` fsyncs into the record the
+                // successor has already adopted, under the generation it
+                // adopted with, so the write is accepted rather than fenced.
+                // The same class as the VM race this whole transition exists
+                // to close, moved from the guest to its record.
+                if matches!(machine.state(), State::Detached {}) {
+                    let _ = reply.send(Err(self.wrong_state("a computer this process still owns")));
+                    return;
+                }
                 // `set_sandbox_lifecycle` refuses a computer on its way out:
                 // nothing is left for a deadline to fire on, and the record
                 // it would persist to is about to be a tombstone.

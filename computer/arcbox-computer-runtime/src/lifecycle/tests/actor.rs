@@ -1299,3 +1299,100 @@ async fn a_refused_handover_leaves_the_computer_usable() {
         .await;
     assert!(harness.script.calls().contains(&"stop"));
 }
+
+/// A handover drops the guest agent, so the data plane stops reaching a VM
+/// this process no longer owns.
+///
+/// The exec and file verbs read the agent straight off the snapshot and never
+/// round-trip the mailbox — that is the whole point of the seam — so the
+/// terminal state alone cannot stop them. `detached` projects `Ready`, which
+/// is exactly what `require_alive_agent` admits, so without this an exec would
+/// keep landing in a guest the successor had adopted. A stop and a release
+/// forget the agent for the same reason.
+#[tokio::test(start_paused = true)]
+async fn a_handover_takes_the_guest_agent_off_the_snapshot() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    assert!(
+        harness.snapshot.borrow().agent.is_some(),
+        "a ready computer is dialable"
+    );
+
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+    assert!(
+        harness.snapshot.borrow().agent.is_none(),
+        "the data plane can still reach a handed-over guest"
+    );
+}
+
+/// A handed-over computer refuses `SetLifecycle`.
+///
+/// It projects `Ready`, so the public-state gate lets it through, and what it
+/// would reach is not a timer but the record: `persist_lifecycle` fsyncs into
+/// the record the successor has already adopted, under the generation it
+/// adopted with — so the write is accepted rather than fenced. The same race
+/// this transition exists to close, moved from the guest to its record.
+#[tokio::test(start_paused = true)]
+async fn a_handed_over_computer_refuses_a_lifecycle_update() {
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+
+    let error = harness
+        .send(|reply| Command::SetLifecycle {
+            update: LifecycleUpdate {
+                ttl_seconds: Some(60),
+                ..LifecycleUpdate::default()
+            },
+            reply,
+        })
+        .error()
+        .await;
+    assert!(
+        matches!(error, VmmError::WrongState { .. }),
+        "a handed-over record was written: {error}"
+    );
+}
+
+/// A handover ordered while a capture is in flight is refused.
+///
+/// The capture sub-task cloned the handle before it started and the driver's
+/// detach only stands the reaper down, so accepting would leave this process
+/// freezing, snapshotting and resuming a guest the successor had adopted.
+#[tokio::test(start_paused = true)]
+async fn a_handover_during_a_capture_is_refused() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    *harness.script.checkpoint_takes.lock().unwrap() = Some(Duration::from_secs(30));
+
+    let (reply, capture) = oneshot::channel();
+    harness
+        .commands
+        .send(Command::Checkpoint {
+            spec: CaptureSpec {
+                name: "snap".to_owned(),
+                labels: std::collections::HashMap::new(),
+            },
+            reply,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let error = harness
+        .send(|reply| Command::Detach { reply })
+        .error()
+        .await;
+    assert!(
+        matches!(error, VmmError::WrongState { .. }),
+        "a handover during a capture must be refused: {error}"
+    );
+    assert!(
+        !harness.script.calls().contains(&"detach"),
+        "the port was reached while a capture held the handle: {:?}",
+        harness.script.calls()
+    );
+
+    // The capture it stood aside for still owns the guest and still answers.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    capture.await.unwrap().unwrap();
+}
