@@ -205,9 +205,9 @@ pub struct DriverCapabilities {
     pub adopt: bool,
     /// The VMM can be spawned ahead of a boot ([`Prepare`]).
     pub prepare: bool,
-    /// Prepared VMs and handles expose [`Staging`](crate::Staging): the
-    /// files a VM boots from are brought into an area of its own and named
-    /// by where they landed.
+    /// Prepared VMs and handles expose [`Staging`]: the files a VM boots
+    /// from are brought into an area of its own and named by where they
+    /// landed.
     pub staging: bool,
     /// Handles expose a memory balloon.
     pub balloon: bool,

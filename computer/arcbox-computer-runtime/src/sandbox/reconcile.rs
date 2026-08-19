@@ -161,7 +161,7 @@ pub struct SandboxStateRecord {
     cow: Option<CowRecord>,
     /// Whether a jailer chroot was created for this sandbox.
     ///
-    /// Written, never read. This sweep asks the driver to discard a dead
+    /// Nothing in this agent acts on it. The sweep asks the driver to discard a dead
     /// VM's area instead ([`arcbox_vm_driver::Adopt::discard_area`]): the
     /// flag records what the *writing* process's config said, while the
     /// only area this process can name is the one its own config
@@ -764,8 +764,9 @@ async fn reap_orphans(
 
         // The VM's own area — under the jailer, a whole chroot holding the
         // guest's rootfs. Only the driver knows where that is, and the VM
-        // is already dead: the loop above either adopted it (and `continue`d
-        // past here) or killed it.
+        // is gone: the loop above either adopted it, in which case this one
+        // has already `continue`d past here, or killed it, or never found
+        // it at all.
         //
         // The journal's `jailer` flag is deliberately not consulted. It
         // says what the config of the process that *wrote* it had, while
@@ -1245,7 +1246,7 @@ async fn adopt_or_kill(
 ///
 /// Keyed by the id its resources are named after, which for a sandbox that
 /// claimed a pre-warmed slot is the slot's, not its own. The id is already
-/// known to parse: [`sweep_orphans`] refuses a journal whose ids do not,
+/// known to parse: [`sweep_orphans`] skips a journal whose ids do not,
 /// before any of them reaches this far.
 fn vm_record(
     driver: &dyn VmDriver,
