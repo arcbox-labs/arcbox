@@ -1,5 +1,5 @@
 use super::reconcile::JournaledLease;
-use super::record::{ProvisionIntent, SandboxProvisionOutcome};
+use super::record::{ComputerProvisionOutcome, ProvisionIntent};
 use super::*;
 use crate::lifecycle::tasks::CaptureSpec;
 
@@ -12,7 +12,7 @@ use crate::lifecycle::tasks::CaptureSpec;
 pub(super) const CHECKPOINT_FORMAT: &str = arcbox_vm_driver::testkit::CHECKPOINT_FORMAT;
 
 /// Parameters for the internal restore path
-/// ([`SandboxManager::restore_from_snapshot`]), shared by the Restore RPC
+/// ([`ComputerManager::restore_from_snapshot`]), shared by the Restore RPC
 /// and internal callers.
 pub(super) struct RestoreRequest {
     /// Source checkpoint id.
@@ -24,12 +24,12 @@ pub(super) struct RestoreRequest {
     /// `ttl_seconds`) — plus, on the warm-create origin, the initial
     /// workload fields; the boot-recipe fields are ignored — the snapshot
     /// carries the boot state.
-    pub(super) spec: SandboxSpec,
+    pub(super) spec: ComputerSpec,
     /// Which API surface this restore serves; decides the event contract.
     pub(super) origin: RestoreOrigin,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Rootfs images that existing snapshots or catalog templates need to
     /// stay restorable/bootable.
     ///
@@ -46,9 +46,9 @@ impl SandboxManager {
     }
 
     /// Checkpoint a `Ready` sandbox into the snapshot catalog.
-    pub async fn checkpoint_sandbox(
+    pub async fn checkpoint_computer(
         &self,
-        sandbox_id: &SandboxId,
+        computer_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
@@ -56,7 +56,7 @@ impl SandboxManager {
         // The pause machinery owns this name: Remove deletes every snapshot
         // carrying it, so a user checkpoint must not squat on it (CORE-21).
         if name == super::pause::PAUSE_SNAPSHOT_NAME {
-            return Err(VmmError::Config(format!(
+            return Err(ComputerError::Config(format!(
                 "checkpoint name {:?} is reserved for sandbox pause",
                 super::pause::PAUSE_SNAPSHOT_NAME
             )));
@@ -64,10 +64,10 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
-        self.capture_checkpoint(sandbox_id, name, labels).await
+        self.capture_checkpoint(computer_id, name, labels).await
     }
 
-    /// [`Self::checkpoint_sandbox`] without the reserved-name and
+    /// [`Self::checkpoint_computer`] without the reserved-name and
     /// reserved-label guards, for the catalogs that own those names.
     ///
     /// The guards exist to stop a *caller* squatting on the pause
@@ -76,12 +76,12 @@ impl SandboxManager {
     /// exactly what the label guard refuses.
     pub(super) async fn capture_checkpoint(
         &self,
-        sandbox_id: &SandboxId,
+        computer_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
-        self.mailbox(sandbox_id)?
-            .ask(sandbox_id, |reply| Command::Checkpoint {
+        self.mailbox(computer_id)?
+            .ask(computer_id, |reply| Command::Checkpoint {
                 spec: CaptureSpec { name, labels },
                 reply,
             })
@@ -96,19 +96,22 @@ impl SandboxManager {
     ///
     /// The restored sandbox starts in `Ready` state immediately.
     ///
-    /// Returns `(sandbox_id, ip_address)`.
-    pub async fn restore_sandbox(&self, spec: RestoreSandboxSpec) -> Result<(SandboxId, String)> {
-        self.restore_sandbox_keyed(spec, &Uuid::new_v4().to_string())
+    /// Returns `(computer_id, ip_address)`.
+    pub async fn restore_computer(
+        &self,
+        spec: RestoreComputerSpec,
+    ) -> Result<(ComputerId, String)> {
+        self.restore_computer_keyed(spec, &Uuid::new_v4().to_string())
             .await
     }
 
     /// Restore with a stable request key for durable replay.
-    pub async fn restore_sandbox_keyed(
+    pub async fn restore_computer_keyed(
         &self,
-        spec: RestoreSandboxSpec,
+        spec: RestoreComputerSpec,
         restore_key: &str,
-    ) -> Result<(SandboxId, String)> {
-        let RestoreSandboxSpec {
+    ) -> Result<(ComputerId, String)> {
+        let RestoreComputerSpec {
             id,
             snapshot_id,
             labels,
@@ -119,7 +122,7 @@ impl SandboxManager {
             RestoreRequest {
                 snapshot_id,
                 network_override,
-                spec: SandboxSpec {
+                spec: ComputerSpec {
                     id,
                     labels,
                     ttl_seconds,
@@ -137,9 +140,9 @@ impl SandboxManager {
         &self,
         request: RestoreRequest,
         restore_key: &str,
-    ) -> Result<(SandboxId, String)> {
+    ) -> Result<(ComputerId, String)> {
         // Gate on the startup sweep before touching per-id resources (see
-        // create_sandbox / await_reconcile).
+        // create_computer / await_reconcile).
         self.await_reconcile().await?;
 
         let caller_supplied_id = request.spec.id.as_ref().is_some_and(|id| !id.is_empty());
@@ -150,7 +153,7 @@ impl SandboxManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        super::validate_new_sandbox_id(&new_id, &*self.services.driver, &self.config)?;
+        super::validate_new_computer_id(&new_id, &*self.services.driver, &self.config)?;
         // The snapshot id is caller-supplied and flows into snapshot dir paths
         // (create_dir_all / copy / remove_dir_all) — validate it too, or a
         // `../` id would traverse out of the snapshots directory.
@@ -174,14 +177,14 @@ impl SandboxManager {
         // cloning it with a fresh overlay would silently discard that disk
         // state. Resume is the only consumer (CORE-21).
         if snap_meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: request.snapshot_id.clone(),
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
             });
         }
         if self.config.firecracker.jailer.is_none() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin \
                  paths"
                     .into(),
@@ -208,16 +211,17 @@ impl SandboxManager {
         {
             ProvisionIntent::Created(record) | ProvisionIntent::Resume(record) => record,
             ProvisionIntent::Replay(record) => {
-                let outcome = record
-                    .provision_outcome
-                    .ok_or_else(|| VmmError::WrongState {
-                        id: new_id.clone(),
-                        expected: "a persisted restore outcome".into(),
-                        actual: "none".into(),
-                    })?;
+                let outcome =
+                    record
+                        .provision_outcome
+                        .ok_or_else(|| ComputerError::WrongState {
+                            id: new_id.clone(),
+                            expected: "a persisted restore outcome".into(),
+                            actual: "none".into(),
+                        })?;
                 return Ok((new_id, outcome.ip_address));
             }
-            ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(new_id)),
+            ProvisionIntent::Blocked(_) => return Err(ComputerError::AlreadyExists(new_id)),
         };
         let generation = record.generation;
         let deadlines = Deadlines {
@@ -245,7 +249,7 @@ impl SandboxManager {
                 .network
                 .reserve(
                     &VmId::new(new_id.as_str())?,
-                    super::sandbox_network_policy(),
+                    super::computer_network_policy(),
                 )
                 .await
             {
@@ -253,7 +257,7 @@ impl SandboxManager {
                 Err(error) => {
                     let abort = self.records.abort_provision(&new_id, generation)?;
                     if let Some(durability_error) = abort.durability_error {
-                        return Err(VmmError::Unavailable(format!(
+                        return Err(ComputerError::Unavailable(format!(
                             "{error}; restore rollback is visible, but durability is unconfirmed: {durability_error}"
                         )));
                     }
@@ -277,7 +281,7 @@ impl SandboxManager {
         let mut nic: Option<NicSpec> = None;
         let setup = async {
             super::reconcile::create_runtime_dir(&vm_dir)?;
-            let cleanup_record = super::reconcile::SandboxStateRecord::new(
+            let cleanup_record = super::reconcile::ComputerStateRecord::new(
                 &new_id,
                 None,
                 lease
@@ -300,7 +304,7 @@ impl SandboxManager {
                         .await?,
                 );
             }
-            Ok::<_, VmmError>(())
+            Ok::<_, ComputerError>(())
         }
         .await;
         if let Err(error) = setup {
@@ -320,7 +324,7 @@ impl SandboxManager {
             if unwound.is_empty() {
                 return Err(error);
             }
-            return Err(VmmError::Unavailable(format!(
+            return Err(ComputerError::Unavailable(format!(
                 "{error}; restore rollback incomplete: {}",
                 unwound.join("; ")
             )));
@@ -347,7 +351,7 @@ impl SandboxManager {
             })),
             seeded: Seeded::Fresh,
         });
-        let outcome = SandboxProvisionOutcome {
+        let outcome = ComputerProvisionOutcome {
             ip_address: ip_address.clone(),
         };
         // A restore's caller waits for READY: that is what makes the sandbox
@@ -373,8 +377,8 @@ impl SandboxManager {
     /// user-owned snapshots, and deleting one would strand a paused sandbox.
     /// Template-owned snapshots (CORE-107) are hidden for the same reason —
     /// they surface via `TemplateService.Get/List`, not as user checkpoints.
-    pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
-        let infos = match sandbox_id {
+    pub fn list_checkpoints(&self, computer_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
+        let infos = match computer_id {
             Some(sid) => self.snapshots.list(sid)?,
             None => self.snapshots.list_all()?,
         };
@@ -387,7 +391,7 @@ impl SandboxManager {
             })
             .map(|s| CheckpointSummary {
                 id: s.id,
-                sandbox_id: s.vm_id,
+                computer_id: s.vm_id,
                 name: s.name.unwrap_or_default(),
                 labels: s.labels,
                 snapshot_dir: s
@@ -414,7 +418,7 @@ impl SandboxManager {
     pub async fn delete_checkpoint(&self, snapshot_id: &str) -> Result<()> {
         let meta = self.snapshots.find_by_id(snapshot_id)?;
         if meta.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::WrongState {
+            return Err(ComputerError::WrongState {
                 id: snapshot_id.to_owned(),
                 expected: "a user checkpoint".into(),
                 actual: "the internal pause checkpoint of a paused sandbox".into(),
@@ -425,7 +429,7 @@ impl SandboxManager {
         if let Some(owner) = meta.labels.get(crate::template_catalog::TEMPLATE_LABEL)
             && self.templates.references_snapshot(snapshot_id)?
         {
-            return Err(VmmError::FailedPrecondition(format!(
+            return Err(ComputerError::FailedPrecondition(format!(
                 "snapshot {snapshot_id} is owned by template {owner}; delete the template instead"
             )));
         }

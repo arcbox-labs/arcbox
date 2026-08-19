@@ -14,7 +14,7 @@
 //!   writes — which is why restoring *from* a pause checkpoint is refused.
 //!
 //! Resume mirrors the fresh-network restore path: a new TAP + IP is
-//! allocated (`RestoreSandboxSpec::network_override` semantics) and the
+//! allocated (`RestoreComputerSpec::network_override` semantics) and the
 //! sandbox returns to `Ready` under its original id. The old allocation was
 //! quarantined at pause time and its host forwarding state cleaned via the
 //! same durable ticket flow Stop uses. Whether the guest needs re-addressing
@@ -53,16 +53,16 @@ pub mod reason {
     pub const AUTO_RESUME: &str = "auto_resume";
 }
 
-/// Delete every internal pause checkpoint of `sandbox_id`.
+/// Delete every internal pause checkpoint of `computer_id`.
 ///
 /// Scans by the reserved name rather than the recorded snapshot id so a
 /// checkpoint leaked by an interrupted pause (committed to the catalog but
 /// never recorded durably) is cleaned up too.
 pub fn delete_pause_snapshots(
     snapshots: &crate::snapshot::SnapshotCatalog,
-    sandbox_id: &str,
+    computer_id: &str,
 ) -> Result<()> {
-    for info in snapshots.list(sandbox_id)? {
+    for info in snapshots.list(computer_id)? {
         if info.name.as_deref() == Some(PAUSE_SNAPSHOT_NAME) {
             snapshots.delete_by_id(&info.id)?;
         }
@@ -84,14 +84,14 @@ pub struct ResumedRuntime {
 
 /// How a failed resume left the sandbox.
 pub struct ResumeFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     /// True when every re-created resource was released again and the
     /// retained pause state (checkpoint + disk) is intact — the sandbox can
     /// go back to `Paused` and a retry can succeed.
     pub unwound: bool,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Pause a `Ready` sandbox: checkpoint it, then release its runtime
     /// resources while keeping the record, checkpoint, and disk overlay
     /// under the same id.
@@ -99,16 +99,16 @@ impl SandboxManager {
     /// Idempotent: pausing a `Paused` sandbox is a no-op. Any other state
     /// answers `WrongState` — an active execution must finish (or be
     /// stopped) first, matching the contract's "requires READY".
-    pub async fn pause_sandbox(&self, id: &SandboxId) -> Result<()> {
-        self.pause_sandbox_with_reason(id, PauseReason::Requested)
+    pub async fn pause_computer(&self, id: &ComputerId) -> Result<()> {
+        self.pause_computer_with_reason(id, PauseReason::Requested)
             .await
     }
 
-    /// [`Self::pause_sandbox`] with an explicit PAUSING-event reason —
+    /// [`Self::pause_computer`] with an explicit PAUSING-event reason —
     /// the idle detector reports `idle_timeout` (see [`reason`]).
-    pub(super) async fn pause_sandbox_with_reason(
+    pub(super) async fn pause_computer_with_reason(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         reason: PauseReason,
     ) -> Result<()> {
         self.await_reconcile().await?;
@@ -118,10 +118,10 @@ impl SandboxManager {
         // off the snapshot rather than left to the flow, because it is a
         // refusal the caller gets *instead* of the claim: only a computer
         // that would otherwise be paused hears it, exactly as today.
-        if computer.snapshot.borrow().state == SandboxState::Ready
+        if computer.snapshot.borrow().state == ComputerState::Ready
             && self.config.firecracker.jailer.is_none()
         {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "sandbox pause requires jailer isolation; direct mode cannot resume".into(),
             ));
         }
@@ -140,7 +140,7 @@ impl SandboxManager {
     /// "reason" attribute (see [`reason`]).
     ///
     /// Returns the sandbox's (fresh) IP address, empty without networking.
-    pub async fn resume_sandbox(&self, id: &SandboxId, resume_reason: &str) -> Result<String> {
+    pub async fn resume_computer(&self, id: &ComputerId, resume_reason: &str) -> Result<String> {
         self.await_reconcile().await?;
         let computer = self.computer(id)?;
         computer
@@ -170,7 +170,7 @@ impl SandboxManager {
 /// borrows the actor's `watch` and the sizing must not.
 pub(super) fn paused_artifacts(
     config: &RuntimeConfig,
-    id: &SandboxId,
+    id: &ComputerId,
     snapshot: &ComputerSnapshot,
 ) -> PausedArtifacts {
     PausedArtifacts {

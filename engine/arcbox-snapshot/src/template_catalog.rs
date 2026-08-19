@@ -190,7 +190,7 @@ pub struct PublishOutcome {
 /// Snapshot ids released by a catalog mutation.
 ///
 /// Owned by removed entries and referenced by no remaining entry anywhere in
-/// the catalog. The caller (`SandboxManager`) deletes them from the snapshot
+/// the catalog. The caller (`ComputerManager`) deletes them from the snapshot
 /// catalog — the catalog itself never touches artifacts.
 #[derive(Debug, Default)]
 pub struct ReleasedArtifacts {

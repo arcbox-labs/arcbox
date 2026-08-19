@@ -24,7 +24,7 @@
 
 use super::*;
 
-impl SandboxManager {
+impl ComputerManager {
     /// Replace a computer's lifecycle deadlines (CORE-60).
     ///
     /// `ttl_seconds` re-arms the hard cap from *now* (0 removes it);
@@ -32,9 +32,9 @@ impl SandboxManager {
     /// timer; `on_idle` replaces the policy. `None` fields are unchanged.
     /// Allowed in any non-terminal state — a paused computer keeps honoring
     /// its (re-armed) TTL, and new idle knobs apply on the next `Ready`.
-    pub async fn set_sandbox_lifecycle(
+    pub async fn set_computer_lifecycle(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         update: LifecycleUpdate,
     ) -> Result<()> {
         self.await_reconcile().await?;
@@ -50,7 +50,7 @@ impl SandboxManager {
             .await?;
         let deadlines = computer.snapshot.borrow().deadlines;
         info!(
-            sandbox_id = %id,
+            computer_id = %id,
             ttl_deadline = ?deadlines.ttl,
             idle_timeout_seconds = deadlines.idle_timeout_seconds,
             on_idle = ?deadlines.on_idle,

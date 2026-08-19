@@ -1,8 +1,8 @@
 use thiserror::Error;
 
-/// Core VMM error type.
+/// This runtime's error type.
 #[derive(Debug, Error)]
-pub enum VmmError {
+pub enum ComputerError {
     /// The requested VM was not found.
     #[error("VM not found: {0}")]
     NotFound(String),
@@ -113,7 +113,7 @@ pub enum VmmError {
 
     /// The operation's side effects committed — the sandbox exists and is
     /// running — but the acknowledging record's durability is unconfirmed.
-    /// Distinct from [`VmmError::Unavailable`] so callers with a fallback
+    /// Distinct from [`ComputerError::Unavailable`] so callers with a fallback
     /// (warm create) can tell "nothing happened, retry freely" from "it
     /// happened, do NOT re-execute".
     #[error("sandbox {id} committed, but ACK durability is unconfirmed: {detail}")]
@@ -140,13 +140,13 @@ pub enum VmmError {
 }
 
 /// Convenience alias.
-pub type Result<T> = std::result::Result<T, VmmError>;
+pub type Result<T> = std::result::Result<T, ComputerError>;
 
 /// Variant-for-variant, so a snapshot or template failure keeps the exact
 /// shape callers already match on — the daemon maps `TemplateNotFound`
 /// and `TemplateVersionExists` onto their own wire codes, and folding
 /// either into a generic error would change the surface.
-impl From<arcbox_snapshot::SnapshotError> for VmmError {
+impl From<arcbox_snapshot::SnapshotError> for ComputerError {
     fn from(err: arcbox_snapshot::SnapshotError) -> Self {
         use arcbox_error::CommonError;
         use arcbox_snapshot::SnapshotError as S;
@@ -168,13 +168,13 @@ impl From<arcbox_snapshot::SnapshotError> for VmmError {
 
 /// Variant-for-variant where a native shape exists, so a driver-reported
 /// `NotFound` or `WrongState` keeps the wire code the equivalent native
-/// error already has (the guest agent classifies `VmmError` by variant;
+/// error already has (the guest agent classifies `ComputerError` by variant;
 /// anything it does not know becomes a 500), and so do the guest
 /// network's two protocol answers — retry-later and failed precondition,
 /// the 503 and 412 of the cleanup-token protocol. What has no native
 /// shape — an adapter fault, a checkpoint another driver wrote — stays
-/// [`VmmError::Driver`] with the port error intact for its `source` chain.
-impl From<arcbox_vm_driver::Error> for VmmError {
+/// [`ComputerError::Driver`] with the port error intact for its `source` chain.
+impl From<arcbox_vm_driver::Error> for ComputerError {
     fn from(err: arcbox_vm_driver::Error) -> Self {
         use arcbox_vm_driver::Error as D;
         match err {
@@ -203,13 +203,13 @@ impl From<arcbox_vm_driver::Error> for VmmError {
 }
 
 /// A durable write that never landed is an I/O failure; one that landed
-/// without a confirmed rename is [`VmmError::Unavailable`] — the caller
+/// without a confirmed rename is [`ComputerError::Unavailable`] — the caller
 /// may retry, and the retry is safe because the write is idempotent.
 ///
 /// Callers that can do better than this (the sandbox record store keeps
 /// the record and warns) match on [`AtomicWriteError`] themselves instead
 /// of going through here.
-impl From<arcbox_atomic_file::AtomicWriteError> for VmmError {
+impl From<arcbox_atomic_file::AtomicWriteError> for ComputerError {
     fn from(err: arcbox_atomic_file::AtomicWriteError) -> Self {
         use arcbox_atomic_file::AtomicWriteError;
         match err {
@@ -227,19 +227,19 @@ mod tests {
 
     #[test]
     fn test_not_found_display() {
-        let e = VmmError::NotFound("vm-123".into());
+        let e = ComputerError::NotFound("vm-123".into());
         assert_eq!(e.to_string(), "VM not found: vm-123");
     }
 
     #[test]
     fn test_already_exists_display() {
-        let e = VmmError::AlreadyExists("my-vm".into());
+        let e = ComputerError::AlreadyExists("my-vm".into());
         assert_eq!(e.to_string(), "VM already exists: my-vm");
     }
 
     #[test]
     fn test_wrong_state_display() {
-        let e = VmmError::WrongState {
+        let e = ComputerError::WrongState {
             id: "vm-1".into(),
             expected: "running".into(),
             actual: "stopped".into(),
@@ -253,14 +253,14 @@ mod tests {
     #[test]
     fn test_from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let vmm_err = VmmError::from(io_err);
-        assert!(matches!(vmm_err, VmmError::Io(_)));
-        assert!(vmm_err.to_string().contains("I/O error"));
+        let err = ComputerError::from(io_err);
+        assert!(matches!(err, ComputerError::Io(_)));
+        assert!(err.to_string().contains("I/O error"));
     }
 
     #[test]
     fn test_network_error_display() {
-        let e = VmmError::Network("TAP creation failed".into());
+        let e = ComputerError::Network("TAP creation failed".into());
         assert_eq!(e.to_string(), "network error: TAP creation failed");
     }
 
@@ -272,14 +272,14 @@ mod tests {
     fn the_ports_cleanup_answers_keep_their_classification() {
         use arcbox_vm_driver::Error as D;
 
-        let retry = VmmError::from(D::Unavailable("startup cleanup pending".into()));
+        let retry = ComputerError::from(D::Unavailable("startup cleanup pending".into()));
         assert!(
-            matches!(&retry, VmmError::Unavailable(m) if m == "startup cleanup pending"),
+            matches!(&retry, ComputerError::Unavailable(m) if m == "startup cleanup pending"),
             "{retry}"
         );
-        let mismatch = VmmError::from(D::PreconditionFailed("token b is not token a".into()));
+        let mismatch = ComputerError::from(D::PreconditionFailed("token b is not token a".into()));
         assert!(
-            matches!(&mismatch, VmmError::FailedPrecondition(m) if m == "token b is not token a"),
+            matches!(&mismatch, ComputerError::FailedPrecondition(m) if m == "token b is not token a"),
             "{mismatch}"
         );
     }

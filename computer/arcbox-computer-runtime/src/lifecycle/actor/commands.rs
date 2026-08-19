@@ -45,7 +45,7 @@ impl ComputerActor {
                 } else {
                     // Pausing a paused computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        SandboxState::Paused => Ok(()),
+                        ComputerState::Paused => Ok(()),
                         _ => Err(self.wrong_state("Ready")),
                     });
                 }
@@ -57,7 +57,7 @@ impl ComputerActor {
                 } else {
                     // Resuming a live computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        SandboxState::Ready | SandboxState::Running => Ok(()),
+                        ComputerState::Ready | ComputerState::Running => Ok(()),
                         _ => Err(self.wrong_state("Paused")),
                     });
                 }
@@ -70,7 +70,7 @@ impl ComputerActor {
                 }
                 // A stop asked for during a launch is deferred until the
                 // launch resolves, rather than refused as today's
-                // `stop_sandbox` does: the alternative is a stop racing a
+                // `stop_computer` does: the alternative is a stop racing a
                 // boot that is still acquiring resources.
                 if launching(*machine.state()) {
                     self.pending_stop.get_or_insert(budget);
@@ -78,13 +78,13 @@ impl ComputerActor {
                     return;
                 }
                 match self.public() {
-                    SandboxState::Stopping => self.park(Answer::Stopped, reply),
-                    // `stop_sandbox`'s retry. A `Stopped` write that was
+                    ComputerState::Stopping => self.park(Answer::Stopped, reply),
+                    // `stop_computer`'s retry. A `Stopped` write that was
                     // visible but not confirmed kept the crash journal, and
                     // a second stop is the only thing that finishes it —
                     // answering `Ok` would leave a journal naming resources
                     // that are already gone for the next startup sweep.
-                    SandboxState::Stopped => {
+                    ComputerState::Stopped => {
                         let _ = reply.send(self.finish_stop());
                     }
                     _ => {
@@ -106,7 +106,7 @@ impl ComputerActor {
                     // release that failed, a panicked sub-task — is re-driven
                     // instead: `removing` swallows the retry, so nothing else
                     // would ever answer it, and a retried
-                    // `remove_sandbox_impl` re-runs the teardown today.
+                    // `remove_computer_impl` re-runs the teardown today.
                     State::Removing {} => {
                         if self.inflight.is_none() && self.retry.is_none() {
                             self.restart_teardown(*machine.state()).await;
@@ -160,12 +160,12 @@ impl ComputerActor {
                 self.dispatch(machine, Event::WorkloadReleased).await;
             }
             Command::SetLifecycle { update, reply } => {
-                // `set_sandbox_lifecycle` refuses a computer on its way out:
+                // `set_computer_lifecycle` refuses a computer on its way out:
                 // nothing is left for a deadline to fire on, and the record
                 // it would persist to is about to be a tombstone.
                 if matches!(
                     self.public(),
-                    SandboxState::Stopping | SandboxState::Stopped | SandboxState::Failed
+                    ComputerState::Stopping | ComputerState::Stopped | ComputerState::Failed
                 ) {
                     let _ = reply.send(Err(
                         self.wrong_state("a live computer (not stopping, stopped, or failed)")
@@ -194,7 +194,7 @@ impl ComputerActor {
                 }
                 // The timers live in this task; the record is what a restart
                 // re-arms them from, so an acknowledged change has to be on
-                // disk as well (`set_sandbox_lifecycle` today).
+                // disk as well (`set_computer_lifecycle` today).
                 let persisted = self.persist_lifecycle();
                 self.rearm(*machine.state());
                 // `Inspect` reports the deadlines, so the read view has to
@@ -217,7 +217,7 @@ impl ComputerActor {
             return Ok(());
         };
         self.records
-            .transition(&self.id, generation, SandboxTransition::Stopped)?
+            .transition(&self.id, generation, ComputerTransition::Stopped)?
             .confirmed("computer stop retry")?;
         // The write just confirmed, so whatever blocked the first clear is
         // answered.
@@ -232,7 +232,7 @@ impl ComputerActor {
     fn park(&mut self, answer: Answer, reply: Reply) {
         match self.answer_error.take() {
             Some(detail) => {
-                let _ = reply.send(Err(VmmError::Unavailable(detail)));
+                let _ = reply.send(Err(ComputerError::Unavailable(detail)));
             }
             None => self.waiters.push((answer, reply)),
         }
@@ -247,8 +247,8 @@ impl ComputerActor {
                 let _ = reply.send(match (&failed, &unconfirmed) {
                     // The flow reached its answer, but a step of it failed
                     // loudly on the way; the caller hears that first.
-                    (Some(detail), _) => Err(VmmError::Unavailable(detail.clone())),
-                    (None, Some(detail)) => Err(VmmError::AckUnconfirmed {
+                    (Some(detail), _) => Err(ComputerError::Unavailable(detail.clone())),
+                    (None, Some(detail)) => Err(ComputerError::AckUnconfirmed {
                         id: self.id.clone(),
                         detail: detail.clone(),
                     }),
@@ -266,10 +266,10 @@ impl ComputerActor {
     /// unconfirmed one it left behind.
     fn acknowledged(&mut self) -> Result<()> {
         if let Some(detail) = self.answer_error.take() {
-            return Err(VmmError::Unavailable(detail));
+            return Err(ComputerError::Unavailable(detail));
         }
         match self.unconfirmed.take() {
-            Some(detail) => Err(VmmError::AckUnconfirmed {
+            Some(detail) => Err(ComputerError::AckUnconfirmed {
                 id: self.id.clone(),
                 detail,
             }),
@@ -283,19 +283,19 @@ impl ComputerActor {
     /// A parked `Remove` is the exception: a failure elsewhere is what starts
     /// its teardown, so the removal is what answers it. The removal's own
     /// release failure is [`Self::fail_every_waiter`].
-    pub(super) fn fail_waiters(&mut self, error: VmmError) -> usize {
+    pub(super) fn fail_waiters(&mut self, error: ComputerError) -> usize {
         self.fail_parked(error, false)
     }
 
     /// [`Self::fail_waiters`], including the parked removals — for the one
     /// failure no later answer can reach, a removal's own release.
-    pub(super) fn fail_every_waiter(&mut self, error: VmmError) -> usize {
+    pub(super) fn fail_every_waiter(&mut self, error: ComputerError) -> usize {
         self.fail_parked(error, true)
     }
 
     /// The typed error goes to the first caller; further ones (coalesced
     /// verbs) get its text, since an error is not `Clone`.
-    fn fail_parked(&mut self, error: VmmError, removals_too: bool) -> usize {
+    fn fail_parked(&mut self, error: ComputerError, removals_too: bool) -> usize {
         let text = error.to_string();
         let mut typed = Some(error);
         let mut answered = 0;
@@ -307,15 +307,15 @@ impl ComputerActor {
                 answered += 1;
                 let _ = reply.send(Err(typed
                     .take()
-                    .unwrap_or_else(|| VmmError::Other(text.clone()))));
+                    .unwrap_or_else(|| ComputerError::Other(text.clone()))));
             }
         }
         self.waiters = remaining;
         answered
     }
 
-    fn wrong_state(&self, expected: &str) -> VmmError {
-        VmmError::WrongState {
+    fn wrong_state(&self, expected: &str) -> ComputerError {
+        ComputerError::WrongState {
             id: self.id.clone(),
             expected: expected.to_owned(),
             actual: self.public().to_string(),

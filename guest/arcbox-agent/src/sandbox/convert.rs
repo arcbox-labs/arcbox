@@ -6,8 +6,8 @@ use arcbox_computer_runtime::template_catalog::{
     ReadyProbeSpec, TemplateDefaultsSpec, TemplateEntry,
 };
 use arcbox_computer_runtime::{
-    CheckpointInfo, CheckpointSummary, ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction,
-    SandboxEvent as VmSandboxEvent, SandboxInfo, SandboxState, SandboxSummary, StdinState,
+    CheckpointInfo, CheckpointSummary, ComputerEvent, ComputerInfo, ComputerState, ComputerSummary,
+    ExecutionChannel, ExecutionSnapshot, ExitStatus, IdleAction, StdinState,
 };
 use arcbox_connect::sandbox_v1;
 use buffa_types::google::protobuf::Timestamp;
@@ -69,7 +69,7 @@ pub(super) fn execution_to_proto(snap: &ExecutionSnapshot) -> sandbox_v1::Execut
     };
     sandbox_v1::Execution {
         id: snap.id.clone(),
-        sandbox_id: snap.sandbox_id.clone(),
+        sandbox_id: snap.computer_id.clone(),
         state: state.into(),
         tty: snap.tty,
         started_at: timestamp(snap.started_at).into(),
@@ -140,16 +140,16 @@ pub(super) fn channel_to_proto(channel: ExecutionChannel, tty: bool) -> sandbox_
     }
 }
 
-pub(super) fn state_to_proto(state: SandboxState) -> sandbox_v1::SandboxState {
+pub(super) fn state_to_proto(state: ComputerState) -> sandbox_v1::SandboxState {
     match state {
-        SandboxState::Starting => sandbox_v1::SandboxState::Starting,
-        SandboxState::Ready => sandbox_v1::SandboxState::Ready,
-        SandboxState::Running => sandbox_v1::SandboxState::Running,
-        SandboxState::Stopping => sandbox_v1::SandboxState::Stopping,
-        SandboxState::Stopped => sandbox_v1::SandboxState::Stopped,
-        SandboxState::Failed => sandbox_v1::SandboxState::Failed,
-        SandboxState::Pausing => sandbox_v1::SandboxState::Pausing,
-        SandboxState::Paused => sandbox_v1::SandboxState::Paused,
+        ComputerState::Starting => sandbox_v1::SandboxState::Starting,
+        ComputerState::Ready => sandbox_v1::SandboxState::Ready,
+        ComputerState::Running => sandbox_v1::SandboxState::Running,
+        ComputerState::Stopping => sandbox_v1::SandboxState::Stopping,
+        ComputerState::Stopped => sandbox_v1::SandboxState::Stopped,
+        ComputerState::Failed => sandbox_v1::SandboxState::Failed,
+        ComputerState::Pausing => sandbox_v1::SandboxState::Pausing,
+        ComputerState::Paused => sandbox_v1::SandboxState::Paused,
     }
 }
 
@@ -187,9 +187,9 @@ pub(super) fn event_kind(action: &str) -> sandbox_v1::SandboxEventKind {
     }
 }
 
-pub(super) fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
+pub(super) fn vm_event_to_proto(e: ComputerEvent) -> sandbox_v1::SandboxEvent {
     sandbox_v1::SandboxEvent {
-        sandbox_id: e.sandbox_id,
+        sandbox_id: e.computer_id,
         kind: event_kind(&e.action).into(),
         time: timestamp_from_unix_nanos(e.timestamp_ns).into(),
         attributes: e.attributes.into_iter().collect(),
@@ -197,7 +197,7 @@ pub(super) fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
     }
 }
 
-pub(super) fn info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
+pub(super) fn info_to_proto(info: ComputerInfo) -> sandbox_v1::SandboxInfo {
     // The host TAP name is deliberately not exposed (CORE-54): it is a host
     // interface a tenant can neither see nor use.
     let network = info.network.map(|n| sandbox_v1::SandboxNetwork {
@@ -238,7 +238,7 @@ pub(super) fn idle_action_to_proto(action: IdleAction) -> sandbox_v1::IdleAction
     }
 }
 
-pub(super) fn summary_to_proto(s: SandboxSummary) -> sandbox_v1::SandboxSummary {
+pub(super) fn summary_to_proto(s: ComputerSummary) -> sandbox_v1::SandboxSummary {
     sandbox_v1::SandboxSummary {
         id: s.id,
         state: state_to_proto(s.state).into(),
@@ -265,7 +265,7 @@ pub(super) fn checkpoint_to_proto(info: CheckpointInfo) -> sandbox_v1::Checkpoin
 pub(super) fn checkpoint_summary_to_proto(s: CheckpointSummary) -> sandbox_v1::SnapshotSummary {
     sandbox_v1::SnapshotSummary {
         id: s.id,
-        sandbox_id: s.sandbox_id,
+        sandbox_id: s.computer_id,
         name: s.name,
         labels: s.labels.into_iter().collect(),
         created_at: timestamp_from_rfc3339(&s.created_at).into(),

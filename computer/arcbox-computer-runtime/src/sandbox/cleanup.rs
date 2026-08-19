@@ -1,6 +1,6 @@
 //! What is left of the manager's teardown once the computer's actor owns it.
 //!
-//! `remove_sandbox_impl` and its parts — the busy gate, the bounded wait on a
+//! `remove_computer_impl` and its parts — the busy gate, the bounded wait on a
 //! boot's resource handoff, the epoch-stamped expiry retry, the `Arc::ptr_eq`
 //! generation guard — are the actor's now: `Effect::AbortInflight` plus the
 //! machine's remove arms, tested in `crate::lifecycle::tests`. The release
@@ -46,7 +46,7 @@ mod tests {
             .into_owned();
         let cow_probe = Arc::new(CowTestProbe::default());
         let driver = FakeDriver::new();
-        let manager = SandboxManager::new(
+        let manager = ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: Arc::new(driver.clone()),
@@ -65,10 +65,10 @@ mod tests {
 
         let boot_parked = driver.park_next_boot();
         let (id, _) = manager
-            .create_sandbox_keyed(
-                SandboxSpec {
+            .create_computer_keyed(
+                ComputerSpec {
                     id: Some("job".into()),
-                    network: SandboxNetworkSpec {
+                    network: ComputerNetworkSpec {
                         mode: "none".into(),
                     },
                     ..Default::default()
@@ -92,7 +92,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(vm_dir.join("state.json")).unwrap()).unwrap();
         assert!(state["pid"].as_u64().is_some(), "the vmm pid is journalled");
 
-        tokio::time::timeout(Duration::from_secs(5), manager.remove_sandbox(&id, true))
+        tokio::time::timeout(Duration::from_secs(5), manager.remove_computer(&id, true))
             .await
             .expect("force removal must cancel the parked boot")
             .unwrap();

@@ -28,7 +28,7 @@
 //!
 //! # Public API
 //!
-//! - [`SandboxManager`] — top-level sandbox orchestrator
+//! - [`ComputerManager`] — top-level computer orchestrator
 //! - [`NodeEnvironment`] — the four environment-specific components a
 //!   composer supplies, all required: the VM driver, the guest network,
 //!   the guest-agent factory, and the copy-on-write rootfs manager
@@ -37,8 +37,8 @@
 //!   `arcbox-vm-proto` vsock client as its one implementation
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
-//! - [`SandboxState`] — a computer's public lifecycle state
-//! - [`RuntimeConfig`] / [`SandboxSpec`] — configuration types
+//! - [`ComputerState`] — a computer's public lifecycle state
+//! - [`RuntimeConfig`] / [`ComputerSpec`] — configuration types
 //!
 //! This crate names no VMM and no network implementation. Sandboxes reach
 //! both only through `arcbox-vm-driver`'s ports, and the composer supplies
@@ -73,15 +73,15 @@ pub use arcbox_vm_proto::file as file_proto;
 pub use arcbox_snapshot::{snapshot, snapshot_cow, template_catalog};
 
 pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
-pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
+pub use config::{ComputerConfig, DefaultVmConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
 pub use environment::NodeEnvironment;
-pub use error::{Result, VmmError};
+pub use error::{ComputerError, Result};
 pub use rootfs::{RootfsBuilder, RootfsPaths};
 pub use sandbox::pause_reason;
 pub use sandbox::{
-    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
-    SandboxEvent, SandboxId, SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkIdentity,
-    SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, ComputerEvent, ComputerId, ComputerInfo, ComputerManager,
+    ComputerMountSpec, ComputerNetworkIdentity, ComputerNetworkInfo, ComputerNetworkSpec,
+    ComputerSpec, ComputerState, ComputerSummary, IdleAction, LifecycleUpdate, RestoreComputerSpec,
     TemplateWarmRef,
 };
 pub use sandbox::{

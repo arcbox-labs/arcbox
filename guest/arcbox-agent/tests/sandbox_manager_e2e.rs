@@ -46,8 +46,8 @@ use std::time::Duration;
 use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxEvent,
-    SandboxManager, SandboxNetworkSpec, SandboxSpec, SandboxState,
+    ComputerConfig, ComputerEvent, ComputerManager, ComputerNetworkSpec, ComputerSpec,
+    ComputerState, DefaultVmConfig, GrpcConfig, NetworkConfig, RuntimeConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ fn try_config(data_dir: &str) -> Option<GuestConfig> {
     let kernel = std::env::var("FC_KERNEL").ok()?;
     let rootfs = std::env::var("FC_ROOTFS").ok()?;
     let runtime = RuntimeConfig {
-        firecracker: FirecrackerConfig {
+        firecracker: ComputerConfig {
             jailer: None,
             data_dir: data_dir.to_owned(),
             // Direct mode cannot restore (and so never pools); keep the
@@ -104,10 +104,10 @@ fn try_config(data_dir: &str) -> Option<GuestConfig> {
     })
 }
 
-/// Return a SandboxSpec with networking disabled (no TAP, no root required).
-fn no_tap() -> SandboxSpec {
-    SandboxSpec {
-        network: SandboxNetworkSpec {
+/// Return a ComputerSpec with networking disabled (no TAP, no root required).
+fn no_tap() -> ComputerSpec {
+    ComputerSpec {
+        network: ComputerNetworkSpec {
             mode: "none".into(),
         },
         ..Default::default()
@@ -116,14 +116,14 @@ fn no_tap() -> SandboxSpec {
 
 /// A manager over the environment `SandboxService::new` composes: this
 /// suite exercises the real composition rather than one of its own.
-fn manager(cfg: GuestConfig) -> SandboxManager {
+fn manager(cfg: GuestConfig) -> ComputerManager {
     let environment = node_environment(&cfg, block_tools()).unwrap();
-    SandboxManager::new(cfg.runtime, environment).unwrap()
+    ComputerManager::new(cfg.runtime, environment).unwrap()
 }
 
 /// Complete the startup cleanup handshake for a manager backed by a fresh
 /// test directory, where no stale host resources exist.
-async fn finalize_startup_cleanup(mgr: &SandboxManager) {
+async fn finalize_startup_cleanup(mgr: &ComputerManager) {
     let token = mgr
         .startup_cleanup_token()
         .await
@@ -136,14 +136,14 @@ async fn finalize_startup_cleanup(mgr: &SandboxManager) {
 /// or until a `"failed"` event for `id` is received, or a 30-second timeout
 /// expires.  Returns `true` on success.
 async fn wait_for_event(
-    rx: &mut tokio::sync::broadcast::Receiver<SandboxEvent>,
+    rx: &mut tokio::sync::broadcast::Receiver<ComputerEvent>,
     id: &str,
     action: &str,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Ok(ev)) if ev.sandbox_id == id => {
+            Ok(Ok(ev)) if ev.computer_id == id => {
                 if ev.action == action {
                     return true;
                 }
@@ -181,22 +181,22 @@ async fn e2e_sandbox_basic_lifecycle() {
     let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
-    let (id, _ip) = mgr.create_sandbox(no_tap()).await.unwrap();
+    let (id, _ip) = mgr.create_computer(no_tap()).await.unwrap();
     assert!(
         wait_for_event(&mut events, &id, "ready").await,
         "sandbox did not reach ready state"
     );
 
-    let info = mgr.inspect_sandbox(&id).unwrap();
-    assert_eq!(info.state, SandboxState::Ready);
+    let info = mgr.inspect_computer(&id).unwrap();
+    assert_eq!(info.state, ComputerState::Ready);
 
-    mgr.stop_sandbox(&id, 5).await.unwrap();
-    let info = mgr.inspect_sandbox(&id).unwrap();
-    assert_eq!(info.state, SandboxState::Stopped);
+    mgr.stop_computer(&id, 5).await.unwrap();
+    let info = mgr.inspect_computer(&id).unwrap();
+    assert_eq!(info.state, ComputerState::Stopped);
 
-    mgr.remove_sandbox(&id, true).await.unwrap();
+    mgr.remove_computer(&id, true).await.unwrap();
     assert!(
-        mgr.inspect_sandbox(&id).is_err(),
+        mgr.inspect_computer(&id).is_err(),
         "sandbox should be gone after remove"
     );
 }
@@ -215,13 +215,13 @@ async fn e2e_event_broadcast_ready() {
     let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
-    let (id, _) = mgr.create_sandbox(no_tap()).await.unwrap();
+    let (id, _) = mgr.create_computer(no_tap()).await.unwrap();
     assert!(
         wait_for_event(&mut events, &id, "ready").await,
         "expected ready event for sandbox {id}"
     );
 
-    mgr.remove_sandbox(&id, true).await.unwrap();
+    mgr.remove_computer(&id, true).await.unwrap();
 }
 
 /// Create two sandboxes with TAP networking and verify they receive distinct
@@ -247,8 +247,8 @@ async fn e2e_two_sandboxes_distinct_ips() {
     let mut ev1 = mgr.subscribe_events();
     let mut ev2 = mgr.subscribe_events();
 
-    let (id1, ip1) = mgr.create_sandbox(Default::default()).await.unwrap();
-    let (id2, ip2) = mgr.create_sandbox(Default::default()).await.unwrap();
+    let (id1, ip1) = mgr.create_computer(Default::default()).await.unwrap();
+    let (id2, ip2) = mgr.create_computer(Default::default()).await.unwrap();
 
     assert_ne!(ip1, ip2, "sandboxes must receive distinct IP addresses");
 
@@ -261,12 +261,12 @@ async fn e2e_two_sandboxes_distinct_ips() {
         "sandbox 2 did not reach ready"
     );
 
-    mgr.remove_sandbox(&id1, true).await.unwrap();
-    mgr.remove_sandbox(&id2, true).await.unwrap();
+    mgr.remove_computer(&id1, true).await.unwrap();
+    mgr.remove_computer(&id2, true).await.unwrap();
 }
 
 /// Create a sandbox with TAP networking, verify the TAP interface exists while
-/// it is running, then verify it is removed after `remove_sandbox`.
+/// it is running, then verify it is removed after `remove_computer`.
 /// Requires root.
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and root"]
@@ -286,7 +286,7 @@ async fn e2e_sandbox_with_tap_network() {
     finalize_startup_cleanup(&mgr).await;
     let mut events = mgr.subscribe_events();
 
-    let (id, ip) = mgr.create_sandbox(Default::default()).await.unwrap();
+    let (id, ip) = mgr.create_computer(Default::default()).await.unwrap();
     assert!(!ip.is_empty(), "tap mode should assign an IP address");
     assert!(
         wait_for_event(&mut events, &id, "ready").await,
@@ -294,7 +294,7 @@ async fn e2e_sandbox_with_tap_network() {
     );
 
     let tap_name = {
-        let info = mgr.inspect_sandbox(&id).unwrap();
+        let info = mgr.inspect_computer(&id).unwrap();
         let net = info.network.expect("tap mode should populate network info");
         // The host interface is deliberately not part of the sandbox API
         // (CORE-54); this test owns the host, so it derives the name the
@@ -312,7 +312,7 @@ async fn e2e_sandbox_with_tap_network() {
         tap_name
     };
 
-    mgr.remove_sandbox(&id, true).await.unwrap();
+    mgr.remove_computer(&id, true).await.unwrap();
 
     assert!(
         !common::iface_exists(&tap_name),
@@ -336,14 +336,14 @@ async fn e2e_run_command() {
     let mgr = manager(cfg);
     let mut events = mgr.subscribe_events();
 
-    let (id, _) = mgr.create_sandbox(no_tap()).await.unwrap();
+    let (id, _) = mgr.create_computer(no_tap()).await.unwrap();
     assert!(
         wait_for_event(&mut events, &id, "ready").await,
         "sandbox did not reach ready"
     );
 
     let mut rx = mgr
-        .run_in_sandbox(
+        .run_in_computer(
             &id,
             vec!["echo".into(), "hello from vm".into()],
             HashMap::new(),
@@ -377,7 +377,7 @@ async fn e2e_run_command() {
     );
     assert_eq!(exit_code, 0, "echo should exit with code 0");
 
-    mgr.remove_sandbox(&id, true).await.unwrap();
+    mgr.remove_computer(&id, true).await.unwrap();
 }
 
 /// The VMM pid the sandbox's crash journal names, so the test can prove a
@@ -454,7 +454,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
         let mgr = manager(cfg);
         finalize_startup_cleanup(&mgr).await;
         let mut events = mgr.subscribe_events();
-        let (id, ip) = mgr.create_sandbox(SandboxSpec::default()).await.unwrap();
+        let (id, ip) = mgr.create_computer(ComputerSpec::default()).await.unwrap();
         assert!(
             wait_for_event(&mut events, &id, "ready").await,
             "sandbox did not reach ready"
@@ -487,10 +487,10 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
         mgr.finalize_startup_cleanup(&token).await.unwrap();
     }
 
-    let info = mgr.inspect_sandbox(&id).unwrap();
+    let info = mgr.inspect_computer(&id).unwrap();
     assert_eq!(
         info.state,
-        SandboxState::Ready,
+        ComputerState::Ready,
         "the sandbox is usable again, not failed"
     );
     assert_eq!(
@@ -507,7 +507,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
     // An exec proves the vsock path was re-established, not just that the
     // process is alive: this agent was built from the adopted handle.
     let mut rx = mgr
-        .run_in_sandbox(
+        .run_in_computer(
             &id,
             vec!["echo".into(), "still here".into()],
             HashMap::new(),
@@ -540,8 +540,8 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
 
     // And the adopted sandbox is still removable — through the handle, since
     // no PreparedVm crosses a restart.
-    mgr.remove_sandbox(&id, true).await.unwrap();
-    assert!(mgr.inspect_sandbox(&id).is_err());
+    mgr.remove_computer(&id, true).await.unwrap();
+    assert!(mgr.inspect_computer(&id).is_err());
     {
         assert!(!firecracker_alive(pid), "remove left a firecracker behind");
         assert!(

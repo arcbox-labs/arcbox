@@ -13,8 +13,8 @@ use arcbox_vm_driver::{
 };
 
 use crate::boot_proto::KernelIpParam;
-use crate::error::{Result, VmmError};
-use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
+use crate::error::{ComputerError, Result};
+use crate::sandbox::{ComputerSpec, NetworkAttachment, ipv4, netmask};
 
 /// The boot recipe as the driver port sees it.
 ///
@@ -35,7 +35,7 @@ use crate::sandbox::{NetworkAttachment, SandboxSpec, ipv4, netmask};
 /// `KernelIpParam::from_str` to derive the DNS nameserver.
 pub fn build_vm_spec(
     id: &str,
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     net: Option<&NetworkAttachment>,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -56,7 +56,7 @@ pub fn build_vm_spec(
         id: VmId::new(id)?,
         cpus: spec.vcpus.max(1),
         memory_mib: u32::try_from(spec.memory_mib).map_err(|_| {
-            VmmError::Config(format!(
+            ComputerError::Config(format!(
                 "memory_mib {} exceeds what a VM spec can carry",
                 spec.memory_mib
             ))
@@ -179,11 +179,11 @@ mod tests {
     /// CID 3, dirty tracking on — and nothing the sandbox never had.
     #[test]
     fn boot_spec_bakes_the_invariant_identity_and_the_fixed_devices() {
-        let spec = SandboxSpec {
+        let spec = ComputerSpec {
             boot_args: "console=ttyS0".into(),
             vcpus: 0,
             memory_mib: 512,
-            ..SandboxSpec::default()
+            ..ComputerSpec::default()
         };
         let vm = build_vm_spec(
             "box",
@@ -226,7 +226,7 @@ mod tests {
 
         // A caller-pinned `ip=` is kept verbatim; no network means no NIC
         // and no `ip=` at all.
-        let pinned = SandboxSpec {
+        let pinned = ComputerSpec {
             boot_args: "ip=10.0.0.2::10.0.0.1:255.255.255.0".into(),
             ..spec.clone()
         };

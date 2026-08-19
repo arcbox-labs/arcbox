@@ -38,7 +38,7 @@ impl SandboxService {
             }
         };
 
-        let data = match self.manager.read_sandbox_file(&req.id, &req.path).await {
+        let data = match self.manager.read_computer_file(&req.id, &req.path).await {
             Ok(d) => d,
             Err(e) => {
                 let e = SandboxError::from(e);
@@ -144,7 +144,7 @@ impl SandboxService {
         let mode = if open.mode == 0 { 0o644 } else { open.mode };
         match self
             .manager
-            .write_sandbox_file(&open.id, &open.path, mode, &data)
+            .write_computer_file(&open.id, &open.path, mode, &data)
             .await
         {
             Ok(()) => {
@@ -165,7 +165,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let dto = self
             .manager
-            .stat_sandbox_path(&req.id, &req.path)
+            .stat_computer_path(&req.id, &req.path)
             .await
             .map_err(SandboxError::from)?;
         Ok(convert::file_stat_to_proto(&dto))
@@ -180,7 +180,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let entries = self
             .manager
-            .list_sandbox_dir(&req.id, &req.path)
+            .list_computer_dir(&req.id, &req.path)
             .await
             .map_err(SandboxError::from)?;
         Ok(sandbox_v1::ListDirResponse {
@@ -195,7 +195,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let mode = if req.mode == 0 { 0o755 } else { req.mode };
         self.manager
-            .make_sandbox_dir(&req.id, &req.path, mode)
+            .make_computer_dir(&req.id, &req.path, mode)
             .await
             .map_err(SandboxError::from)
     }
@@ -205,7 +205,7 @@ impl SandboxService {
         let req = sandbox_v1::RemoveEntryRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
-            .remove_sandbox_path(&req.id, &req.path, req.recursive)
+            .remove_computer_path(&req.id, &req.path, req.recursive)
             .await
             .map_err(SandboxError::from)
     }
@@ -215,7 +215,7 @@ impl SandboxService {
         let req = sandbox_v1::MoveEntryRequest::decode_from_slice(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
-            .move_sandbox_path(&req.id, &req.from_path, &req.to_path)
+            .move_computer_path(&req.id, &req.from_path, &req.to_path)
             .await
             .map_err(SandboxError::from)
     }
@@ -249,7 +249,7 @@ impl SandboxService {
 
         let mut watch = match self
             .manager
-            .watch_sandbox_dir(&req.id, &req.path, req.recursive)
+            .watch_computer_dir(&req.id, &req.path, req.recursive)
             .await
         {
             Ok(watch) => watch,

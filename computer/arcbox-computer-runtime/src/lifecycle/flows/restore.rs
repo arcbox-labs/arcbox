@@ -16,13 +16,13 @@ use tracing::{info, warn};
 
 use super::{ComputerFlows, Launch, RestoreLaunch, warm_create};
 use crate::agent::GuestAgent;
-use crate::error::VmmError;
+use crate::error::ComputerError;
 use crate::lifecycle::event::RestoreOrigin;
 use crate::lifecycle::tasks::restore::{RestoreTimings, RestoreVm, RestoredVm, restore_vm};
 use crate::lifecycle::tasks::resume::restore_paused;
 use crate::lifecycle::tasks::{TaskFailure, TaskResult};
-use crate::sandbox::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
-use crate::sandbox::record::SandboxProvisionOutcome;
+use crate::sandbox::reconcile::{ComputerStateRecord, JournaledLease, write_state_record};
+use crate::sandbox::record::ComputerProvisionOutcome;
 use crate::sandbox::{journaled_pid, pool};
 
 impl ComputerFlows {
@@ -32,7 +32,7 @@ impl ComputerFlows {
     pub(super) async fn restore_vm(
         &self,
         origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)> {
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)> {
         let Launch::Restore(launch) = self.take_launch() else {
             return Err(self.wrong_launch("restore"));
         };
@@ -50,7 +50,7 @@ impl ComputerFlows {
             .unwrap_or_default();
         let vm_dir = self.computer.lock().unwrap().vm_dir.clone();
         let Some(jailer) = services.config.firecracker.jailer.clone() else {
-            return Err(TaskFailure::recoverable(VmmError::Config(
+            return Err(TaskFailure::recoverable(ComputerError::Config(
                 "checkpoint restore requires jailer isolation; direct mode embeds shared origin \
                  paths"
                     .into(),
@@ -93,7 +93,7 @@ impl ComputerFlows {
             // so it is written before anything is torn down.
             Err(failure) => {
                 let pool_slot_id = self.computer.lock().unwrap().pool_slot_id.clone();
-                let journal = SandboxStateRecord::new(
+                let journal = ComputerStateRecord::new(
                     &self.id,
                     failure.prepared.as_deref().and_then(journaled_pid),
                     lease
@@ -106,7 +106,7 @@ impl ComputerFlows {
                 .map(|record| record.with_pool_slot(pool_slot_id.as_deref()))
                 .and_then(|record| write_state_record(&vm_dir, &record));
                 if let Err(error) = journal {
-                    warn!(sandbox_id = %self.id, %error, "the failed restore's journal was not written");
+                    warn!(computer_id = %self.id, %error, "the failed restore's journal was not written");
                 }
                 let mut computer = self.computer.lock().unwrap();
                 computer.prepared = failure.prepared;
@@ -142,7 +142,7 @@ impl ComputerFlows {
         // is not restore latency.
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
-            sandbox_id = %self.id,
+            computer_id = %self.id,
             snapshot_id = %snapshot_id,
             pool_hit,
             warm_create = warm_create(origin),
@@ -165,7 +165,7 @@ impl ComputerFlows {
             &snapshot_id,
         );
 
-        Ok((agent, SandboxProvisionOutcome { ip_address }))
+        Ok((agent, ComputerProvisionOutcome { ip_address }))
     }
 
     /// Bring a paused computer back in place, onto a fresh network.
@@ -180,14 +180,14 @@ impl ComputerFlows {
         };
         let recoverable = TaskFailure::recoverable;
         let snapshot_id = snapshot_id.ok_or_else(|| {
-            recoverable(VmmError::Snapshot(format!(
+            recoverable(ComputerError::Snapshot(format!(
                 "paused computer {} has no pause checkpoint recorded",
                 self.id
             )))
         })?;
         let services = &self.services;
         let jailer = services.config.firecracker.jailer.clone().ok_or_else(|| {
-            recoverable(VmmError::Config(
+            recoverable(ComputerError::Config(
                 "computer resume requires jailer isolation".into(),
             ))
         })?;
@@ -241,14 +241,14 @@ impl ComputerFlows {
         // frees the memory-sized image.
         if let Err(error) = services.snapshots.delete_by_id(&snapshot_id) {
             warn!(
-                sandbox_id = %self.id,
+                computer_id = %self.id,
                 snapshot_id = %snapshot_id,
                 %error,
                 "resumed, but deleting the pause checkpoint failed"
             );
         }
         info!(
-            sandbox_id = %self.id,
+            computer_id = %self.id,
             total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "computer resumed from pause checkpoint"
         );

@@ -7,7 +7,7 @@ use arcbox_vm_proto::exec::{MSG_EOF, MSG_RESIZE, MSG_SIGNAL, MSG_START, MSG_STDI
 
 use super::{StartCommand, connect_to_agent, drain_output, write_frame};
 use crate::agent::{ExecInputMsg, OutputChunk};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 
 /// Run a command in the sandbox and stream its output.
 ///
@@ -24,15 +24,15 @@ pub async fn run(
 
     // Send the start command.
     let payload = serde_json::to_vec(&start)
-        .map_err(|e| VmmError::Vsock(format!("serialize StartCommand: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("serialize StartCommand: {e}")))?;
     write_frame(&mut stream, MSG_START, &payload)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_START: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_START: {e}")))?;
 
     // No stdin for run(): close immediately.
     write_frame(&mut stream, MSG_EOF, &[])
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_EOF: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_EOF: {e}")))?;
 
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -59,11 +59,11 @@ pub async fn exec(
 
     // Send the start command.
     let payload = serde_json::to_vec(&start)
-        .map_err(|e| VmmError::Vsock(format!("serialize StartCommand: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("serialize StartCommand: {e}")))?;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     write_frame(&mut write_half, MSG_START, &payload)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_START: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_START: {e}")))?;
 
     let (in_tx, mut in_rx) = mpsc::channel::<ExecInputMsg>(32);
     let (out_tx, out_rx) = mpsc::channel::<Result<OutputChunk>>(64);

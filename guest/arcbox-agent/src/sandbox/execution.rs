@@ -271,7 +271,7 @@ impl SandboxService {
             .filter(|p| *p != 0)
             .ok_or_else(|| SandboxError::InvalidArgument(format!("invalid port {}", req.port)))?;
         self.manager
-            .wait_sandbox_port(
+            .wait_computer_port(
                 &req.sandbox_id,
                 port,
                 Duration::from_secs(u64::from(req.timeout_seconds)),

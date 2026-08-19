@@ -55,16 +55,16 @@ use arcbox_vm_driver::VmHandle;
 use arcbox_vm_driver::net::NetworkLease;
 
 use crate::agent::{ExitStatus, GuestAgent};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::deadlines;
 use crate::sandbox::record::{
-    PersistPhase, SandboxProvisionOutcome, SandboxRecordStore, SandboxTransition,
+    ComputerProvisionOutcome, ComputerRecordStore, ComputerTransition, PersistPhase,
 };
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{
-    CheckpointInfo, IdleAction, LifecycleUpdate, SandboxEvent, SandboxId, SandboxState,
+    CheckpointInfo, ComputerEvent, ComputerId, ComputerState, IdleAction, LifecycleUpdate,
 };
 
 mod commands;
@@ -100,14 +100,16 @@ impl Mailbox {
     /// Asks the actor for something and waits for its answer.
     pub(crate) async fn ask<T>(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
     ) -> Result<T> {
         let (reply, answer) = oneshot::channel();
         self.0
             .send(command(reply))
-            .map_err(|_| VmmError::NotFound(id.clone()))?;
-        answer.await.map_err(|_| VmmError::NotFound(id.clone()))?
+            .map_err(|_| ComputerError::NotFound(id.clone()))?;
+        answer
+            .await
+            .map_err(|_| ComputerError::NotFound(id.clone()))?
     }
 
     /// Tells the actor something it does not answer.
@@ -141,7 +143,7 @@ pub enum Command {
     /// answered by READY, which is what its caller waits for.
     Provision {
         provision: Provision,
-        outcome: SandboxProvisionOutcome,
+        outcome: ComputerProvisionOutcome,
         reply: Reply,
     },
     /// Capture a user checkpoint; answered with the catalog entry.
@@ -225,7 +227,7 @@ pub struct Deadlines {
 /// for it.
 #[derive(Clone)]
 pub struct ComputerSnapshot {
-    pub state: SandboxState,
+    pub state: ComputerState,
     pub agent: Option<Arc<dyn GuestAgent>>,
     /// The running VM, for the graceful hand-over a process exit does.
     pub handle: Option<Arc<dyn VmHandle>>,
@@ -249,7 +251,7 @@ impl ComputerSnapshot {
     ///
     /// Everything but the agent, which the actor publishes and withdraws
     /// with the guest's reachability rather than reading it off the runtime.
-    pub fn project(runtime: &ComputerRuntime, state: SandboxState, deadlines: Deadlines) -> Self {
+    pub fn project(runtime: &ComputerRuntime, state: ComputerState, deadlines: Deadlines) -> Self {
         Self {
             state,
             agent: None,
@@ -285,7 +287,7 @@ struct Completion {
 /// What a completed sub-task tells the actor.
 enum Report {
     Booted(Arc<dyn GuestAgent>),
-    Restored(Arc<dyn GuestAgent>, SandboxProvisionOutcome),
+    Restored(Arc<dyn GuestAgent>, ComputerProvisionOutcome),
     Resumed(Arc<dyn GuestAgent>),
     Gated,
     Captured(CheckpointInfo),
@@ -334,7 +336,7 @@ enum StalledStep {
     /// The in-flight sub-task has not handed its resources over.
     Handoff,
     /// The durable record would not delete. Until it does, the id is still
-    /// owned — `remove_sandbox_impl` propagates that failure rather than
+    /// owned — `remove_computer_impl` propagates that failure rather than
     /// dropping its map entry, because only a retry can free the id.
     Record(RecordEnd),
 }
@@ -353,22 +355,22 @@ enum Flow {
 
 /// The lifecycle actor.
 pub struct ComputerActor {
-    id: SandboxId,
+    id: ComputerId,
     /// The resources this computer holds, shared with the sub-tasks the
     /// actor spawns. The actor is the only other writer: it mirrors the
     /// public state into it, records the workload's exit, and projects the
     /// read snapshot from it.
     runtime: Arc<Mutex<ComputerRuntime>>,
     /// Drops this computer's registry entry. Called when the record is
-    /// forgotten, before REMOVED is announced — `remove_sandbox_impl`'s own
+    /// forgotten, before REMOVED is announced — `remove_computer_impl`'s own
     /// order — and again when the actor stops for any other reason.
     unregister: Arc<dyn Fn() + Send + Sync>,
     /// The durable record's generation, `None` for a computer with no record
     /// — the durable effects are then no-ops, as they are today.
     generation: Option<Uuid>,
     vm_dir: PathBuf,
-    records: Arc<SandboxRecordStore>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    records: Arc<ComputerRecordStore>,
+    events_tx: broadcast::Sender<ComputerEvent>,
     tasks: Arc<dyn ComputerTasks>,
     seeded: Seeded,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -383,14 +385,14 @@ pub struct ComputerActor {
     waiters: Vec<(Answer, Reply)>,
     capture_reply: Option<oneshot::Sender<Result<CheckpointInfo>>>,
     /// A graceful stop asked for while a launch was in flight, dispatched as
-    /// soon as the launch resolves. Today's `stop_sandbox` answers
+    /// soon as the launch resolves. Today's `stop_computer` answers
     /// `WrongState` there; deferring is what the engine's actor does and what
     /// the R3 plan specifies (§B.3).
     pending_stop: Option<Duration>,
     inflight: Option<Preemptible>,
     epoch: u64,
     /// The teardown parked on a step it could not finish, replayed when a
-    /// retry takes it. This is `cleanup::expire_sandbox`'s retry loop,
+    /// retry takes it. This is `cleanup::expire_computer`'s retry loop,
     /// collapsed into the actor.
     stalled: Option<Stalled>,
     /// What the step currently being applied stalled on, read by
@@ -406,7 +408,7 @@ pub struct ComputerActor {
     /// pause's own, which names itself.
     capture: Option<CaptureSpec>,
     /// The provision outcome the `Starting` and atomic-`Ready` writes carry.
-    outcome: SandboxProvisionOutcome,
+    outcome: ComputerProvisionOutcome,
     /// Attributes of the events a transition asks for.
     pause_reason: PauseReason,
     resume_reason: String,
@@ -419,7 +421,7 @@ pub struct ComputerActor {
     answer_error: Option<String>,
     /// The failure a removal is unwinding, held until that removal ends.
     /// Its caller must not hear before the id is free again.
-    unwinding: Option<VmmError>,
+    unwinding: Option<ComputerError>,
     /// A journal clear owed to a release that is still running: the journal
     /// records exactly the resources a restart would have to reclaim, so it
     /// may only be dropped once they are gone.
@@ -432,7 +434,7 @@ pub struct ComputerActor {
     idle: Option<Pin<Box<tokio::time::Sleep>>>,
     retry: Option<Pin<Box<tokio::time::Sleep>>>,
     /// `false` keeps both deadline timers unarmed: a manager that was never
-    /// shared (`SandboxManager::into_shared`) fires no timers, which unit
+    /// shared (`ComputerManager::into_shared`) fires no timers, which unit
     /// tests of unrelated surfaces rely on.
     timers_enabled: watch::Receiver<bool>,
 }
@@ -452,13 +454,13 @@ pub enum Seeded {
 
 /// What one actor is built from.
 pub struct ComputerSeed {
-    pub id: SandboxId,
+    pub id: ComputerId,
     pub runtime: Arc<Mutex<ComputerRuntime>>,
     pub unregister: Arc<dyn Fn() + Send + Sync>,
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,
-    pub records: Arc<SandboxRecordStore>,
-    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub records: Arc<ComputerRecordStore>,
+    pub events_tx: broadcast::Sender<ComputerEvent>,
     pub tasks: Arc<dyn ComputerTasks>,
     pub deadlines: Deadlines,
     pub timers_enabled: watch::Receiver<bool>,
@@ -499,7 +501,7 @@ impl ComputerActor {
             error: None,
             pause_snapshot_id: None,
             capture: None,
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             pause_reason: PauseReason::Requested,
             resume_reason: crate::sandbox::pause_reason::RESUME.to_owned(),
             exit: None,
@@ -611,10 +613,10 @@ impl ComputerActor {
         // stop deferred behind a launch a removal then preempted, say —
         // would otherwise learn only that its channel closed.
         for (_, reply) in self.waiters.drain(..) {
-            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+            let _ = reply.send(Err(ComputerError::NotFound(self.id.clone())));
         }
         if let Some(reply) = self.capture_reply.take() {
-            let _ = reply.send(Err(VmmError::NotFound(self.id.clone())));
+            let _ = reply.send(Err(ComputerError::NotFound(self.id.clone())));
         }
     }
 
@@ -631,7 +633,7 @@ impl ComputerActor {
 
         if before.to_public() != after.to_public() {
             debug!(
-                sandbox_id = %self.id,
+                computer_id = %self.id,
                 from = %before.to_public(),
                 to = %after.to_public(),
                 "computer lifecycle transition"

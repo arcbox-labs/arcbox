@@ -1,5 +1,5 @@
 //! The rules that must hold in every state: recovery's seeding, and the gates
-//! `stop_sandbox`, `cleanup::begin_removal` and the two deadline timers apply.
+//! `stop_computer`, `cleanup::begin_removal` and the two deadline timers apply.
 
 use super::harness::{ALL_PHASES, BUDGET_MS, explore, ordinal, reach, ready_machine, step};
 use crate::lifecycle::effect::{
@@ -10,7 +10,7 @@ use crate::lifecycle::machine::State;
 use crate::sandbox::policy::recovery::{JournalEvidence, RecoveryAction, plan};
 use crate::sandbox::record::PersistPhase;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{IdleAction, SandboxState};
+use crate::sandbox::{ComputerState, IdleAction};
 
 /// `sandbox::policy::recovery::plan`'s verdict for a phase whose journal the
 /// startup sweep tore down — the evidence a seeded machine corresponds to.
@@ -34,12 +34,12 @@ fn recovery_seeds_the_state_its_own_verdict_leaves_behind() {
             // resumes it: the machine stays where a fresh one starts.
             RecoveryAction::LeaveResumable => {
                 assert_eq!(state.durable(), Some(PersistPhase::Creating), "{phase:?}");
-                assert_eq!(state.to_public(), SandboxState::Starting, "{phase:?}");
+                assert_eq!(state.to_public(), ComputerState::Starting, "{phase:?}");
             }
             // Recovery already wrote `Failed`; the machine only adopts it.
             RecoveryAction::Fail => {
                 assert_eq!(state.durable(), Some(PersistPhase::Failed), "{phase:?}");
-                assert_eq!(state.to_public(), SandboxState::Failed, "{phase:?}");
+                assert_eq!(state.to_public(), ComputerState::Failed, "{phase:?}");
             }
             RecoveryAction::Reinstate(public) => {
                 assert_eq!(state.durable(), Some(phase), "{phase:?}");
@@ -76,11 +76,11 @@ fn recovery_seeds_the_state_its_own_verdict_leaves_behind() {
 fn an_adopted_computer_is_seeded_ready_without_a_launch() {
     assert_eq!(
         plan(PersistPhase::Ready, JournalEvidence::Adopted),
-        RecoveryAction::Reinstate(SandboxState::Ready),
+        RecoveryAction::Reinstate(ComputerState::Ready),
     );
     let (sm, mut context) = reach(&[Event::Adopted]);
     let state = *sm.state();
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(state.durable(), Some(PersistPhase::Ready));
 
     // And it is a real `ready`, not a look-alike: it accepts work, pauses,
@@ -93,11 +93,11 @@ fn an_adopted_computer_is_seeded_ready_without_a_launch() {
             claim: WorkloadClaim::Api,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Running);
+    assert_eq!(state.to_public(), ComputerState::Running);
 }
 
 /// Who may take the single-workload slot, over every state — the rule
-/// `workload::claim_workload` enforced against `SandboxState`.
+/// `workload::claim_workload` enforced against `ComputerState`.
 ///
 /// The two claims differ in exactly one place: the readiness gate holds the
 /// slot for the boot's own `cmd`, and an `Api` claim cannot reach a computer
@@ -115,7 +115,7 @@ fn only_ready_and_the_gates_own_cmd_take_the_workload_slot() {
                 || (claim == WorkloadClaim::Initial
                     && matches!(before, State::Gating { claimed: false, .. }));
             assert_eq!(
-                after.to_public() == SandboxState::Running && !effects.is_empty(),
+                after.to_public() == ComputerState::Running && !effects.is_empty(),
                 allowed,
                 "{before:?} with {claim:?}"
             );
@@ -132,7 +132,7 @@ fn only_ready_and_the_gates_own_cmd_take_the_workload_slot() {
 /// Drives a cold create through to `ready`, discarding effects.
 #[test]
 fn a_stop_only_acts_while_the_guest_serves() {
-    // `stop_sandbox` accepts Ready/Running/Stopping (and retries idempotently
+    // `stop_computer` accepts Ready/Running/Stopping (and retries idempotently
     // from Stopped), answering WrongState elsewhere. Only the first two are a
     // state change, so re-entering `stopping` emits nothing; everything else
     // the machine swallows for the actor to answer.
@@ -175,7 +175,7 @@ fn a_non_forced_remove_is_refused_exactly_where_the_computer_is_busy() {
         let (_, effects) = step(&mut sm, &mut context, &Event::Remove { force: false });
         let busy = matches!(
             node.state.to_public(),
-            SandboxState::Starting | SandboxState::Running
+            ComputerState::Starting | ComputerState::Running
         ) || matches!(node.state, State::Removing {} | State::Gone {});
         assert_eq!(
             effects.is_empty(),
@@ -274,7 +274,7 @@ fn the_idle_policy_only_fires_on_a_ready_computer() {
             action: IdleAction::Pause,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Pausing);
+    assert_eq!(state.to_public(), ComputerState::Pausing);
     assert!(effects.contains(&Effect::Publish(Notify::Pausing)));
 
     let (mut sm, mut context) = ready_machine();
@@ -290,7 +290,7 @@ fn the_idle_policy_only_fires_on_a_ready_computer() {
 
 /// An idle expiry can only reach a computer that is still idle.
 ///
-/// `expire_sandbox` took a `force` flag for exactly this: the TTL cap
+/// `expire_computer` took a `force` flag for exactly this: the TTL cap
 /// destroys regardless of activity, while the idle detector passed
 /// `force = false` so a non-forced removal would refuse a computer that had
 /// turned busy between the timer firing and the teardown claiming it. The

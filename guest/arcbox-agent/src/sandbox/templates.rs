@@ -1,7 +1,7 @@
 //! Template catalog handlers (CORE-107).
 //!
 //! Decode → manager → encode glue over the catalog surface on
-//! [`SandboxManager`](arcbox_computer_runtime::SandboxManager), plus the Build
+//! [`ComputerManager`](arcbox_computer_runtime::ComputerManager), plus the Build
 //! orchestrator, which drives the existing rootfs pipeline (`template.rs`
 //! export + `RootfsBuilder` conversion) and registers the result as the
 //! catalog draft. `template.rs` (singular) is the
@@ -228,7 +228,7 @@ impl SandboxService {
             // whose warm restore points at missing artifacts. Leave the
             // copy; the error is retryable and the referenced-or-orphan
             // outcome is safe either way.
-            Err(error @ arcbox_computer_runtime::VmmError::Unavailable(_)) => {
+            Err(error @ arcbox_computer_runtime::ComputerError::Unavailable(_)) => {
                 Err(SandboxError::from(error))
             }
             Err(error) => {

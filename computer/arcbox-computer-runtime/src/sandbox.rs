@@ -1,11 +1,11 @@
-//! `SandboxManager` — orchestrates sandbox microVM lifecycle.
+//! `ComputerManager` — orchestrates the lifecycle of computer microVMs.
 //!
 //! A sandbox is a short-lived, strongly-isolated microVM decoupled from its
 //! workload: when the initial `cmd` process exits the sandbox transitions back
 //! to `Ready` rather than stopping, and continues accepting `Run` calls until
 //! an explicit `Stop`/`Remove` or TTL expiry.
 //!
-//! `create_sandbox` returns immediately with state `"starting"`.  The VM boots
+//! `create_computer` returns immediately with state `"starting"`.  The VM boots
 //! in a background task which broadcasts a `"ready"` event on success.
 
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use crate::agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand
 use crate::agent::{GuestAgent, Readiness};
 use crate::config::RuntimeConfig;
 use crate::environment::NodeEnvironment;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Mailbox, Seeded,
 };
@@ -66,9 +66,9 @@ pub use pause::reason as pause_reason;
 pub(crate) use spec::ROOTFS_DISK_ID;
 pub(crate) use types::NetworkAttachment;
 pub use types::{
-    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
-    SandboxEvent, SandboxId, SandboxInfo, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec,
-    SandboxSpec, SandboxState, SandboxSummary, TemplateWarmRef,
+    CheckpointInfo, CheckpointSummary, ComputerEvent, ComputerId, ComputerInfo, ComputerMountSpec,
+    ComputerNetworkInfo, ComputerNetworkSpec, ComputerSpec, ComputerState, ComputerSummary,
+    IdleAction, LifecycleUpdate, RestoreComputerSpec, TemplateWarmRef,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -80,7 +80,7 @@ type ReconcileResult = std::result::Result<(), Arc<str>>;
 /// What replaced `Arc<Mutex<ComputerRuntime>>`. Every verb is a send on the
 /// mailbox and every read is a borrow of the snapshot, so neither the map
 /// lock nor a per-computer mutex is ever held across an await — the
-/// discipline `list_sandboxes` used to have to state.
+/// discipline `list_computers` used to have to state.
 #[derive(Clone)]
 pub(crate) struct ComputerRef {
     mailbox: Mailbox,
@@ -89,12 +89,12 @@ pub(crate) struct ComputerRef {
 }
 
 /// The live computers, by id.
-pub(crate) type Computers = Arc<RwLock<HashMap<SandboxId, ComputerRef>>>;
+pub(crate) type Computers = Arc<RwLock<HashMap<ComputerId, ComputerRef>>>;
 
 /// Manages the full lifecycle of multiple sandbox microVMs.
-pub struct SandboxManager {
+pub struct ComputerManager {
     computers: Computers,
-    records: Arc<record::SandboxRecordStore>,
+    records: Arc<record::ComputerRecordStore>,
     /// What every computer's flows are built from — the driver, the guest
     /// network, the agent factory, the record store, the catalogs and the
     /// pool. One `Arc`, cloned into each actor.
@@ -103,7 +103,7 @@ pub struct SandboxManager {
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
     config: Arc<RuntimeConfig>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    events_tx: broadcast::Sender<ComputerEvent>,
     cow_manager: Arc<CowManager>,
     /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
     pool: Arc<pool::SlotPool>,
@@ -122,11 +122,11 @@ pub struct SandboxManager {
     timers_enabled: tokio::sync::watch::Sender<bool>,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Create a new manager from the given configuration, over the
     /// environment-specific components the composer supplies.
     ///
-    /// Fails with [`VmmError::Config`] when the environment's driver lacks a
+    /// Fails with [`ComputerError::Config`] when the environment's driver lacks a
     /// capability every sandbox needs — `Prepare` (the flows spawn the VMM
     /// ahead of the guest), `Staging` (every flow brings its computer's
     /// files into the area the VMM can reach), `Vsock` (the guest agent is
@@ -176,18 +176,18 @@ impl SandboxManager {
             ),
         ] {
             if missing {
-                return Err(VmmError::Config(format!(
+                return Err(ComputerError::Config(format!(
                     "VM driver `{}` has no {capability} capability; {need}",
                     driver.name()
                 )));
             }
         }
-        let records = Arc::new(record::SandboxRecordStore::new(Path::new(
+        let records = Arc::new(record::ComputerRecordStore::new(Path::new(
             &config.firecracker.data_dir,
         ))?);
         drop(records.load_all()?);
         if network.reconcile().is_none() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "guest network has no reconcile capability; the quarantine ledger is how a host \
                  releases the addresses a previous process held"
                     .into(),
@@ -266,7 +266,7 @@ impl SandboxManager {
                     reconcile::seed_computers(inactive, &computers, &services, &timers_gate);
                     reconcile::finalize_sweep(swept).await?;
                     reconcile_capability(&*network).replay_complete();
-                    Ok::<_, VmmError>(())
+                    Ok::<_, ComputerError>(())
                 }
                 .await
                 .map_err(|error| Arc::<str>::from(error.to_string()));
@@ -333,23 +333,23 @@ impl SandboxManager {
     }
 
     /// This computer's registry entry.
-    pub(super) fn computer(&self, id: &SandboxId) -> Result<ComputerRef> {
+    pub(super) fn computer(&self, id: &ComputerId) -> Result<ComputerRef> {
         self.check_reconcile()?;
         self.computers
             .read()
             .unwrap()
             .get(id)
             .cloned()
-            .ok_or_else(|| VmmError::NotFound(id.clone()))
+            .ok_or_else(|| ComputerError::NotFound(id.clone()))
     }
 
     /// This computer's mailbox.
-    pub(super) fn mailbox(&self, id: &SandboxId) -> Result<Mailbox> {
+    pub(super) fn mailbox(&self, id: &ComputerId) -> Result<Mailbox> {
         Ok(self.computer(id)?.mailbox)
     }
 
     /// What a read of this computer sees, without touching its mailbox.
-    pub(super) fn snapshot(&self, id: &SandboxId) -> Result<ComputerSnapshot> {
+    pub(super) fn snapshot(&self, id: &ComputerId) -> Result<ComputerSnapshot> {
         Ok(self.computer(id)?.snapshot.borrow().clone())
     }
 
@@ -367,11 +367,13 @@ impl SandboxManager {
         let result = rx
             .wait_for(Option::is_some)
             .await
-            .map_err(|error| VmmError::Other(format!("sandbox reconciliation stopped: {error}")))?
+            .map_err(|error| {
+                ComputerError::Other(format!("sandbox reconciliation stopped: {error}"))
+            })?
             .clone()
             .expect("wait_for returned only after reconciliation completed");
         result.map_err(|error| {
-            VmmError::Other(format!(
+            ComputerError::Other(format!(
                 "sandbox durable-state reconciliation failed: {error}"
             ))
         })
@@ -380,11 +382,11 @@ impl SandboxManager {
     fn check_reconcile(&self) -> Result<()> {
         let result = self.reconcile_done.borrow().clone();
         match result {
-            None => Err(VmmError::Other(
+            None => Err(ComputerError::Other(
                 "sandbox durable-state reconciliation is still running".into(),
             )),
             Some(Ok(())) => Ok(()),
-            Some(Err(error)) => Err(VmmError::Other(format!(
+            Some(Err(error)) => Err(ComputerError::Other(format!(
                 "sandbox durable-state reconciliation failed: {error}"
             ))),
         }
@@ -398,7 +400,7 @@ impl SandboxManager {
             .reconcile_network()
             .pending_cleanups()
             .await
-            .map_err(VmmError::from)?
+            .map_err(ComputerError::from)?
             .into_iter()
             .map(|(vm, token)| (vm.as_str().to_owned(), token))
             .collect())
@@ -473,17 +475,17 @@ impl SandboxManager {
     /// before asking. The gate this used to take could therefore only ever
     /// have fired for a sandbox that has no lease to report anyway, and it
     /// has no non-blocking form on the port.
-    pub fn sandbox_network_identity(&self, id: &str) -> Result<SandboxNetworkIdentity> {
+    pub fn computer_network_identity(&self, id: &str) -> Result<ComputerNetworkIdentity> {
         let snapshot = self.snapshot(&id.to_owned())?;
         let lease = snapshot
             .lease
             .as_ref()
-            .ok_or_else(|| VmmError::WrongState {
+            .ok_or_else(|| ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "sandbox with an active network allocation".into(),
                 actual: snapshot.state.to_string(),
             })?;
-        Ok(SandboxNetworkIdentity {
+        Ok(ComputerNetworkIdentity {
             ip: lease.ipv4()?,
             cleanup_token: lease.cleanup_token.clone(),
             expose: self.services.network.host_ingress(lease)?,
@@ -520,7 +522,7 @@ impl LeaseExt for NetworkLease {
 pub(super) fn ipv4(address: std::net::IpAddr) -> Result<std::net::Ipv4Addr> {
     match address {
         std::net::IpAddr::V4(v4) => Ok(v4),
-        std::net::IpAddr::V6(v6) => Err(VmmError::Network(format!(
+        std::net::IpAddr::V6(v6) => Err(ComputerError::Network(format!(
             "the guest network offered {v6}; this manager's sandboxes are IPv4-only"
         ))),
     }
@@ -539,7 +541,7 @@ pub(super) fn netmask(prefix_len: u8) -> std::net::Ipv4Addr {
 
 /// The connectivity every sandbox gets: egress through the host's address,
 /// which is what the System VM's netfilter provides for the pool.
-pub(super) const fn sandbox_network_policy() -> NetworkPolicy {
+pub(super) const fn computer_network_policy() -> NetworkPolicy {
     NetworkPolicy {
         mode: NetworkMode::Nat,
     }
@@ -559,7 +561,7 @@ pub(super) const fn attach_mode(net_invariant: bool) -> AttachMode {
 
 /// A sandbox's network identity as seen by forwarding and DNS consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxNetworkIdentity {
+pub struct ComputerNetworkIdentity {
     /// External pool IP — the address the rest of the system keeps using.
     pub ip: std::net::Ipv4Addr,
     /// Opaque generation token carried through host cleanup finalization.
@@ -573,25 +575,25 @@ pub struct SandboxNetworkIdentity {
     pub expose: HostIngress,
 }
 
-/// The guest network's cleanup protocol, which [`SandboxManager::new`]
+/// The guest network's cleanup protocol, which [`ComputerManager::new`]
 /// requires — the quarantine ledger gates every address the pool hands
 /// out, and the startup sweep gates the pool itself.
 pub(super) fn reconcile_capability(network: &dyn GuestNetwork) -> &dyn NetworkReconcile {
     network
         .reconcile()
-        .expect("SandboxManager::new requires the guest network's reconcile capability")
+        .expect("ComputerManager::new requires the guest network's reconcile capability")
 }
 
-/// The driver's `Prepare` capability, which [`SandboxManager::new`]
+/// The driver's `Prepare` capability, which [`ComputerManager::new`]
 /// requires — the boot, pool, and restore flows all spawn the VMM before
 /// there is a guest to run on it.
 pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
     driver
         .prepare()
-        .expect("SandboxManager::new requires the driver's Prepare capability")
+        .expect("ComputerManager::new requires the driver's Prepare capability")
 }
 
-/// A grip's `Staging` capability, which [`SandboxManager::new`] requires —
+/// A grip's `Staging` capability, which [`ComputerManager::new`] requires —
 /// every flow that puts a guest on a VMM first brings that guest's files
 /// into the area the VMM can reach, and pause takes its disk back out of
 /// it.
@@ -601,7 +603,7 @@ pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
 /// booted here asks its [`PreparedVm`] and one this process adopted asks
 /// its [`VmHandle`](arcbox_vm_driver::VmHandle).
 pub(crate) fn staging_capability(staging: Option<&dyn Staging>) -> &dyn Staging {
-    staging.expect("SandboxManager::new requires the driver's Staging capability")
+    staging.expect("ComputerManager::new requires the driver's Staging capability")
 }
 
 /// The VMM's pid as the crash journal records it: what a restart sweep
@@ -644,7 +646,7 @@ pub(crate) fn preserved_cow_file(config: &RuntimeConfig, id: &str) -> PathBuf {
 /// recorded at capture; legacy entries default to the Firecracker format.
 pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointImage> {
     let dir = meta.vmstate_path.parent().ok_or_else(|| {
-        VmmError::Snapshot(format!(
+        ComputerError::Snapshot(format!(
             "checkpoint {} records a vmstate at {}, which is in no directory",
             meta.id,
             meta.vmstate_path.display()
@@ -663,19 +665,19 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
 /// restricted to `[A-Za-z0-9_-]`. This rejects path traversal (`/`, `\`, `..`),
 /// NUL and whitespace. The narrower rule a VMM imposes on the id it runs under
 /// is *not* checked here — that is [`VmId`]'s, applied by
-/// [`validate_new_sandbox_id`] where an id becomes a VM identity.
+/// [`validate_new_computer_id`] where an id becomes a VM identity.
 ///
 /// Deliberately NO length cap here: this also runs against persisted
 /// records, and what one legacy over-long id would cost differs by call
 /// site. On the sweep path it costs that record its reconciliation — the
 /// journal is skipped rather than acted on, and every resource it names
 /// is held (`reconcile::sweep_orphans`). On a record *load* it costs
-/// every record theirs: [`SandboxRecordStore::load_all`] validates each
+/// every record theirs: [`ComputerRecordStore::load_all`] validates each
 /// id and propagates, so one rejection aborts the whole startup read,
 /// which is the stronger reason the cap is absent. It also runs against
 /// snapshot / execution ids that never become a VM identity at all. Both
 /// limits the driver imposes are enforced only where a sandbox id enters
-/// the system: [`validate_new_sandbox_id`].
+/// the system: [`validate_new_computer_id`].
 ///
 /// The gap between this alphabet and [`VmId`]'s is not academic: `_` is
 /// legal here and is not a `VmId`, so every record a pre-#680 process
@@ -683,13 +685,13 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
 /// is exactly what the sweep and the quarantine ledger read back.
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
-        return Err(VmmError::Config(format!("{kind} must not be empty")));
+        return Err(ComputerError::Config(format!("{kind} must not be empty")));
     }
     if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "invalid {kind} {id:?}: only ASCII letters, digits, '-' and '_' are allowed"
         )));
     }
@@ -717,7 +719,7 @@ pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
 /// every attempt while the VMM is up and bound inside its chroot; caught
 /// by the CORE-107 prewarm e2e, whose 51-char builder id overflowed the
 /// stock budget).
-pub(super) fn validate_new_sandbox_id(
+pub(super) fn validate_new_computer_id(
     id: &str,
     driver: &dyn VmDriver,
     config: &RuntimeConfig,
@@ -726,7 +728,7 @@ pub(super) fn validate_new_sandbox_id(
     if let Some(budget) = driver.id_budget(&isolation_spec(config)?)
         && id.len() > budget
     {
-        return Err(VmmError::Config(format!(
+        return Err(ComputerError::Config(format!(
             "invalid sandbox id {id:?}: at most {budget} characters under this \
              driver's layout (its sockets must fit the AF_UNIX path limit)"
         )));
@@ -753,19 +755,19 @@ pub(super) fn validate_new_sandbox_id(
 /// error path unwinds it.
 pub(crate) fn reserve_actor(
     computers: &Computers,
-    id: &SandboxId,
+    id: &ComputerId,
     runtime: ComputerRuntime,
 ) -> Result<ActorReservation> {
     let mut map = computers.write().unwrap();
     if map.contains_key(id) {
-        return Err(VmmError::AlreadyExists(id.clone()));
+        return Err(ComputerError::AlreadyExists(id.clone()));
     }
     let incarnation = Uuid::new_v4();
     let (mailbox_tx, commands) = tokio::sync::mpsc::unbounded_channel();
     let runtime = Arc::new(Mutex::new(runtime));
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(ComputerSnapshot::project(
         &runtime.lock().unwrap(),
-        SandboxState::Starting,
+        ComputerState::Starting,
         Deadlines::default(),
     ));
     map.insert(
@@ -794,7 +796,7 @@ pub(crate) fn reserve_actor(
 /// sender goes with it, so an actor already running would stop too.
 pub(crate) struct ActorReservation {
     computers: Computers,
-    id: SandboxId,
+    id: ComputerId,
     incarnation: Uuid,
     runtime: Runtime,
     mailbox: Mailbox,
@@ -871,7 +873,7 @@ impl Drop for ActorReservation {
 
 /// Everything an actor needs that the reservation does not already hold.
 ///
-/// Assembled from the manager's own pieces rather than from `&SandboxManager`
+/// Assembled from the manager's own pieces rather than from `&ComputerManager`
 /// so the startup sweep can seed actors too: it runs in a task spawned from
 /// the constructor, before the manager it belongs to exists.
 pub(crate) struct ActorSpawn {
@@ -889,7 +891,7 @@ pub(crate) struct ActorSpawn {
 /// needed: a computer removed and re-created under the same id (deterministic
 /// caller-supplied ids make this common) installs a fresh entry, and the
 /// departing actor must not evict it.
-fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
+fn forget_computer(computers: &Computers, id: &ComputerId, incarnation: Uuid) {
     let mut map = computers.write().unwrap();
     if map
         .get(id)
@@ -908,7 +910,7 @@ mod tests {
     fn placeholder(id: &str) -> ComputerRuntime {
         ComputerRuntime::new(
             id.to_owned(),
-            SandboxSpec::default(),
+            ComputerSpec::default(),
             None,
             PathBuf::from("/tmp/x"),
         )
@@ -960,14 +962,14 @@ mod tests {
             ),
         ] {
             let driver = FakeDriver::builder().capabilities(capabilities).build();
-            let error = SandboxManager::new(config.clone(), environment(driver))
+            let error = ComputerManager::new(config.clone(), environment(driver))
                 .err()
                 .unwrap_or_else(|| panic!("a driver without {name} is refused"));
-            assert!(matches!(error, VmmError::Config(_)), "{error}");
+            assert!(matches!(error, ComputerError::Config(_)), "{error}");
             assert!(error.to_string().contains(name), "{error}");
         }
 
-        let manager = SandboxManager::new(config.clone(), environment(FakeDriver::new()))
+        let manager = ComputerManager::new(config.clone(), environment(FakeDriver::new()))
             .expect("a driver with every needed capability is accepted");
         assert_eq!(manager.services.driver.name(), "fake");
     }
@@ -980,7 +982,7 @@ mod tests {
         // before either touches the per-id resources they both derive.
         assert!(matches!(
             reserve_actor(&computers, &"dup".to_owned(), placeholder("dup")),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
         drop(first);
         assert!(!computers.read().unwrap().contains_key("dup"));
@@ -1036,23 +1038,23 @@ mod tests {
     /// constants in `arcbox-fc-driver`
     /// (`the_deployed_jail_layout_admits_the_ids_a_node_mints`).
     #[test]
-    fn a_new_sandbox_id_is_held_to_the_drivers_own_budget() {
+    fn a_new_computer_id_is_held_to_the_drivers_own_budget() {
         let mut config = jailed_config();
         let budget = CONTROL_PLANE_ID.len();
         let driver = FakeDriver::builder().jailed_id_budget(budget).build();
-        assert!(validate_new_sandbox_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
-        assert!(validate_new_sandbox_id(&"a".repeat(budget), &driver, &config).is_ok());
-        assert!(validate_new_sandbox_id(&"a".repeat(budget + 1), &driver, &config).is_err());
+        assert!(validate_new_computer_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
+        assert!(validate_new_computer_id(&"a".repeat(budget), &driver, &config).is_ok());
+        assert!(validate_new_computer_id(&"a".repeat(budget + 1), &driver, &config).is_err());
 
         // A tighter budget refuses what the looser one took, rather than
         // silently reintroducing the connect timeout.
         let tighter = FakeDriver::builder().jailed_id_budget(budget - 1).build();
-        assert!(validate_new_sandbox_id(CONTROL_PLANE_ID, &tighter, &config).is_err());
+        assert!(validate_new_computer_id(CONTROL_PLANE_ID, &tighter, &config).is_err());
 
         // A driver that reports no budget for this isolation bounds
         // nothing: only `VmId`'s own 64-byte ceiling is left.
         config.firecracker.jailer = None;
-        assert!(validate_new_sandbox_id(&"a".repeat(budget + 1), &tighter, &config).is_ok());
+        assert!(validate_new_computer_id(&"a".repeat(budget + 1), &tighter, &config).is_ok());
     }
 
     /// CORE-140. Firecracker validates the `--id` it is handed and refuses it
@@ -1067,13 +1069,13 @@ mod tests {
             .build();
         for _ in 0..2 {
             let error =
-                validate_new_sandbox_id(&CONTROL_PLANE_ID.replacen('-', "_", 1), &driver, &config)
+                validate_new_computer_id(&CONTROL_PLANE_ID.replacen('-', "_", 1), &driver, &config)
                     .expect_err("firecracker would refuse to run under this id");
             assert!(
-                matches!(&error, VmmError::Config(message) if message.contains('_')),
+                matches!(&error, ComputerError::Config(message) if message.contains('_')),
                 "the error should name the offending character, got {error}"
             );
-            assert!(validate_new_sandbox_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
+            assert!(validate_new_computer_id(CONTROL_PLANE_ID, &driver, &config).is_ok());
             // Direct mode passes the same `--id`, so it is refused there too.
             config.firecracker.jailer = None;
         }
@@ -1107,7 +1109,7 @@ mod tests {
 
         assert!(matches!(
             reserve_actor(&computers, &"same".to_owned(), placeholder("same")),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
         forget_computer(&computers, &"same".to_owned(), incarnation);
         let replacement = reserve_actor(&computers, &"same".to_owned(), placeholder("same"))

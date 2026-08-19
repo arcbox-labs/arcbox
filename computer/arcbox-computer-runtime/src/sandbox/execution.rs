@@ -54,7 +54,7 @@ pub struct ExecutionSpec {
     pub tty_size: Option<(u16, u16)>,
     /// Kill the process after this many seconds (0 = no timeout).
     pub timeout_seconds: u32,
-    /// Keep stdin open for [`SandboxManager::write_stdin`]. When false the
+    /// Keep stdin open for [`ComputerManager::write_stdin`]. When false the
     /// process starts with stdin already at EOF (run semantics).
     pub stdin: bool,
 }
@@ -65,7 +65,7 @@ pub struct ExecutionSnapshot {
     /// Execution id, unique within its sandbox.
     pub id: String,
     /// Owning sandbox.
-    pub sandbox_id: SandboxId,
+    pub computer_id: ComputerId,
     /// Whether the workload runs on a pseudo-TTY.
     pub tty: bool,
     /// When the workload was dispatched.
@@ -188,7 +188,7 @@ struct ExecState {
 /// A live or recently-exited execution.
 pub(super) struct Execution {
     id: String,
-    sandbox_id: SandboxId,
+    computer_id: ComputerId,
     tty: bool,
     started_at: DateTime<Utc>,
     /// The started command, kept to distinguish an idempotent start retry
@@ -207,13 +207,13 @@ pub(super) struct Execution {
 impl Execution {
     fn new(
         id: String,
-        sandbox_id: SandboxId,
+        computer_id: ComputerId,
         spec: &ExecutionSpec,
         input_tx: mpsc::Sender<ExecInputMsg>,
     ) -> Self {
         Self {
             id,
-            sandbox_id,
+            computer_id,
             tty: spec.tty,
             started_at: Utc::now(),
             cmd: spec.cmd.clone(),
@@ -231,7 +231,7 @@ impl Execution {
         let st = self.state.lock().unwrap();
         ExecutionSnapshot {
             id: self.id.clone(),
-            sandbox_id: self.sandbox_id.clone(),
+            computer_id: self.computer_id.clone(),
             tty: self.tty,
             started_at: self.started_at,
             exited_at: st.exited_at,
@@ -272,8 +272,8 @@ impl Execution {
     }
 
     /// Error for operations that need the workload alive.
-    fn exited_error(&self) -> VmmError {
-        VmmError::WrongState {
+    fn exited_error(&self) -> ComputerError {
+        ComputerError::WrongState {
             id: format!("execution '{}'", self.id),
             expected: "running".into(),
             actual: "exited".into(),
@@ -298,10 +298,10 @@ impl Execution {
         (snapshot, rx)
     }
 
-    /// Offset-idempotent stdin write; see [`SandboxManager::write_stdin`].
+    /// Offset-idempotent stdin write; see [`ComputerManager::write_stdin`].
     async fn write_stdin(&self, offset: u64, data: &[u8], eof: bool) -> Result<StdinState> {
         if eof && self.tty {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "cannot close stdin of a TTY execution; send Ctrl-D (0x04) instead".into(),
             ));
         }
@@ -315,7 +315,7 @@ impl Execution {
                 return Err(self.exited_error());
             }
             if offset > st.stdin_written {
-                return Err(VmmError::StdinGap {
+                return Err(ComputerError::StdinGap {
                     accepted: st.stdin_written,
                     offset,
                 });
@@ -326,7 +326,7 @@ impl Execution {
                 Vec::new()
             } else {
                 if st.stdin_closed {
-                    return Err(VmmError::Config("stdin is already closed".into()));
+                    return Err(ComputerError::Config("stdin is already closed".into()));
                 }
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -360,7 +360,7 @@ impl Execution {
     /// Deliver a POSIX signal to the running workload's process group.
     async fn signal(&self, signal: i32) -> Result<()> {
         if !(1..=64).contains(&signal) {
-            return Err(VmmError::Config(format!("invalid signal {signal}")));
+            return Err(ComputerError::Config(format!("invalid signal {signal}")));
         }
         if self.has_exited() {
             return Err(self.exited_error());
@@ -374,7 +374,9 @@ impl Execution {
     /// Resize the workload's pseudo-TTY.
     async fn resize(&self, width: u16, height: u16) -> Result<()> {
         if !self.tty {
-            return Err(VmmError::Config("execution has no TTY to resize".into()));
+            return Err(ComputerError::Config(
+                "execution has no TTY to resize".into(),
+            ));
         }
         if self.has_exited() {
             return Err(self.exited_error());
@@ -406,9 +408,9 @@ impl Execution {
     }
 }
 
-type ExecKey = (SandboxId, String);
+type ExecKey = (ComputerId, String);
 
-/// Registry of executions, keyed by `(sandbox_id, execution_id)`.
+/// Registry of executions, keyed by `(computer_id, execution_id)`.
 #[derive(Default)]
 pub(super) struct ExecutionRegistry {
     inner: Mutex<RegistryInner>,
@@ -487,7 +489,7 @@ impl ExecutionRegistry {
             if existing.cmd == cmd {
                 return Ok(Reserve::Existing(existing.snapshot()));
             }
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{}' (id reused for a different command)",
                 key.1
             )));
@@ -499,7 +501,7 @@ impl ExecutionRegistry {
                 // contract only holds once the process is already running.
                 return Ok(Reserve::AwaitPending(pending.done.subscribe()));
             }
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{}' (id reused for a different command)",
                 key.1
             )));
@@ -518,36 +520,36 @@ impl ExecutionRegistry {
         }))
     }
 
-    fn get(&self, sandbox_id: &str, execution_id: &str) -> Result<Arc<Execution>> {
+    fn get(&self, computer_id: &str, execution_id: &str) -> Result<Arc<Execution>> {
         self.inner
             .lock()
             .unwrap()
             .live
-            .get(&(sandbox_id.to_owned(), execution_id.to_owned()))
+            .get(&(computer_id.to_owned(), execution_id.to_owned()))
             .cloned()
             .ok_or_else(|| {
-                VmmError::NotFound(format!(
-                    "execution '{execution_id}' in sandbox '{sandbox_id}'"
+                ComputerError::NotFound(format!(
+                    "execution '{execution_id}' in sandbox '{computer_id}'"
                 ))
             })
     }
 
     /// Snapshots of every retained execution of one sandbox — running and
     /// exited, until the retention GC drops them.
-    fn list(&self, sandbox_id: &str) -> Vec<ExecutionSnapshot> {
+    fn list(&self, computer_id: &str) -> Vec<ExecutionSnapshot> {
         self.inner
             .lock()
             .unwrap()
             .live
             .iter()
-            .filter(|((sid, _), _)| sid == sandbox_id)
+            .filter(|((sid, _), _)| sid == computer_id)
             .map(|(_, exec)| exec.snapshot())
             .collect()
     }
 
     /// Remove `exec`'s entry if it is still the registered generation.
     fn remove_generation(&self, exec: &Arc<Execution>) {
-        let key = (exec.sandbox_id.clone(), exec.id.clone());
+        let key = (exec.computer_id.clone(), exec.id.clone());
         let mut inner = self.inner.lock().unwrap();
         if inner.live.get(&key).is_some_and(|e| Arc::ptr_eq(e, exec)) {
             inner.live.remove(&key);
@@ -558,13 +560,13 @@ impl ExecutionRegistry {
     /// parked attach/wait subscribers resolve. Entries stay registered —
     /// their buffered output remains readable until the per-execution
     /// retention GC drops them.
-    fn interrupt_sandbox(&self, sandbox_id: &str) {
+    fn interrupt_computer(&self, computer_id: &str) {
         let executions: Vec<Arc<Execution>> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .live
                 .iter()
-                .filter(|((sid, _), _)| sid == sandbox_id)
+                .filter(|((sid, _), _)| sid == computer_id)
                 .map(|(_, exec)| Arc::clone(exec))
                 .collect()
         };
@@ -579,13 +581,13 @@ impl ExecutionRegistry {
 /// threading the registry through each of them.
 pub(super) fn spawn_teardown_purge(
     registry: Arc<ExecutionRegistry>,
-    mut events: broadcast::Receiver<SandboxEvent>,
+    mut events: broadcast::Receiver<ComputerEvent>,
 ) {
     tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(ev) if ev.is_terminal() => {
-                    registry.interrupt_sandbox(&ev.sandbox_id);
+                    registry.interrupt_computer(&ev.computer_id);
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -624,7 +626,7 @@ async fn run_session(
         // drops, so the computer is idle either way — there is just no status
         // to report, only why.
         Err(e) => {
-            warn!(sandbox_id = %exec.sandbox_id, execution_id = %exec.id, error = %e,
+            warn!(computer_id = %exec.computer_id, execution_id = %exec.id, error = %e,
                   "execution session broke before exit");
             slot.exited(WorkloadOutcome::Broke(e.clone()));
         }
@@ -635,7 +637,7 @@ async fn run_session(
     registry.remove_generation(&exec);
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Start an execution inside a `Ready` sandbox.
     ///
     /// The execution id (caller-supplied or generated) addresses the process
@@ -644,7 +646,7 @@ impl SandboxManager {
     /// existing execution instead of dispatching a second process.
     pub async fn start_execution(
         &self,
-        sandbox_id: &SandboxId,
+        computer_id: &ComputerId,
         spec: ExecutionSpec,
     ) -> Result<ExecutionSnapshot> {
         let id = match &spec.id {
@@ -655,7 +657,7 @@ impl SandboxManager {
             _ => Uuid::new_v4().to_string(),
         };
         if spec.cmd.is_empty() {
-            return Err(VmmError::Config(
+            return Err(ComputerError::Config(
                 "execution command must not be empty".into(),
             ));
         }
@@ -668,7 +670,7 @@ impl SandboxManager {
         for _ in 0..MAX_START_RESERVE_ROUNDS {
             match self
                 .executions
-                .reserve((sandbox_id.clone(), id.clone()), &spec.cmd)?
+                .reserve((computer_id.clone(), id.clone()), &spec.cmd)?
             {
                 Reserve::Existing(snapshot) => return Ok(snapshot),
                 Reserve::Slot(guard) => {
@@ -681,12 +683,12 @@ impl SandboxManager {
             }
         }
         let Some(reservation) = reservation else {
-            return Err(VmmError::AlreadyExists(format!(
+            return Err(ComputerError::AlreadyExists(format!(
                 "execution '{id}' (concurrent starts did not settle)"
             )));
         };
 
-        let agent = self.require_ready_agent(sandbox_id)?;
+        let agent = self.require_ready_agent(computer_id)?;
         let start = StartCommand {
             cmd: spec.cmd.clone(),
             env: spec.env.clone(),
@@ -701,7 +703,7 @@ impl SandboxManager {
         // Claim the computer (Ready → Running) before dispatching, so a
         // losing racer never launches a process (same discipline as
         // workload.rs).
-        let slot = self.workload_slot(sandbox_id)?;
+        let slot = self.workload_slot(computer_id)?;
         slot.claim(WorkloadClaim::Api).await?;
 
         let (input_tx, output_rx) = match agent.exec(start).await {
@@ -719,7 +721,7 @@ impl SandboxManager {
             let _ = input_tx.send(ExecInputMsg::Eof).await;
         }
 
-        let exec = Arc::new(Execution::new(id, sandbox_id.clone(), &spec, input_tx));
+        let exec = Arc::new(Execution::new(id, computer_id.clone(), &spec, input_tx));
         reservation.commit(&exec);
 
         tokio::spawn(run_session(
@@ -738,15 +740,15 @@ impl SandboxManager {
     /// retained byte if retention already dropped the requested offset), then
     /// live output, and closes once the execution has exited and both
     /// channels are drained. Read the final state with
-    /// [`SandboxManager::wait_execution`] afterwards.
+    /// [`ComputerManager::wait_execution`] afterwards.
     pub fn attach_execution(
         &self,
-        sandbox_id: &str,
+        computer_id: &str,
         execution_id: &str,
         stdout_offset: u64,
         stderr_offset: u64,
     ) -> Result<(ExecutionSnapshot, mpsc::Receiver<ExecutionOutput>)> {
-        let exec = self.executions.get(sandbox_id, execution_id)?;
+        let exec = self.executions.get(computer_id, execution_id)?;
         Ok(exec.attach(stdout_offset, stderr_offset))
     }
 
@@ -759,23 +761,23 @@ impl SandboxManager {
     /// the client sends through the stream itself.
     pub async fn write_stdin(
         &self,
-        sandbox_id: &str,
+        computer_id: &str,
         execution_id: &str,
         offset: u64,
         data: &[u8],
         eof: bool,
     ) -> Result<StdinState> {
         self.executions
-            .get(sandbox_id, execution_id)?
+            .get(computer_id, execution_id)?
             .write_stdin(offset, data, eof)
             .await
     }
 
     /// Current stdin acceptance state — the resume point after a lost write.
-    pub fn stdin_status(&self, sandbox_id: &str, execution_id: &str) -> Result<StdinState> {
+    pub fn stdin_status(&self, computer_id: &str, execution_id: &str) -> Result<StdinState> {
         Ok(self
             .executions
-            .get(sandbox_id, execution_id)?
+            .get(computer_id, execution_id)?
             .snapshot()
             .stdin)
     }
@@ -783,12 +785,12 @@ impl SandboxManager {
     /// Deliver a POSIX signal to a running execution's process group.
     pub async fn signal_execution(
         &self,
-        sandbox_id: &str,
+        computer_id: &str,
         execution_id: &str,
         signal: i32,
     ) -> Result<()> {
         self.executions
-            .get(sandbox_id, execution_id)?
+            .get(computer_id, execution_id)?
             .signal(signal)
             .await
     }
@@ -796,13 +798,13 @@ impl SandboxManager {
     /// Resize a running TTY execution's terminal.
     pub async fn resize_execution(
         &self,
-        sandbox_id: &str,
+        computer_id: &str,
         execution_id: &str,
         width: u16,
         height: u16,
     ) -> Result<()> {
         self.executions
-            .get(sandbox_id, execution_id)?
+            .get(computer_id, execution_id)?
             .resize(width, height)
             .await
     }
@@ -811,13 +813,13 @@ impl SandboxManager {
     /// state. A zero timeout polls the current state.
     pub async fn wait_execution(
         &self,
-        sandbox_id: &str,
+        computer_id: &str,
         execution_id: &str,
         timeout: Duration,
     ) -> Result<ExecutionSnapshot> {
         Ok(self
             .executions
-            .get(sandbox_id, execution_id)?
+            .get(computer_id, execution_id)?
             .wait(timeout)
             .await)
     }
@@ -827,9 +829,9 @@ impl SandboxManager {
     ///
     /// The sandbox must exist; an unknown id is `NotFound` rather than an
     /// empty list, so a caller can tell "no executions" from a typo.
-    pub fn list_executions(&self, sandbox_id: &SandboxId) -> Result<Vec<ExecutionSnapshot>> {
-        self.computer(sandbox_id)?;
-        let mut snapshots = self.executions.list(sandbox_id);
+    pub fn list_executions(&self, computer_id: &ComputerId) -> Result<Vec<ExecutionSnapshot>> {
+        self.computer(computer_id)?;
+        let mut snapshots = self.executions.list(computer_id);
         snapshots.sort_by(|a, b| {
             a.started_at
                 .cmp(&b.started_at)
@@ -839,21 +841,21 @@ impl SandboxManager {
     }
 
     /// Wait until something inside an alive sandbox listens on TCP `port`,
-    /// or fail with [`VmmError::DeadlineExceeded`] once `timeout` elapses.
+    /// or fail with [`ComputerError::DeadlineExceeded`] once `timeout` elapses.
     ///
     /// The vm-agent watches the guest's own listen table in-process — no
     /// connect probes that would perturb the workload with spurious
     /// accepted connections.
-    pub async fn wait_sandbox_port(
+    pub async fn wait_computer_port(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         port: u16,
         timeout: Duration,
     ) -> Result<()> {
         let agent = self.require_alive_agent(id)?;
         match agent.wait_for_port(port, timeout).await? {
             crate::agent::PortWait::Listening => Ok(()),
-            crate::agent::PortWait::Deadline => Err(VmmError::DeadlineExceeded(format!(
+            crate::agent::PortWait::Deadline => Err(ComputerError::DeadlineExceeded(format!(
                 "no listener on port {port} in sandbox '{id}' within {}s",
                 timeout.as_secs()
             ))),
@@ -994,7 +996,7 @@ mod tests {
 
         // A gap is rejected with the resume point.
         let err = exec.write_stdin(99, b"x", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::StdinGap { accepted: 11, .. }));
+        assert!(matches!(err, ComputerError::StdinGap { accepted: 11, .. }));
 
         // Exactly the deduplicated byte stream reached the process.
         let mut forwarded = Vec::new();
@@ -1018,7 +1020,7 @@ mod tests {
 
         // Further data after EOF is rejected; a pure duplicate is not.
         let err = exec.write_stdin(2, b"more", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::Config(_)));
+        assert!(matches!(err, ComputerError::Config(_)));
         let st = exec.write_stdin(0, b"in", false).await.unwrap();
         assert_eq!(st.bytes_written, 2);
 
@@ -1029,7 +1031,7 @@ mod tests {
         };
         let (tty_exec, _tty_rx) = test_execution(&tty_spec);
         let err = tty_exec.write_stdin(0, b"", true).await.unwrap_err();
-        assert!(matches!(err, VmmError::Config(_)));
+        assert!(matches!(err, ComputerError::Config(_)));
     }
 
     #[tokio::test]
@@ -1100,23 +1102,23 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(ExecInputMsg::Signal(15))));
         assert!(matches!(
             exec.signal(0).await.unwrap_err(),
-            VmmError::Config(_)
+            ComputerError::Config(_)
         ));
         // Non-TTY executions have nothing to resize.
         assert!(matches!(
             exec.resize(80, 24).await.unwrap_err(),
-            VmmError::Config(_)
+            ComputerError::Config(_)
         ));
 
         exec.mark_exited(&Ok(ExitStatus::Code(0)));
         assert!(matches!(
             exec.signal(9).await.unwrap_err(),
-            VmmError::WrongState { .. }
+            ComputerError::WrongState { .. }
         ));
     }
 
     #[tokio::test]
-    async fn interrupt_sandbox_marks_running_executions_but_keeps_them_readable() {
+    async fn interrupt_computer_marks_running_executions_but_keeps_them_readable() {
         let registry = Arc::new(ExecutionRegistry::default());
         let (exec, _rx) = test_execution(&stdin_spec());
         registry
@@ -1126,7 +1128,7 @@ mod tests {
             .live
             .insert(("sandbox-1".into(), "exec-1".into()), Arc::clone(&exec));
 
-        registry.interrupt_sandbox("sandbox-1");
+        registry.interrupt_computer("sandbox-1");
         // Still registered: buffered output stays readable until the
         // retention GC, but the execution is resolved as torn down.
         assert!(registry.get("sandbox-1", "exec-1").is_ok());
@@ -1143,7 +1145,7 @@ mod tests {
             .unwrap()
             .live
             .insert(("sandbox-1".into(), "exec-2".into()), Arc::clone(&done));
-        registry.interrupt_sandbox("sandbox-1");
+        registry.interrupt_computer("sandbox-1");
         assert_eq!(done.snapshot().exit_status, Some(ExitStatus::Code(3)));
     }
 
@@ -1177,7 +1179,7 @@ mod tests {
         // Different command under the same id → collision.
         assert!(matches!(
             registry.reserve(key, &["other".to_owned()]),
-            Err(VmmError::AlreadyExists(_))
+            Err(ComputerError::AlreadyExists(_))
         ));
 
         // While a start is in flight, a matching retry waits for it instead
@@ -1195,7 +1197,7 @@ mod tests {
             ));
             assert!(matches!(
                 registry.reserve(key2.clone(), &["other".to_owned()]),
-                Err(VmmError::AlreadyExists(_))
+                Err(ComputerError::AlreadyExists(_))
             ));
         }
         // A dropped (uncommitted) reservation frees the slot.

@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory};
 use crate::config::{JailerConfig, RuntimeConfig};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox;
 use crate::sandbox::boot::{StageError, stage_rootfs_cow_or_copy};
@@ -93,7 +93,7 @@ pub struct RestoreTimings {
 /// A restore that failed before its commit, carrying whatever it had already
 /// acquired so the caller can unwind it (`rollback_restore`).
 pub struct RestoreFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     pub prepared: Option<Arc<dyn PreparedVm>>,
     pub cow_handle: Option<CowHandle>,
 }
@@ -144,7 +144,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             // and crash reconciliation key the chroot and dm/CoW teardown
             // on it (see release_runtime_resources / sweep_orphans).
             instance.lock().unwrap().pool_slot_id = Some(slot.slot_id.clone());
-            let handover = sandbox::reconcile::SandboxStateRecord::new(
+            let handover = sandbox::reconcile::ComputerStateRecord::new(
                 new_id,
                 sandbox::journaled_pid(&*slot.prepared),
                 lease
@@ -177,7 +177,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                     // chroot, and CoW invisible to reconciliation.
                     if let Err(error) = sandbox::reconcile::clear_state_record(&slot_vm_dir) {
                         warn!(
-                            sandbox_id = %new_id,
+                            computer_id = %new_id,
                             slot_id = %slot_id,
                             error = %error,
                             "claimed slot journal not cleared; the startup sweep will reconcile it"
@@ -186,7 +186,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                         && error.kind() != std::io::ErrorKind::NotFound
                     {
                         warn!(
-                            sandbox_id = %new_id,
+                            computer_id = %new_id,
                             slot_id = %slot_id,
                             error = %error,
                             "claimed slot runtime dir not removed"
@@ -236,7 +236,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
 
             let pid = sandbox::journaled_pid(&*spawned_prepared);
             let journal = |cow: Option<&CowHandle>| {
-                sandbox::reconcile::SandboxStateRecord::new(
+                sandbox::reconcile::ComputerStateRecord::new(
                     new_id,
                     pid,
                     lease
@@ -279,7 +279,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                 // gets the same CoW semantics (block-level template
                 // sharing, sparse COW).
                 let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
-                    VmmError::Snapshot(format!(
+                    ComputerError::Snapshot(format!(
                         "checkpoint {} records no rootfs template; there is no disk to restore \
                          it onto",
                         snap_meta.id
@@ -384,10 +384,10 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             {
                 Ok(Ok(ClockSync::Synced)) => {}
                 Ok(Ok(ClockSync::AgentError(code))) => {
-                    warn!(sandbox_id = %id, code, "agent could not set the clock after restore");
+                    warn!(computer_id = %id, code, "agent could not set the clock after restore");
                 }
-                Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after restore failed: {e}"),
-                Err(_) => warn!(sandbox_id = %id, "clock sync after restore timed out"),
+                Ok(Err(e)) => warn!(computer_id = %id, "clock sync after restore failed: {e}"),
+                Err(_) => warn!(computer_id = %id, "clock sync after restore timed out"),
             }
         });
     }
@@ -421,7 +421,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             agent.reconfigure_network(&cmd),
         )
         .await
-        .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
+        .map_err(|_| ComputerError::Vsock("net reconfig after restore timed out".into()))
         .and_then(|r| r)
     };
 
@@ -452,7 +452,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
     // Persist cleanup metadata before handing runtime resources to the
     // instance. A failed durable write aborts and unwinds every resource.
     let adopted_slot = instance.lock().unwrap().pool_slot_id.clone();
-    let final_journal = sandbox::reconcile::SandboxStateRecord::new(
+    let final_journal = sandbox::reconcile::ComputerStateRecord::new(
         new_id,
         sandbox::journaled_pid(&*prepared),
         lease

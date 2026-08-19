@@ -5,14 +5,14 @@ use std::time::Duration;
 use tracing::info;
 
 use super::ComputerFlows;
-use crate::error::VmmError;
+use crate::error::ComputerError;
 use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::tasks::checkpoint::{CheckpointFailure, CheckpointRequest, checkpoint_impl};
 use crate::lifecycle::tasks::pause::release_for_pause;
 use crate::lifecycle::tasks::release::{release_everything, release_runtime_resources};
 use crate::lifecycle::tasks::{CaptureSpec, Drain, TaskFailure, TaskResult};
 use crate::sandbox::pause::PAUSE_SNAPSHOT_NAME;
-use crate::sandbox::{CheckpointInfo, SandboxState};
+use crate::sandbox::{CheckpointInfo, ComputerState};
 
 /// How often a stop looks for the workload it is draining to finish.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
@@ -33,13 +33,13 @@ impl ComputerFlows {
             Some(spec) => CheckpointRequest {
                 name: spec.name,
                 labels: spec.labels,
-                expected_state: SandboxState::Ready,
+                expected_state: ComputerState::Ready,
                 resume_after: !hold,
             },
             None => CheckpointRequest {
                 name: PAUSE_SNAPSHOT_NAME.to_owned(),
                 labels: std::collections::HashMap::new(),
-                expected_state: SandboxState::Pausing,
+                expected_state: ComputerState::Pausing,
                 resume_after: !hold,
             },
         };
@@ -88,7 +88,7 @@ impl ComputerFlows {
                 .shutdown(arcbox_vm_driver::ShutdownMode::Graceful { timeout: remaining })
                 .await
                 .map_err(|error| {
-                    TaskFailure::recoverable(VmmError::Process(format!(
+                    TaskFailure::recoverable(ComputerError::Process(format!(
                         "shut down computer {}: {error}",
                         self.id
                     )))
@@ -99,7 +99,7 @@ impl ComputerFlows {
         // area its files were staged into, then TAP/IP and the CoW device;
         // the record itself stays inspectable until Remove.
         self.release_scope(ReleaseScope::Runtime).await?;
-        info!(sandbox_id = %self.id, "computer stopped");
+        info!(computer_id = %self.id, "computer stopped");
         Ok(())
     }
 
@@ -115,11 +115,11 @@ impl ComputerFlows {
                 )
                 .await
             }
-            // Unreachable: `pause_sandbox` refuses direct mode before it
+            // Unreachable: `pause_computer` refuses direct mode before it
             // claims anything, because a direct-mode vmstate pins origin
             // paths and could never resume.
             ReleaseScope::KeepDisk if services.config.firecracker.jailer.is_none() => {
-                Err(VmmError::Config(
+                Err(ComputerError::Config(
                     "computer pause requires jailer isolation; direct mode cannot resume".into(),
                 ))
             }

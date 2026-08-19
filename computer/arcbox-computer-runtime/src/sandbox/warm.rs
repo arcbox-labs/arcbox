@@ -41,7 +41,7 @@ fn fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
 
 /// Derive the warm key for an effective (defaults-applied) create spec,
 /// fingerprinting the kernel and rootfs files on disk.
-pub(super) fn derive_warm_key(spec: &SandboxSpec) -> std::io::Result<WarmKey> {
+pub(super) fn derive_warm_key(spec: &ComputerSpec) -> std::io::Result<WarmKey> {
     Ok(warm_key(
         spec,
         fingerprint(Path::new(&spec.kernel))?,
@@ -108,28 +108,28 @@ pub struct WarmPublishTicket {
 /// a cmd-less boot, `Starting` when the tail is still holding the workload
 /// slot for the initial cmd.
 pub async fn publish_after_boot(
-    sandbox_id: &SandboxId,
+    computer_id: &ComputerId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
     cow_manager: &CowManager,
-    expected_state: SandboxState,
+    expected_state: ComputerState,
 ) -> Result<()> {
     if !ticket.cache.begin_publish(&ticket.key) {
         debug!(
-            sandbox_id,
+            computer_id,
             "a warm snapshot publish for this key is already in flight"
         );
         return Ok(());
     }
     let started = std::time::Instant::now();
     let published =
-        publish_warm_snapshot(sandbox_id, ticket, computer, cow_manager, expected_state).await;
+        publish_warm_snapshot(computer_id, ticket, computer, cow_manager, expected_state).await;
     ticket.cache.end_publish(&ticket.key);
     match published {
         Ok(Some(snapshot_id)) => {
             let checkpoint_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             info!(
-                sandbox_id,
+                computer_id,
                 snapshot_id, checkpoint_ms, "warm template snapshot published"
             );
             Ok(())
@@ -138,7 +138,7 @@ pub async fn publish_after_boot(
         Err(PublishFailure::Frozen(error)) => Err(error),
         Err(PublishFailure::Recoverable(error)) => {
             warn!(
-                sandbox_id,
+                computer_id,
                 %error,
                 "warm snapshot publish failed; later creates keep cold-booting"
             );
@@ -151,12 +151,12 @@ pub async fn publish_after_boot(
 /// its guest is frozen and the boot must fail (see
 /// [`CheckpointFailure`](crate::lifecycle::tasks::checkpoint::CheckpointFailure)).
 enum PublishFailure {
-    Recoverable(VmmError),
-    Frozen(VmmError),
+    Recoverable(ComputerError),
+    Frozen(ComputerError),
 }
 
-impl From<VmmError> for PublishFailure {
-    fn from(error: VmmError) -> Self {
+impl From<ComputerError> for PublishFailure {
+    fn from(error: ComputerError) -> Self {
         Self::Recoverable(error)
     }
 }
@@ -176,11 +176,11 @@ impl From<crate::lifecycle::tasks::checkpoint::CheckpointFailure> for PublishFai
 /// (see [`super::policy::warm`]).
 /// Returns `None` when the key was already cached by a concurrent create.
 async fn publish_warm_snapshot(
-    sandbox_id: &SandboxId,
+    computer_id: &ComputerId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
     cow_manager: &CowManager,
-    expected_state: SandboxState,
+    expected_state: ComputerState,
 ) -> std::result::Result<Option<String>, PublishFailure> {
     // A concurrent first-create may have published while this guest booted.
     if warm_entries(&ticket.snapshots)?
@@ -195,7 +195,7 @@ async fn publish_warm_snapshot(
     let info = crate::lifecycle::tasks::checkpoint::checkpoint_impl(
         computer,
         &ticket.snapshots,
-        sandbox_id,
+        computer_id,
         crate::lifecycle::tasks::checkpoint::CheckpointRequest {
             name,
             labels,
@@ -256,14 +256,14 @@ mod tests {
         warm_key(&base_spec(), fingerprint_of(7), fingerprint_of(42))
     }
 
-    fn base_spec() -> SandboxSpec {
-        SandboxSpec {
+    fn base_spec() -> ComputerSpec {
+        ComputerSpec {
             kernel: "/run/kernel/vmlinux".into(),
             rootfs: "/data/rootfs.ext4".into(),
             boot_args: "console=ttyS0 quiet".into(),
             vcpus: 2,
             memory_mib: 512,
-            network: SandboxNetworkSpec { mode: "tap".into() },
+            network: ComputerNetworkSpec { mode: "tap".into() },
             ..Default::default()
         }
     }

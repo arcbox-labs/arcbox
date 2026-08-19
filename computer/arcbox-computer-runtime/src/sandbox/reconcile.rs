@@ -1,6 +1,6 @@
 //! Crash-recovery reconciliation for sandbox runtime state.
 //!
-//! `SandboxManager` state is in-memory; if the agent restarts (crash,
+//! `ComputerManager` state is in-memory; if the agent restarts (crash,
 //! supervision respawn) the VMM processes, TAP devices, dm-snapshot
 //! devices, and jailer chroots of running sandboxes are left with no owner,
 //! and fresh IP allocations can collide with orphaned TAPs. To recover,
@@ -24,7 +24,7 @@
 //! - the durable record is `Ready`. `Starting` died with the boot task that
 //!   was driving it and nothing here finishes one; the transitional phases
 //!   died between resource states;
-//! - the journal says how its lease attaches ([`SandboxStateRecord::attach_mode`]),
+//! - the journal says how its lease attaches ([`ComputerStateRecord::attach_mode`]),
 //!   and the guest network takes that lease back under exactly that mode;
 //! - the CoW manager re-registers the dm-snapshot the guest is running on.
 //!
@@ -52,10 +52,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
-use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
-use super::{LeaseExt, SandboxState};
+use super::record::{ComputerRecord, ComputerRecordStore, ComputerTransition, PersistPhase};
+use super::{ComputerState, LeaseExt};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::snapshot_cow::{
@@ -133,7 +133,7 @@ impl CowRecord {
 /// the daemon stages the agent it shipped with, so an old agent only ever sees
 /// new records across a daemon downgrade.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SandboxStateRecord {
+pub struct ComputerStateRecord {
     /// Sandbox ID (also the directory name).
     pub id: String,
     /// The VMM's PID at boot time.
@@ -151,7 +151,7 @@ pub struct SandboxStateRecord {
     /// by [`tap_name_for`], the same rule [`validate_state_record`]
     /// enforces, and the resolvers from the network config the pool was
     /// built with — and neither is read back:
-    /// [`SandboxStateRecord::lease`] is what the sweep uses.
+    /// [`ComputerStateRecord::lease`] is what the sweep uses.
     #[serde(default)]
     pub network: Option<JournaledAllocation>,
     /// dm-snapshot CoW resources to tear down.
@@ -323,7 +323,7 @@ const fn default_prefix_len() -> u8 {
     16
 }
 
-impl SandboxStateRecord {
+impl ComputerStateRecord {
     /// Assemble a record from boot/restore results.
     pub fn new(
         id: &str,
@@ -360,7 +360,10 @@ impl SandboxStateRecord {
                     ip: allocation.ip_address.into(),
                     prefix_len: allocation.prefix_len,
                     gateway: allocation.gateway.into(),
-                    mac: allocation.mac_address.parse().map_err(VmmError::from)?,
+                    mac: allocation
+                        .mac_address
+                        .parse()
+                        .map_err(ComputerError::from)?,
                     cleanup_token: allocation.cleanup_token.clone(),
                 })
             })
@@ -385,7 +388,7 @@ impl SandboxStateRecord {
 /// `lease` in the journal's legacy allocation shape.
 ///
 /// `tap_name` and `dns_servers` are the two fields a lease does not carry;
-/// see [`SandboxStateRecord::network`] for why they are written anyway.
+/// see [`ComputerStateRecord::network`] for why they are written anyway.
 fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<JournaledAllocation> {
     let ip = lease.ipv4()?;
     Ok(JournaledAllocation {
@@ -400,7 +403,7 @@ fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<JournaledAl
 }
 
 /// Atomically persist crash-recovery metadata before resources are exposed.
-pub fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<()> {
+pub fn write_state_record(vm_dir: &Path, record: &ComputerStateRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(record)?;
     arcbox_atomic_file::write(&vm_dir.join(STATE_FILE), &bytes)?;
     Ok(())
@@ -409,13 +412,13 @@ pub fn write_state_record(vm_dir: &Path, record: &SandboxStateRecord) -> Result<
 /// Creates a runtime directory and durably links it from its parent.
 pub(super) fn create_runtime_dir(vm_dir: &Path) -> Result<()> {
     let parent = vm_dir.parent().ok_or_else(|| {
-        crate::error::VmmError::Config(format!(
+        crate::error::ComputerError::Config(format!(
             "sandbox runtime directory has no parent: {}",
             vm_dir.display()
         ))
     })?;
     let data_dir = parent.parent().ok_or_else(|| {
-        crate::error::VmmError::Config(format!(
+        crate::error::ComputerError::Config(format!(
             "sandbox runtime parent has no parent: {}",
             parent.display()
         ))
@@ -442,7 +445,7 @@ pub fn clear_state_record(vm_dir: &Path) -> Result<()> {
 
 /// One sandbox whose VM outlived the process that booted it, with every
 /// runtime resource the sweep took back for it.
-pub(super) struct AdoptedSandbox {
+pub(super) struct AdoptedComputer {
     handle: Arc<dyn VmHandle>,
     lease: Option<NetworkLease>,
     identity: Option<NetworkIdentity>,
@@ -474,13 +477,13 @@ impl SkippedJournals {
     /// The durable key is the directory alone. The resource names are
     /// every spelling the record offers — the directory it sat in, the id
     /// it claims, the pool slot it says its dm/CoW resources are keyed by
-    /// ([`SandboxStateRecord::resource_owner`]), and the owners its
+    /// ([`ComputerStateRecord::resource_owner`]), and the owners its
     /// journaled CoW names spell out. One reason a journal is unreadable
     /// is that those disagree, so holding a name that turns out to be
     /// nobody's costs a leaked device this sweep would have reaped, while
     /// missing the real one aborts the whole reconciliation on a device a
     /// live VMM still pins.
-    fn hold(&mut self, dir: &Path, record: &SandboxStateRecord) {
+    fn hold(&mut self, dir: &Path, record: &ComputerStateRecord) {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
             self.ids.insert(name.to_owned());
             self.owners.insert(name.to_owned());
@@ -524,7 +527,7 @@ pub(super) struct OrphanSweep {
     ids: HashSet<String>,
     /// Sandboxes reclaimed alive, by id. Their journals stay on disk — they
     /// are live state again, not debris — and so do their runtime dirs.
-    adopted: HashMap<String, AdoptedSandbox>,
+    adopted: HashMap<String, AdoptedComputer>,
     /// Sandboxes whose journal this process could not read: the name of
     /// the directory each was found in, never the id it claimed.
     skipped: HashSet<String>,
@@ -579,7 +582,7 @@ pub(super) async fn sweep_orphans(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
     snapshots: &crate::snapshot::SnapshotCatalog,
-    store: &SandboxRecordStore,
+    store: &ComputerRecordStore,
 ) -> Result<OrphanSweep> {
     // Snapshots staged by a checkpoint that died mid-flight: unfinished by
     // definition, and each can hold a full memory dump.
@@ -602,7 +605,7 @@ pub(super) async fn sweep_orphans(
             continue;
         }
         let state_path = dir.join(STATE_FILE);
-        let record: SandboxStateRecord = match std::fs::read(&state_path) {
+        let record: ComputerStateRecord = match std::fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             // No record: either never booted or cleanly stopped.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -639,13 +642,13 @@ pub(super) async fn sweep_orphans(
         // snapshot and execution ids that never become a VM identity, and
         // is deliberately permissive for exactly this reason — so the id a
         // driver will be handed is parsed here, letting `adopt_or_kill` and
-        // [`SandboxStateRecord::lease`] rely on it downstream.
+        // [`ComputerStateRecord::lease`] rely on it downstream.
         let usable = validate_state_record(config, &sandboxes_dir, &dir, &record)
-            .and_then(|()| VmId::new(record.id.as_str()).map_err(VmmError::from))
-            .and_then(|_| VmId::new(record.resource_owner()).map_err(VmmError::from));
+            .and_then(|()| VmId::new(record.id.as_str()).map_err(ComputerError::from))
+            .and_then(|_| VmId::new(record.resource_owner()).map_err(ComputerError::from));
         if let Err(error) = usable {
             warn!(
-                sandbox_id = %record.id,
+                computer_id = %record.id,
                 path = %dir.display(),
                 %error,
                 "skipping an unusable crash journal: its VM is left alone and every \
@@ -722,8 +725,8 @@ pub(super) async fn sweep_orphans(
     reason = "the sweep's whole resource set, threaded rather than re-derived"
 )]
 async fn reap_orphans(
-    records: &[(PathBuf, SandboxStateRecord)],
-    adopted: &mut HashMap<String, AdoptedSandbox>,
+    records: &[(PathBuf, ComputerStateRecord)],
+    adopted: &mut HashMap<String, AdoptedComputer>,
     retained: &HashSet<String>,
     held: &HashSet<String>,
     phases: &HashMap<&str, super::record::PersistPhase>,
@@ -792,18 +795,21 @@ async fn reap_orphans(
             continue;
         }
         if recovery::sweep_action(&record.id, retained) == SweepAction::DropStaleJournal {
-            info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
+            info!(computer_id = %record.id, "dropping stale pause journal, keeping retained state");
             clear_state_record(dir)?;
             continue;
         }
-        info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
+        info!(computer_id = %record.id, "reconciling orphaned sandbox");
 
         if let Some(cow) = &record.cow {
             cow_manager.teardown_checked(&cow.to_handle()).await?;
         }
 
         if let Some(lease) = record.lease()? {
-            network.quarantine(lease).await.map_err(VmmError::from)?;
+            network
+                .quarantine(lease)
+                .await
+                .map_err(ComputerError::from)?;
         }
 
         // The VM's own area — under the jailer, a whole chroot holding the
@@ -848,7 +854,7 @@ pub(super) async fn finalize_sweep(sweep: OrphanSweep) -> Result<()> {
 /// carries are needed afterwards, by [`finalize_sweep`].
 pub(super) struct SweptRuntime {
     swept: HashSet<String>,
-    adopted: HashMap<String, AdoptedSandbox>,
+    adopted: HashMap<String, AdoptedComputer>,
     skipped: HashSet<String>,
 }
 
@@ -867,7 +873,7 @@ pub(super) struct SweptRuntime {
 /// the only handle keeping its guest alive, so dropping either here would
 /// kill that guest with its lease and template refcount still held.
 pub(super) fn normalize_durable_records(
-    store: &SandboxRecordStore,
+    store: &ComputerRecordStore,
     data_dir: &Path,
     sweep: Option<&mut SweptRuntime>,
     built: &mut Vec<RecoveredComputer>,
@@ -898,14 +904,14 @@ pub(super) fn normalize_durable_records(
         match recovery::plan(record.phase, evidence) {
             RecoveryAction::LeaveResumable => {}
             RecoveryAction::RefuseUnjournaled => {
-                return Err(crate::error::VmmError::Unavailable(format!(
+                return Err(crate::error::ComputerError::Unavailable(format!(
                     "sandbox {} is {} but has no cleanup journal",
                     record.id,
                     record.phase.as_str()
                 )));
             }
             RecoveryAction::RefuseAdopted => {
-                return Err(crate::error::VmmError::Unavailable(format!(
+                return Err(crate::error::ComputerError::Unavailable(format!(
                     "sandbox {} is {}, a phase the startup sweep must not adopt",
                     record.id,
                     record.phase.as_str()
@@ -916,12 +922,12 @@ pub(super) fn normalize_durable_records(
                     .transition(
                         &record.id,
                         record.generation,
-                        SandboxTransition::Failed(AGENT_RESTART_ERROR.into()),
+                        ComputerTransition::Failed(AGENT_RESTART_ERROR.into()),
                     )?
                     .confirmed("sandbox restart normalization")?;
                 inactive.push(RecoveredComputer::reinstated(inactive_instance(
                     record,
-                    SandboxState::Failed,
+                    ComputerState::Failed,
                     data_dir,
                 )));
             }
@@ -984,7 +990,7 @@ pub(super) async fn release_unclaimed(
 /// Best-effort per resource: it runs while an error is already on its way
 /// out, and every sandbox's journal survives to be swept again.
 async fn release_reclaimed(
-    adopted: &mut HashMap<String, AdoptedSandbox>,
+    adopted: &mut HashMap<String, AdoptedComputer>,
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) {
@@ -1049,7 +1055,7 @@ async fn kill_or_hand_over(id: &str, handle: &Arc<dyn VmHandle>) -> Result<()> {
     if let Some(detach) = handle.detach()
         && let Err(error) = detach.detach().await
     {
-        warn!(sandbox_id = %id, %error, "handing the vmm over failed; dropping it kills it");
+        warn!(computer_id = %id, %error, "handing the vmm over failed; dropping it kills it");
     }
     Err(error.into())
 }
@@ -1072,10 +1078,10 @@ async fn release_one(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) {
-    warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
+    warn!(computer_id = %id, "releasing a reclaimed sandbox that recovery did not take");
     if let Err(error) = kill_or_hand_over(id, handle).await {
         warn!(
-            sandbox_id = %id, %error,
+            computer_id = %id, %error,
             "killing the reclaimed vmm failed; leaving it, its disk and its address for the next sweep"
         );
         return;
@@ -1083,12 +1089,12 @@ async fn release_one(
     if let Some(cow_handle) = cow_handle
         && let Err(error) = cow_manager.teardown_checked(cow_handle).await
     {
-        warn!(sandbox_id = %id, %error, "releasing the reclaimed disk overlay failed");
+        warn!(computer_id = %id, %error, "releasing the reclaimed disk overlay failed");
     }
     if let Some(lease) = lease
         && let Err(error) = network.quarantine(lease).await
     {
-        warn!(sandbox_id = %id, %error, "quarantining the reclaimed lease failed");
+        warn!(computer_id = %id, %error, "quarantining the reclaimed lease failed");
     }
 }
 
@@ -1113,10 +1119,10 @@ impl RecoveredComputer {
 /// what it left rather than a decision: `plan` only ever reinstates the three
 /// inactive phases, and the `Fail` verdict writes `Failed` before it gets
 /// here.
-const fn phase_of(state: SandboxState) -> PersistPhase {
+const fn phase_of(state: ComputerState) -> PersistPhase {
     match state {
-        SandboxState::Paused | SandboxState::Pausing => PersistPhase::Paused,
-        SandboxState::Stopped | SandboxState::Stopping => PersistPhase::Stopped,
+        ComputerState::Paused | ComputerState::Pausing => PersistPhase::Paused,
+        ComputerState::Stopped | ComputerState::Stopping => PersistPhase::Stopped,
         _ => PersistPhase::Failed,
     }
 }
@@ -1154,15 +1160,15 @@ pub(super) fn seed_computers(
             // Unreachable: the sweep runs before any create can claim an id,
             // and every record it reads is distinct.
             Err(error) => {
-                warn!(sandbox_id = %id, %error, "a recovered computer's id was already claimed");
+                warn!(computer_id = %id, %error, "a recovered computer's id was already claimed");
             }
         }
     }
 }
 
 fn inactive_instance(
-    record: SandboxRecord,
-    state: SandboxState,
+    record: ComputerRecord,
+    state: ComputerState,
     data_dir: &Path,
 ) -> ComputerRuntime {
     let vm_dir = data_dir.join("sandboxes").join(&record.id);
@@ -1179,7 +1185,7 @@ fn inactive_instance(
     // The TTL cap survives restarts: a reloaded paused sandbox still
     // expires (the lifecycle monitor re-arms the timer after reconcile).
     instance.ttl_deadline = record.ttl_deadline;
-    if state == SandboxState::Paused {
+    if state == ComputerState::Paused {
         instance.pause_snapshot_id = record.pause_snapshot_id;
         instance.paused_at = record.paused_at;
     }
@@ -1197,12 +1203,12 @@ fn inactive_instance(
 /// is not journaled, so it stays `None` rather than being invented from this
 /// restart's clock.
 fn adopted_instance(
-    record: SandboxRecord,
-    state: SandboxState,
+    record: ComputerRecord,
+    state: ComputerState,
     data_dir: &Path,
-    adopted: AdoptedSandbox,
+    adopted: AdoptedComputer,
 ) -> ComputerRuntime {
-    let AdoptedSandbox {
+    let AdoptedComputer {
         handle,
         lease,
         identity,
@@ -1240,9 +1246,9 @@ async fn adopt_or_kill(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
     runtime_dir: &Path,
-    record: &SandboxStateRecord,
+    record: &ComputerStateRecord,
     phase: Option<super::record::PersistPhase>,
-) -> Result<Option<AdoptedSandbox>> {
+) -> Result<Option<AdoptedComputer>> {
     let Some(adopt) = driver.adopt() else {
         return Ok(None);
     };
@@ -1250,7 +1256,7 @@ async fn adopt_or_kill(
     let adopted = tokio::time::timeout(ADOPT_TIMEOUT, adopt.adopt(&vm_record))
         .await
         .map_err(|_| {
-            VmmError::Process(format!(
+            ComputerError::Process(format!(
                 "sandbox {}: the driver did not find or reconnect to its vmm within {}s",
                 record.id,
                 ADOPT_TIMEOUT.as_secs()
@@ -1263,12 +1269,12 @@ async fn adopt_or_kill(
 
     match reclaim(network, cow_manager, record, phase, &handle).await {
         Ok(reclaimed) => {
-            info!(sandbox_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
+            info!(computer_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
             Ok(Some(reclaimed))
         }
         Err(reason) => {
             info!(
-                sandbox_id = %record.id, vm = %vm_record.id, %reason,
+                computer_id = %record.id, vm = %vm_record.id, %reason,
                 "killing the orphaned vmm"
             );
             // A kill that fails leaves the VM alive and still pinning its dm
@@ -1295,7 +1301,7 @@ async fn adopt_or_kill(
 fn vm_record(
     driver: &dyn VmDriver,
     runtime_dir: &Path,
-    record: &SandboxStateRecord,
+    record: &ComputerStateRecord,
 ) -> Result<VmRecord> {
     Ok(VmRecord {
         id: VmId::new(record.resource_owner())?,
@@ -1323,10 +1329,10 @@ fn vm_record(
 async fn reclaim(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
-    record: &SandboxStateRecord,
+    record: &ComputerStateRecord,
     phase: Option<super::record::PersistPhase>,
     handle: &Arc<dyn VmHandle>,
-) -> std::result::Result<AdoptedSandbox, String> {
+) -> std::result::Result<AdoptedComputer, String> {
     // A guest that is quiesced (a checkpoint that died between the pause and
     // the resume) or gone answers nothing; only a running one is usable.
     match handle.state() {
@@ -1383,7 +1389,7 @@ async fn reclaim(
             .map_err(|error| format!("its disk overlay could not be re-registered: {error}"))?;
     }
 
-    Ok(AdoptedSandbox {
+    Ok(AdoptedComputer {
         handle: Arc::clone(handle),
         lease,
         identity,
@@ -1405,11 +1411,11 @@ fn validate_state_record(
     config: &RuntimeConfig,
     sandboxes_dir: &Path,
     directory: &Path,
-    record: &SandboxStateRecord,
+    record: &ComputerStateRecord,
 ) -> Result<()> {
     super::validate_id("sandbox id", &record.id)?;
     if directory.file_name().and_then(|name| name.to_str()) != Some(record.id.as_str()) {
-        return Err(crate::error::VmmError::Config(format!(
+        return Err(crate::error::ComputerError::Config(format!(
             "sandbox cleanup record id {} does not match directory {}",
             record.id,
             directory.display()
@@ -1418,7 +1424,7 @@ fn validate_state_record(
     if let Some(network) = &record.network {
         let expected = tap_name_for(network.ip_address);
         if network.tap_name != expected {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has unexpected TAP {}",
                 record.id, network.tap_name
             )));
@@ -1427,7 +1433,7 @@ fn validate_state_record(
     if let Some(slot_id) = &record.pool_slot_id {
         super::validate_id("pool slot id", slot_id)?;
         if !slot_id.starts_with(POOL_SLOT_PREFIX) {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has non-pool slot id {slot_id}",
                 record.id
             )));
@@ -1443,7 +1449,7 @@ fn validate_state_record(
             || cow.dm_device != format!("/dev/mapper/{expected_name}")
             || cow.cow_file != expected_file
         {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} cleanup record has invalid CoW resources",
                 record.id
             )));
@@ -1452,7 +1458,7 @@ fn validate_state_record(
     if let Some(origin) = &record.restore_origin_dir {
         let origin_id = origin.file_name().and_then(|name| name.to_str());
         if origin.parent() != Some(sandboxes_dir) || origin_id.is_none() {
-            return Err(crate::error::VmmError::Config(format!(
+            return Err(crate::error::ComputerError::Config(format!(
                 "sandbox {} restore origin escapes {}",
                 record.id,
                 sandboxes_dir.display()
@@ -1467,8 +1473,8 @@ fn validate_state_record(
 mod tests {
     use std::collections::HashMap;
 
-    use super::super::SandboxSpec;
-    use super::super::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
+    use super::super::ComputerSpec;
+    use super::super::record::{ComputerProvisionOutcome, PersistPhase, ProvisionIntent};
     use super::*;
 
     /// `state.json` written before the guest-network port existed, verbatim.
@@ -1497,7 +1503,7 @@ mod tests {
 
     #[test]
     fn a_pre_port_journal_loads_and_is_written_back_unchanged() {
-        let record: SandboxStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
+        let record: ComputerStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
         let lease = record.lease().unwrap().expect("the record holds a lease");
         assert_eq!(lease.vm.as_str(), "box");
         assert_eq!(lease.ip, "172.20.0.7".parse::<std::net::IpAddr>().unwrap());
@@ -1524,7 +1530,7 @@ mod tests {
             cgroup_version: None,
             parent_cgroup: None,
         });
-        let written = SandboxStateRecord::new(
+        let written = ComputerStateRecord::new(
             "box",
             Some(4242),
             Some(JournaledLease::cold_boot(&lease, true)),
@@ -1569,7 +1575,7 @@ mod tests {
           },
           "jailer": true
         }"#;
-        let record: SandboxStateRecord = serde_json::from_str(OLDEST_RECORD).unwrap();
+        let record: ComputerStateRecord = serde_json::from_str(OLDEST_RECORD).unwrap();
         let network = record.network.as_ref().expect("the record holds a network");
         assert_eq!(network.prefix_len, 16);
         assert_eq!(network.cleanup_token, "");
@@ -1584,7 +1590,7 @@ mod tests {
     /// datapath.
     #[test]
     fn a_journal_without_an_attach_mode_loads_as_not_adoptable() {
-        let record: SandboxStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
+        let record: ComputerStateRecord = serde_json::from_str(LEGACY_RECORD).unwrap();
         assert_eq!(record.attach_mode, None);
         assert!(!record.net_invariant);
     }
@@ -1603,7 +1609,7 @@ mod tests {
         };
         let config = RuntimeConfig::default();
         for baked in [true, false] {
-            let record = SandboxStateRecord::new(
+            let record = ComputerStateRecord::new(
                 "box",
                 None,
                 Some(JournaledLease::cold_boot(&lease, baked)),
@@ -1617,7 +1623,7 @@ mod tests {
         }
         // A restore or resume is the only thing that varies the mode, and
         // both halves come from the snapshot's flag there.
-        let legacy = SandboxStateRecord::new(
+        let legacy = ComputerStateRecord::new(
             "box",
             None,
             Some(JournaledLease::from_snapshot(&lease, false)),
@@ -1633,10 +1639,14 @@ mod tests {
         assert!(!legacy.net_invariant);
     }
 
-    fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: PersistPhase) -> SandboxRecord {
-        let spec = SandboxSpec {
+    fn record_in_phase(
+        store: &ComputerRecordStore,
+        id: &str,
+        phase: PersistPhase,
+    ) -> ComputerRecord {
+        let spec = ComputerSpec {
             id: Some(id.into()),
-            ..SandboxSpec::default()
+            ..ComputerSpec::default()
         };
         let record = match store.provision_intent(id, "create-key", spec).unwrap() {
             ProvisionIntent::Created(record) => record,
@@ -1651,7 +1661,7 @@ mod tests {
                     .transition(
                         id,
                         generation,
-                        SandboxTransition::Failed("original failure".into()),
+                        ComputerTransition::Failed("original failure".into()),
                     )
                     .unwrap();
             }
@@ -1660,13 +1670,13 @@ mod tests {
                     .transition(
                         id,
                         generation,
-                        SandboxTransition::Starting(SandboxProvisionOutcome {
+                        ComputerTransition::Starting(ComputerProvisionOutcome {
                             ip_address: "192.0.2.2".into(),
                         }),
                     )
                     .unwrap();
                 store
-                    .transition(id, generation, SandboxTransition::Removing)
+                    .transition(id, generation, ComputerTransition::Removing)
                     .unwrap();
             }
             phase => {
@@ -1674,7 +1684,7 @@ mod tests {
                     .transition(
                         id,
                         generation,
-                        SandboxTransition::Starting(SandboxProvisionOutcome {
+                        ComputerTransition::Starting(ComputerProvisionOutcome {
                             ip_address: "192.0.2.2".into(),
                         }),
                     )
@@ -1683,32 +1693,32 @@ mod tests {
                     PersistPhase::Starting => {}
                     PersistPhase::Ready => {
                         store
-                            .transition(id, generation, SandboxTransition::Ready)
+                            .transition(id, generation, ComputerTransition::Ready)
                             .unwrap();
                     }
                     PersistPhase::Stopping | PersistPhase::Stopped => {
                         store
-                            .transition(id, generation, SandboxTransition::Stopping)
+                            .transition(id, generation, ComputerTransition::Stopping)
                             .unwrap();
                         if phase == PersistPhase::Stopped {
                             store
-                                .transition(id, generation, SandboxTransition::Stopped)
+                                .transition(id, generation, ComputerTransition::Stopped)
                                 .unwrap();
                         }
                     }
                     PersistPhase::Pausing | PersistPhase::Paused | PersistPhase::Resuming => {
                         store
-                            .transition(id, generation, SandboxTransition::Ready)
+                            .transition(id, generation, ComputerTransition::Ready)
                             .unwrap();
                         store
-                            .transition(id, generation, SandboxTransition::Pausing)
+                            .transition(id, generation, ComputerTransition::Pausing)
                             .unwrap();
                         if phase != PersistPhase::Pausing {
                             store
                                 .transition(
                                     id,
                                     generation,
-                                    SandboxTransition::Paused {
+                                    ComputerTransition::Paused {
                                         snapshot_id: "snap".into(),
                                     },
                                 )
@@ -1716,7 +1726,7 @@ mod tests {
                         }
                         if phase == PersistPhase::Resuming {
                             store
-                                .transition(id, generation, SandboxTransition::Resuming)
+                                .transition(id, generation, ComputerTransition::Resuming)
                                 .unwrap();
                         }
                     }
@@ -1730,7 +1740,7 @@ mod tests {
 
     #[test]
     fn state_record_roundtrips_through_json() {
-        let record = SandboxStateRecord {
+        let record = ComputerStateRecord {
             id: "sb-1".into(),
             pid: Some(42),
             network: None,
@@ -1748,7 +1758,7 @@ mod tests {
             net_invariant: true,
         };
         let bytes = serde_json::to_vec(&record).unwrap();
-        let parsed: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
+        let parsed: ComputerStateRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.id, "sb-1");
         assert_eq!(parsed.pid, Some(42));
         assert!(parsed.jailer);
@@ -1772,7 +1782,7 @@ mod tests {
                 .join(format!("arcbox-cow-{owner}.img")),
             template_path: "/var/lib/arcbox/sandbox/rootfs.ext4".into(),
         };
-        let record = |slot: Option<&str>, cow_owner: &str| SandboxStateRecord {
+        let record = |slot: Option<&str>, cow_owner: &str| ComputerStateRecord {
             id: "sb-1".into(),
             pid: None,
             network: None,
@@ -1830,7 +1840,7 @@ mod tests {
     #[test]
     fn startup_normalizes_crash_phases_and_restores_inactive_records() {
         let data_dir = tempfile::tempdir().unwrap();
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         for (id, phase) in [
             ("creating", PersistPhase::Creating),
             ("starting", PersistPhase::Starting),
@@ -1857,7 +1867,7 @@ mod tests {
             assert_eq!(record.error.as_deref(), Some(AGENT_RESTART_ERROR));
 
             let instance = &inactive[id];
-            assert_eq!(instance.runtime.state, SandboxState::Failed);
+            assert_eq!(instance.runtime.state, ComputerState::Failed);
             assert_eq!(instance.runtime.error.as_deref(), Some(AGENT_RESTART_ERROR));
             assert_eq!(instance.runtime.record_generation, Some(record.generation));
             assert!(instance.runtime.prepared.is_none());
@@ -1865,8 +1875,8 @@ mod tests {
             assert!(instance.runtime.network.is_none());
         }
 
-        assert_eq!(inactive["stopped"].runtime.state, SandboxState::Stopped);
-        assert_eq!(inactive["failed"].runtime.state, SandboxState::Failed);
+        assert_eq!(inactive["stopped"].runtime.state, ComputerState::Stopped);
+        assert_eq!(inactive["failed"].runtime.state, ComputerState::Failed);
         assert_eq!(
             inactive["failed"].runtime.error.as_deref(),
             Some("original failure")
@@ -1882,7 +1892,7 @@ mod tests {
     #[test]
     fn paused_records_survive_restart_while_interrupted_transitions_fail() {
         let data_dir = tempfile::tempdir().unwrap();
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "clean", PersistPhase::Paused);
         record_in_phase(&store, "mid-pause", PersistPhase::Pausing);
         record_in_phase(&store, "mid-resume", PersistPhase::Resuming);
@@ -1901,7 +1911,7 @@ mod tests {
             .collect();
 
         let clean = &inactive["clean"].runtime;
-        assert_eq!(clean.state, SandboxState::Paused);
+        assert_eq!(clean.state, ComputerState::Paused);
         assert_eq!(clean.pause_snapshot_id.as_deref(), Some("snap"));
         assert!(clean.paused_at.is_some());
         assert_eq!(
@@ -1912,7 +1922,7 @@ mod tests {
         // An interrupted pause/resume never reached a durable Paused commit;
         // its resources were swept, so it degrades honestly.
         for id in ["mid-pause", "mid-resume"] {
-            assert_eq!(inactive[id].runtime.state, SandboxState::Failed, "{id}");
+            assert_eq!(inactive[id].runtime.state, ComputerState::Failed, "{id}");
             assert_eq!(
                 store.load(id).unwrap().unwrap().phase,
                 PersistPhase::Failed,
@@ -1927,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn stale_pause_journal_is_dropped_and_retained_state_survives() {
         let data_dir = tempfile::tempdir().unwrap();
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "napper", PersistPhase::Paused);
 
         let vm_dir = data_dir.path().join("sandboxes").join("napper");
@@ -1944,14 +1954,14 @@ mod tests {
         let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
-        let manager = super::super::SandboxManager::new(config, environment).unwrap();
+        let manager = super::super::ComputerManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
 
         assert!(!vm_dir.join(STATE_FILE).exists());
         assert!(parked_rootfs.exists());
         assert!(cow_file.exists());
         let napper = manager.snapshot(&"napper".to_owned()).unwrap();
-        assert_eq!(napper.state, SandboxState::Paused);
+        assert_eq!(napper.state, ComputerState::Paused);
         assert_eq!(napper.pause_snapshot_id.as_deref(), Some("snap"));
     }
 
@@ -2000,7 +2010,7 @@ mod tests {
         config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
         write_state_record(
             &vm_dir,
-            &SandboxStateRecord::new(
+            &ComputerStateRecord::new(
                 "orphan",
                 Some(i32::try_from(pid).unwrap()),
                 None,
@@ -2011,7 +2021,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2147,7 +2157,7 @@ mod tests {
         unjournaled: &[(&str, PersistPhase)],
     ) -> (
         Box<dyn VmHandle>,
-        super::super::SandboxManager,
+        super::super::ComputerManager,
         std::sync::Arc<arcbox_vm_driver::testkit::FakeNetwork>,
         Result<()>,
     ) {
@@ -2161,7 +2171,7 @@ mod tests {
 
         let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
-        let store = SandboxRecordStore::new(data_dir).unwrap();
+        let store = ComputerRecordStore::new(data_dir).unwrap();
         record_in_phase(&store, "keeper", case.phase);
         // Durable records with no journal at all, which is what makes
         // recovery refuse to normalize and fails the whole reconciliation.
@@ -2178,7 +2188,7 @@ mod tests {
             mac: "02:fc:00:00:00:09".parse().unwrap(),
             cleanup_token: "gen-1".into(),
         };
-        let mut record = SandboxStateRecord::new(
+        let mut record = ComputerStateRecord::new(
             "keeper",
             Some(i32::try_from(pid).unwrap()),
             Some(JournaledLease::cold_boot(&lease, true)),
@@ -2196,7 +2206,7 @@ mod tests {
         if !case.network_adopts {
             network.fail_adopt_once();
         }
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2212,7 +2222,7 @@ mod tests {
     /// The payload: a `Ready` sandbox whose VM outlived its agent comes back
     /// with everything it was running on, and its journal stays where it is.
     #[tokio::test]
-    async fn a_live_ready_sandbox_is_reclaimed_rather_than_killed() {
+    async fn a_live_ready_computer_is_reclaimed_rather_than_killed() {
         let data_dir = tempfile::tempdir().unwrap();
         let (vm, manager, network, reconciled) =
             sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
@@ -2222,7 +2232,7 @@ mod tests {
         let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
         // `Ready`, not `Running`: the workload the previous process was
         // streaming did not survive it, and `Running` refuses the next `Run`.
-        assert_eq!(keeper.state, SandboxState::Ready);
+        assert_eq!(keeper.state, ComputerState::Ready);
         assert!(keeper.handle.is_some(), "the VM's handle came back");
         assert_eq!(
             keeper.lease.as_ref().map(|lease| lease.ip.to_string()),
@@ -2265,10 +2275,11 @@ mod tests {
         // nothing this crate does produces one.
         let broken_dir = data_dir.path().join("sandboxes").join("broken");
         std::fs::create_dir_all(&broken_dir).unwrap();
-        let stray = SandboxStateRecord::new("not-broken", None, None, None, &config, None).unwrap();
+        let stray =
+            ComputerStateRecord::new("not-broken", None, None, None, &config, None).unwrap();
         write_state_record(&broken_dir, &stray).unwrap();
 
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "broken", PersistPhase::Ready);
         drop(store);
 
@@ -2283,13 +2294,13 @@ mod tests {
         );
         assert_eq!(
             manager.snapshot(&"keeper".to_owned()).unwrap().state,
-            SandboxState::Ready
+            ComputerState::Ready
         );
         // Inspectable rather than fatal. `Unjournaled` would have refused a
         // live phase here, which is the abort the skip exists to avoid.
         assert_eq!(
             manager.snapshot(&"broken".to_owned()).unwrap().state,
-            SandboxState::Failed,
+            ComputerState::Failed,
             "the unreadable one is reported, not reconciled"
         );
         assert!(
@@ -2317,10 +2328,10 @@ mod tests {
         let legacy = "inst_7f3a";
         let legacy_dir = data_dir.path().join("sandboxes").join(legacy);
         std::fs::create_dir_all(&legacy_dir).unwrap();
-        let record = SandboxStateRecord::new(legacy, None, None, None, &config, None).unwrap();
+        let record = ComputerStateRecord::new(legacy, None, None, None, &config, None).unwrap();
         write_state_record(&legacy_dir, &record).unwrap();
 
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, legacy, PersistPhase::Ready);
         drop(store);
 
@@ -2335,7 +2346,7 @@ mod tests {
         );
         assert_eq!(
             manager.snapshot(&legacy.to_owned()).unwrap().state,
-            SandboxState::Failed,
+            ComputerState::Failed,
             "the one it could not is reported, not reconciled"
         );
         assert!(
@@ -2370,7 +2381,7 @@ mod tests {
         };
         let broken_dir = data_dir.path().join("sandboxes").join("broken");
         std::fs::create_dir_all(&broken_dir).unwrap();
-        let mut stray = SandboxStateRecord::new(
+        let mut stray = ComputerStateRecord::new(
             "not-broken",
             None,
             Some(JournaledLease::cold_boot(&lease, true)),
@@ -2448,7 +2459,7 @@ mod tests {
         // that makes a journal unreadable in the first place.
         let broken_dir = data_dir.path().join("sandboxes").join("broken");
         std::fs::create_dir_all(&broken_dir).unwrap();
-        let stray = SandboxStateRecord::new("ghost", None, None, None, &config, None).unwrap();
+        let stray = ComputerStateRecord::new("ghost", None, None, None, &config, None).unwrap();
         write_state_record(&broken_dir, &stray).unwrap();
 
         // A real `ghost`: durably `Ready`, with no journal of its own. Its
@@ -2504,7 +2515,7 @@ mod tests {
         };
         write_state_record(
             &keeper_dir,
-            &SandboxStateRecord::new(
+            &ComputerStateRecord::new(
                 "keeper",
                 keeper
                     .record()
@@ -2525,15 +2536,15 @@ mod tests {
         let _broken = boot_previous_vm(&driver, &broken_dir, "zzz-broken", true, false).await;
         write_state_record(
             &broken_dir,
-            &SandboxStateRecord::new("zzz-broken", None, None, None, &config, None).unwrap(),
+            &ComputerStateRecord::new("zzz-broken", None, None, None, &config, None).unwrap(),
         )
         .unwrap();
 
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "keeper", PersistPhase::Ready);
         drop(store);
 
-        let manager = super::super::SandboxManager::new(
+        let manager = super::super::ComputerManager::new(
             config.clone(),
             crate::NodeEnvironment {
                 driver: std::sync::Arc::new(driver),
@@ -2626,7 +2637,7 @@ mod tests {
         let lease = network
             .reserve(
                 &VmId::new("stuck").unwrap(),
-                super::super::sandbox_network_policy(),
+                super::super::computer_network_policy(),
             )
             .await
             .unwrap();
@@ -2636,7 +2647,7 @@ mod tests {
         let mut adopted = HashMap::new();
         adopted.insert(
             "stuck".to_owned(),
-            AdoptedSandbox {
+            AdoptedComputer {
                 handle: Arc::new(RefusesShutdown(Arc::from(vm))),
                 lease: Some(lease),
                 identity: None,
@@ -2768,7 +2779,7 @@ mod tests {
                 "{what}: the journal is cleared"
             );
             let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
-            assert_eq!(keeper.state, SandboxState::Failed, "{what}");
+            assert_eq!(keeper.state, ComputerState::Failed, "{what}");
             assert!(keeper.handle.is_none(), "{what}");
         }
     }
@@ -2812,7 +2823,7 @@ mod tests {
             let goner_dir = data_dir.path().join("sandboxes").join("goner");
             let goner = boot_previous_vm(&driver, &goner_dir, "goner", false, true).await;
             let mut journal =
-                SandboxStateRecord::new("goner", None, None, None, &config, None).unwrap();
+                ComputerStateRecord::new("goner", None, None, None, &config, None).unwrap();
             journal.jailer = journaled_jailer;
             write_state_record(&goner_dir, &journal).unwrap();
 
@@ -2821,7 +2832,7 @@ mod tests {
             let keeper = boot_previous_vm(&driver, &keeper_dir, "keeper", true, true).await;
             write_state_record(
                 &keeper_dir,
-                &SandboxStateRecord::new("keeper", None, None, None, &config, None).unwrap(),
+                &ComputerStateRecord::new("keeper", None, None, None, &config, None).unwrap(),
             )
             .unwrap();
 
@@ -2831,11 +2842,11 @@ mod tests {
             let _odd = boot_previous_vm(&driver, &odd_dir, "zzz-odd", true, true).await;
             write_state_record(
                 &odd_dir,
-                &SandboxStateRecord::new("someone-else", None, None, None, &config, None).unwrap(),
+                &ComputerStateRecord::new("someone-else", None, None, None, &config, None).unwrap(),
             )
             .unwrap();
 
-            let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+            let store = ComputerRecordStore::new(data_dir.path()).unwrap();
             record_in_phase(&store, "goner", PersistPhase::Ready);
             record_in_phase(&store, "keeper", PersistPhase::Ready);
             let cow_manager =
@@ -2863,7 +2874,7 @@ mod tests {
     #[test]
     fn active_record_without_cleanup_journal_blocks_normalization() {
         let data_dir = tempfile::tempdir().unwrap();
-        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        let store = ComputerRecordStore::new(data_dir.path()).unwrap();
         record_in_phase(&store, "starting", PersistPhase::Starting);
 
         assert!(matches!(
@@ -2873,7 +2884,7 @@ mod tests {
                 Some(&mut SweptRuntime::nothing_kept()),
                 &mut Vec::new()
             ),
-            Err(crate::error::VmmError::Unavailable(_))
+            Err(crate::error::ComputerError::Unavailable(_))
         ));
         assert_eq!(
             store.load("starting").unwrap().unwrap().phase,

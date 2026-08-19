@@ -24,7 +24,7 @@ impl ComputerActor {
             Effect::CommitRestored { durability } => {
                 return self.commit(
                     PersistPhase::Ready,
-                    SandboxTransition::ReadyWithOutcome(self.outcome.clone()),
+                    ComputerTransition::ReadyWithOutcome(self.outcome.clone()),
                     durability,
                 );
             }
@@ -146,15 +146,15 @@ impl ComputerActor {
 
     fn persist(&mut self, phase: PersistPhase, durability: Durability) -> Flow {
         let transition = match phase {
-            PersistPhase::Starting => SandboxTransition::Starting(self.outcome.clone()),
-            PersistPhase::Ready => SandboxTransition::Ready,
-            PersistPhase::Stopping => SandboxTransition::Stopping,
-            PersistPhase::Stopped => SandboxTransition::Stopped,
+            PersistPhase::Starting => ComputerTransition::Starting(self.outcome.clone()),
+            PersistPhase::Ready => ComputerTransition::Ready,
+            PersistPhase::Stopping => ComputerTransition::Stopping,
+            PersistPhase::Stopped => ComputerTransition::Stopped,
             PersistPhase::Failed => {
-                SandboxTransition::Failed(self.error.clone().unwrap_or_default())
+                ComputerTransition::Failed(self.error.clone().unwrap_or_default())
             }
-            PersistPhase::Removing => SandboxTransition::Removing,
-            PersistPhase::Pausing => SandboxTransition::Pausing,
+            PersistPhase::Removing => ComputerTransition::Removing,
+            PersistPhase::Pausing => ComputerTransition::Pausing,
             PersistPhase::Paused => {
                 // What a paused computer retains, recorded where every
                 // reader of it looks: `Inspect` and `List` size the
@@ -166,11 +166,11 @@ impl ComputerActor {
                 runtime
                     .pause_snapshot_id
                     .clone_from(&self.pause_snapshot_id);
-                SandboxTransition::Paused {
+                ComputerTransition::Paused {
                     snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
                 }
             }
-            PersistPhase::Resuming => SandboxTransition::Resuming,
+            PersistPhase::Resuming => ComputerTransition::Resuming,
             // The provisioning intent is written before there is a machine to
             // ask for it, so no transition names it.
             PersistPhase::Creating => return Flow::Continue,
@@ -181,7 +181,7 @@ impl ComputerActor {
     fn commit(
         &mut self,
         phase: PersistPhase,
-        transition: SandboxTransition,
+        transition: ComputerTransition,
         durability: Durability,
     ) -> Flow {
         let Some(generation) = self.generation else {
@@ -195,14 +195,14 @@ impl ComputerActor {
             // What that costs depends on what the phase was for. A phase the
             // flow is *about to act on* — `Stopping` before a shutdown,
             // `Removing` before a release, `Resuming` before a resume — must
-            // stop it, which is what `stop_sandbox`, `begin_removal` and
-            // `resume_sandbox` do with their `?`. A phase that only records
+            // stop it, which is what `stop_computer`, `begin_removal` and
+            // `resume_computer` do with their `?`. A phase that only records
             // where the computer *ended up* must not: `persist_boot_failure`
             // reports the failure and lets the release run, keeping the
             // crash journal — which is exactly what `GateJournal` means.
             Err(error) if matches!(durability, Durability::GateJournal) => {
                 error!(
-                    sandbox_id = %self.id,
+                    computer_id = %self.id,
                     %error,
                     phase = phase.as_str(),
                     "durable write was refused; keeping the crash journal"
@@ -220,14 +220,14 @@ impl ComputerActor {
         let phase = phase.as_str();
         match durability {
             Durability::Warn => {
-                warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; continuing");
+                warn!(computer_id = %self.id, error, phase, "durable write is unconfirmed; continuing");
                 Flow::Continue
             }
             Durability::GateJournal => {
                 // The gate *is* the handling: an unconfirmed write keeps the
                 // crash journal, so a restart still finds the resources it
                 // records.
-                warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; keeping the crash journal");
+                warn!(computer_id = %self.id, error, phase, "durable write is unconfirmed; keeping the crash journal");
                 self.journal_blocked = true;
                 Flow::Continue
             }
@@ -247,7 +247,7 @@ impl ComputerActor {
                 // `Failure` and fail the same callers twice.
                 let reverted = self.commit(
                     PersistPhase::Paused,
-                    SandboxTransition::Paused {
+                    ComputerTransition::Paused {
                         snapshot_id: self.pause_snapshot_id.clone().unwrap_or_default(),
                     },
                     Durability::Warn,
@@ -276,7 +276,7 @@ impl ComputerActor {
     /// way, before anything is torn down.
     fn fail_write(&mut self, detail: &str) -> Flow {
         let message = format!("computer {} {detail}", self.id);
-        let error = VmmError::Unavailable(message.clone());
+        let error = ComputerError::Unavailable(message.clone());
         self.error = Some(error.to_string());
         // Parked to be reported only when nobody was there to hear it: the
         // flows that answer immediately (a cold create) have nothing parked,
@@ -295,7 +295,7 @@ impl ComputerActor {
     /// id.
     ///
     /// A refusal stalls the teardown rather than continuing past it:
-    /// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it
+    /// `remove_computer_impl` propagates a failed `finish_remove` *before* it
     /// drops its map entry, because the record still owns the id and only a
     /// retry that re-runs the deletion can free it. Reporting the removal
     /// done here would leave that id un-creatable until the next startup
@@ -314,7 +314,7 @@ impl ComputerActor {
                 if let Some(error) = commit.durability_error {
                     self.unconfirmed = Some(error);
                 }
-                // Before REMOVED is announced, as `remove_sandbox_impl` drops
+                // Before REMOVED is announced, as `remove_computer_impl` drops
                 // its map entry before broadcasting: a reader that acts on
                 // the event must not still find the computer.
                 (self.unregister)();
@@ -326,7 +326,7 @@ impl ComputerActor {
             }
             Err(error) => {
                 error!(
-                    sandbox_id = %self.id,
+                    computer_id = %self.id,
                     %error,
                     retry_millis = self.retry_backoff.as_millis(),
                     "the computer's record would not delete; retrying the teardown"
@@ -373,11 +373,11 @@ impl ComputerActor {
             return;
         }
         if let Err(error) = crate::sandbox::reconcile::clear_state_record(&self.vm_dir) {
-            error!(sandbox_id = %self.id, %error, "crash journal cleanup is not durable");
+            error!(computer_id = %self.id, %error, "crash journal cleanup is not durable");
         }
     }
 
-    pub(super) fn public(&self) -> SandboxState {
+    pub(super) fn public(&self) -> ComputerState {
         self.snapshot_tx.borrow().state
     }
 
@@ -415,7 +415,7 @@ impl ComputerActor {
     }
 
     fn publish(&mut self, notify: Notify) {
-        let event = SandboxEvent::new(&self.id, notify_action(notify));
+        let event = ComputerEvent::new(&self.id, notify_action(notify));
         let event = match notify {
             Notify::Failed => {
                 let error = self.error.clone().unwrap_or_default();

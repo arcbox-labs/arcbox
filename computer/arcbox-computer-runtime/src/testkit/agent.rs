@@ -27,7 +27,7 @@ use crate::agent::{
     StartCommand,
 };
 use crate::boot_proto::NetReconfigCommand;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::file_proto::{FileStatDto, FsEventDto, KIND_DIR, KIND_FILE};
 
 /// What the guest does when it is asked to start a command.
@@ -234,7 +234,7 @@ impl FakeAgent {
             .unwrap_or_else(Reply::ok);
         let (tx, rx) = mpsc::channel(16);
         match reply {
-            Reply::Fails(message) => return Err(VmmError::Vsock(message)),
+            Reply::Fails(message) => return Err(ComputerError::Vsock(message)),
             Reply::NeverExits => lock(&self.shared.open).push(Box::new(tx)),
             Reply::Exits { stdout, status } => {
                 tokio::spawn(async move {
@@ -330,8 +330,8 @@ impl GuestFiles for FakeAgent {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         match lock(&self.shared.files).get(path) {
             Some(Entry::File { data, .. }) => Ok(data.clone()),
-            Some(Entry::Dir { .. }) => Err(VmmError::Vsock(format!("{path} is a directory"))),
-            None => Err(VmmError::PathNotFound(path.to_owned())),
+            Some(Entry::Dir { .. }) => Err(ComputerError::Vsock(format!("{path} is a directory"))),
+            None => Err(ComputerError::PathNotFound(path.to_owned())),
         }
     }
 
@@ -350,7 +350,7 @@ impl GuestFiles for FakeAgent {
         lock(&self.shared.files)
             .get(path)
             .map(|entry| stat_of(path, entry))
-            .ok_or_else(|| VmmError::PathNotFound(path.to_owned()))
+            .ok_or_else(|| ComputerError::PathNotFound(path.to_owned()))
     }
 
     async fn list(&self, path: &str) -> Result<Vec<FileStatDto>> {
@@ -360,8 +360,8 @@ impl GuestFiles for FakeAgent {
                 .into_iter()
                 .map(|(child, entry)| stat_of(child, entry))
                 .collect()),
-            Some(Entry::File { .. }) => Err(VmmError::NotADirectory(path.to_owned())),
-            None => Err(VmmError::PathNotFound(path.to_owned())),
+            Some(Entry::File { .. }) => Err(ComputerError::NotADirectory(path.to_owned())),
+            None => Err(ComputerError::PathNotFound(path.to_owned())),
         }
     }
 
@@ -379,7 +379,7 @@ impl GuestFiles for FakeAgent {
     async fn remove(&self, path: &str, recursive: bool) -> Result<()> {
         let mut files = lock(&self.shared.files);
         if !files.contains_key(path) {
-            return Err(VmmError::PathNotFound(path.to_owned()));
+            return Err(ComputerError::PathNotFound(path.to_owned()));
         }
         let descendants: Vec<String> = files
             .keys()
@@ -387,7 +387,7 @@ impl GuestFiles for FakeAgent {
             .cloned()
             .collect();
         if !descendants.is_empty() && !recursive {
-            return Err(VmmError::DirectoryNotEmpty(path.to_owned()));
+            return Err(ComputerError::DirectoryNotEmpty(path.to_owned()));
         }
         for key in descendants {
             files.remove(&key);
@@ -400,7 +400,7 @@ impl GuestFiles for FakeAgent {
         let mut files = lock(&self.shared.files);
         let entry = files
             .remove(from)
-            .ok_or_else(|| VmmError::PathNotFound(from.to_owned()))?;
+            .ok_or_else(|| ComputerError::PathNotFound(from.to_owned()))?;
         let moved: Vec<String> = files
             .keys()
             .filter(|key| key.starts_with(&format!("{from}/")))
@@ -416,7 +416,7 @@ impl GuestFiles for FakeAgent {
 
     async fn watch(&self, path: &str, _recursive: bool) -> Result<DirWatch> {
         if !lock(&self.shared.files).contains_key(path) {
-            return Err(VmmError::PathNotFound(path.to_owned()));
+            return Err(ComputerError::PathNotFound(path.to_owned()));
         }
         let (tx, events) = mpsc::unbounded_channel();
         lock(&self.shared.watchers).push(tx);

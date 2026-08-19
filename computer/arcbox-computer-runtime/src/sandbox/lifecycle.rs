@@ -1,5 +1,5 @@
 use super::reconcile::JournaledLease;
-use super::record::{ProvisionIntent, SandboxProvisionOutcome, SandboxTransition};
+use super::record::{ComputerProvisionOutcome, ComputerTransition, ProvisionIntent};
 use super::*;
 use crate::lifecycle::actor::ComputerSnapshot;
 use crate::sandbox::record::PersistPhase;
@@ -12,31 +12,31 @@ pub(super) enum WarmPolicy {
     Disabled,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Replay a durable Create outcome without resolving its template again.
-    pub async fn replay_sandbox_create(
+    pub async fn replay_computer_create(
         &self,
         id: &str,
         request_key: &str,
-    ) -> Result<Option<(SandboxId, String)>> {
+    ) -> Result<Option<(ComputerId, String)>> {
         self.await_reconcile().await?;
         self.records
             .replay_provision(id, request_key)
             .map(|outcome| outcome.map(|outcome| (id.to_owned(), outcome.ip_address)))
     }
 
-    pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<(SandboxId, String)> {
-        self.create_sandbox_keyed(spec, &Uuid::new_v4().to_string())
+    pub async fn create_computer(&self, spec: ComputerSpec) -> Result<(ComputerId, String)> {
+        self.create_computer_keyed(spec, &Uuid::new_v4().to_string())
             .await
     }
 
     /// Create a sandbox with a stable key for durable request replay.
-    pub async fn create_sandbox_keyed(
+    pub async fn create_computer_keyed(
         &self,
-        spec: SandboxSpec,
+        spec: ComputerSpec,
         request_key: &str,
-    ) -> Result<(SandboxId, String)> {
-        self.create_sandbox_inner(spec, request_key, WarmPolicy::Auto)
+    ) -> Result<(ComputerId, String)> {
+        self.create_computer_inner(spec, request_key, WarmPolicy::Auto)
             .await
     }
 
@@ -49,7 +49,7 @@ impl SandboxManager {
     /// (terminal events prompt it; a 1 s rescan backstops), so this
     /// normally resolves within a second or two. On expiry the fallback
     /// proceeds anyway and `reserve` surfaces the honest UNAVAILABLE.
-    async fn await_network_release(&self, id: &SandboxId) {
+    async fn await_network_release(&self, id: &ComputerId) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match self.reconcile_network().pending_cleanups().await {
@@ -59,13 +59,13 @@ impl SandboxManager {
                     // The ledger is what the wait is about, so an unreadable
                     // one is not something to spin on: fall through and let
                     // `reserve` report it.
-                    warn!(sandbox_id = %id, %error, "network cleanup ledger is unreadable");
+                    warn!(computer_id = %id, %error, "network cleanup ledger is unreadable");
                     return;
                 }
             }
             if std::time::Instant::now() > deadline {
                 warn!(
-                    sandbox_id = %id,
+                    computer_id = %id,
                     "network cleanup still awaiting host finalization; cold boot will report it"
                 );
                 return;
@@ -74,17 +74,17 @@ impl SandboxManager {
         }
     }
 
-    /// [`Self::create_sandbox_keyed`] with explicit warm behaviour: the
+    /// [`Self::create_computer_keyed`] with explicit warm behaviour: the
     /// prewarm builder (CORE-107) passes [`WarmPolicy::Disabled`] so its own
     /// boot neither restores from a warm source nor publishes into the
     /// warm-cache LRU (which would burn one of the `MAX_WARM_KEYS` slots on
     /// a duplicate full-memory snapshot).
-    pub(super) async fn create_sandbox_inner(
+    pub(super) async fn create_computer_inner(
         &self,
-        mut spec: SandboxSpec,
+        mut spec: ComputerSpec,
         request_key: &str,
         warm_policy: WarmPolicy,
-    ) -> Result<(SandboxId, String)> {
+    ) -> Result<(ComputerId, String)> {
         // Do not allocate any per-id resources until the startup orphan sweep
         // has run — otherwise a re-created same-id sandbox races it.
         self.await_reconcile().await?;
@@ -123,7 +123,7 @@ impl SandboxManager {
         // Hold a caller-supplied id to what the driver can actually run it
         // as — its VM identity and its socket-path budget. Auto-generated
         // UUIDs pass unchanged.
-        super::validate_new_sandbox_id(&id, &*self.services.driver, &self.config)?;
+        super::validate_new_computer_id(&id, &*self.services.driver, &self.config)?;
         spec.id = Some(id.clone());
 
         // Template warm-restore (CORE-107): a catalog template carrying a
@@ -148,7 +148,7 @@ impl SandboxManager {
             )
         {
             info!(
-                sandbox_id = %id,
+                computer_id = %id,
                 snapshot_id = %warm.snapshot_id,
                 "template create: restoring the template's pre-warmed snapshot"
             );
@@ -169,10 +169,10 @@ impl SandboxManager {
                 Ok(result) => return Ok(result),
                 // Post-commit ambiguity: the sandbox is running under this
                 // id — cold-booting would recreate a live sandbox.
-                Err(error @ VmmError::AckUnconfirmed { .. }) => return Err(error),
+                Err(error @ ComputerError::AckUnconfirmed { .. }) => return Err(error),
                 Err(error) => {
                     warn!(
-                        sandbox_id = %id,
+                        computer_id = %id,
                         snapshot_id = %warm.snapshot_id,
                         %error,
                         "template warm restore failed; cold-booting from the template rootfs"
@@ -197,7 +197,7 @@ impl SandboxManager {
                     Ok(Some(snapshot_id)) => {
                         self.warm.touch(&key);
                         info!(
-                            sandbox_id = %id,
+                            computer_id = %id,
                             snapshot_id,
                             "warm create: restoring cached template snapshot"
                         );
@@ -233,12 +233,12 @@ impl SandboxManager {
                             .await
                         {
                             Ok(result) => return Ok(result),
-                            Err(error @ VmmError::AckUnconfirmed { .. }) => {
+                            Err(error @ ComputerError::AckUnconfirmed { .. }) => {
                                 return Err(error);
                             }
                             Err(error) => {
                                 warn!(
-                                    sandbox_id = %id,
+                                    computer_id = %id,
                                     snapshot_id,
                                     %error,
                                     "warm restore failed; cold-booting instead"
@@ -264,11 +264,11 @@ impl SandboxManager {
                     Err(error) => {
                         // The publish path would scan the same catalog, so a
                         // failed lookup cold-boots without cache interaction.
-                        warn!(sandbox_id = %id, %error, "warm snapshot lookup failed; cold-booting");
+                        warn!(computer_id = %id, %error, "warm snapshot lookup failed; cold-booting");
                     }
                 },
                 Err(error) => {
-                    debug!(sandbox_id = %id, %error, "rootfs fingerprint failed; skipping warm create");
+                    debug!(computer_id = %id, %error, "rootfs fingerprint failed; skipping warm create");
                 }
             }
         }
@@ -289,16 +289,17 @@ impl SandboxManager {
         let record = match self.records.provision_intent(&id, request_key, spec)? {
             ProvisionIntent::Created(record) | ProvisionIntent::Resume(record) => record,
             ProvisionIntent::Replay(record) => {
-                let outcome = record
-                    .provision_outcome
-                    .ok_or_else(|| VmmError::WrongState {
-                        id: id.clone(),
-                        expected: "a persisted create outcome".into(),
-                        actual: "none".into(),
-                    })?;
+                let outcome =
+                    record
+                        .provision_outcome
+                        .ok_or_else(|| ComputerError::WrongState {
+                            id: id.clone(),
+                            expected: "a persisted create outcome".into(),
+                            actual: "none".into(),
+                        })?;
                 return Ok((id, outcome.ip_address));
             }
-            ProvisionIntent::Blocked(_) => return Err(VmmError::AlreadyExists(id)),
+            ProvisionIntent::Blocked(_) => return Err(ComputerError::AlreadyExists(id)),
         };
         let generation = record.generation;
         let deadlines = Deadlines {
@@ -339,7 +340,7 @@ impl SandboxManager {
                 lease = Some(
                     self.services
                         .network
-                        .reserve(&VmId::new(&id)?, super::sandbox_network_policy())
+                        .reserve(&VmId::new(&id)?, super::computer_network_policy())
                         .await?,
                 );
             }
@@ -349,7 +350,7 @@ impl SandboxManager {
                 .unwrap_or_default();
 
             super::reconcile::create_runtime_dir(&vm_dir)?;
-            let cleanup_record = super::reconcile::SandboxStateRecord::new(
+            let cleanup_record = super::reconcile::ComputerStateRecord::new(
                 &id,
                 None,
                 lease
@@ -369,7 +370,7 @@ impl SandboxManager {
                 );
             }
 
-            Ok::<_, VmmError>(ip_address)
+            Ok::<_, ComputerError>(ip_address)
         }
         .await;
 
@@ -380,7 +381,7 @@ impl SandboxManager {
                 // log it here so a create that dies between the network
                 // activation and the Starting journal commit is attributable
                 // from the guest log alone (CORE-82).
-                warn!(sandbox_id = %id, error = %error, "sandbox create setup failed; rolling back");
+                warn!(computer_id = %id, error = %error, "sandbox create setup failed; rolling back");
                 let mut rollback_errors = Vec::new();
                 let mut network_cleanup_failed = false;
                 if let Some(reserved) = lease.clone()
@@ -399,7 +400,7 @@ impl SandboxManager {
                     {
                         let mut creating = arc.lock().unwrap();
                         creating.network = lease;
-                        creating.state = SandboxState::Failed;
+                        creating.state = ComputerState::Failed;
                         creating.error = Some(error.to_string());
                     }
                     let record_error = self
@@ -407,7 +408,7 @@ impl SandboxManager {
                         .transition(
                             &id,
                             generation,
-                            SandboxTransition::Failed(error.to_string()),
+                            ComputerTransition::Failed(error.to_string()),
                         )
                         .err()
                         .map(|record_error| format!("record: {record_error}"));
@@ -429,18 +430,18 @@ impl SandboxManager {
                     });
                     let rollback = rollback_errors.join("; ");
                     error!(
-                        sandbox_id = %id,
+                        computer_id = %id,
                         error = %error,
                         rollback = %rollback,
                         "sandbox create rollback incomplete; instance left Failed"
                     );
-                    return Err(VmmError::Other(format!(
+                    return Err(ComputerError::Other(format!(
                         "{error}; sandbox rollback is incomplete: {rollback}"
                     )));
                 }
                 let abort = self.records.abort_provision(&id, generation)?;
                 if let Some(durability_error) = abort.durability_error {
-                    return Err(VmmError::Unavailable(format!(
+                    return Err(ComputerError::Unavailable(format!(
                         "{error}; create rollback is visible, but durability is unconfirmed: {durability_error}"
                     )));
                 }
@@ -488,7 +489,7 @@ impl SandboxManager {
             })),
             seeded: Seeded::Fresh,
         });
-        let outcome = SandboxProvisionOutcome {
+        let outcome = ComputerProvisionOutcome {
             ip_address: ip_address.clone(),
         };
         // `AckUnconfirmed` says the `Starting` write is visible but not
@@ -505,7 +506,7 @@ impl SandboxManager {
                 reply,
             })
             .await?;
-        info!(sandbox_id = %id, "sandbox create requested (async boot started)");
+        info!(computer_id = %id, "sandbox create requested (async boot started)");
         Ok((id, ip_address))
     }
 
@@ -517,7 +518,7 @@ impl SandboxManager {
     /// outlives the remaining budget. All runtime resources (TAP + IP,
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
-    pub async fn stop_sandbox(&self, id: &SandboxId, timeout_seconds: u32) -> Result<()> {
+    pub async fn stop_computer(&self, id: &ComputerId, timeout_seconds: u32) -> Result<()> {
         self.await_reconcile().await?;
         let budget = Duration::from_secs(u64::from(if timeout_seconds > 0 {
             timeout_seconds
@@ -544,7 +545,7 @@ impl SandboxManager {
     /// `Adopt`. The `PreparedVm` a booted sandbox also holds needs no such
     /// step: it kills on drop only while it is still unconsumed.
     pub async fn detach_all(&self) -> Result<()> {
-        let live: Vec<(SandboxId, Arc<dyn VmHandle>)> = self
+        let live: Vec<(ComputerId, Arc<dyn VmHandle>)> = self
             .computers
             .read()
             .unwrap()
@@ -561,21 +562,21 @@ impl SandboxManager {
                 continue;
             };
             match detach.detach().await {
-                Ok(_) => info!(sandbox_id = %id, "handed the sandbox's vm to the next process"),
+                Ok(_) => info!(computer_id = %id, "handed the sandbox's vm to the next process"),
                 Err(error) => failures.push(format!("{id}: {error}")),
             }
         }
         if failures.is_empty() {
             return Ok(());
         }
-        Err(VmmError::Unavailable(format!(
+        Err(ComputerError::Unavailable(format!(
             "some sandboxes could not be handed over and will be killed on exit: {}",
             failures.join("; ")
         )))
     }
 
     /// Forcibly destroy a sandbox and release all resources immediately.
-    pub async fn remove_sandbox(&self, id: &SandboxId, force: bool) -> Result<()> {
+    pub async fn remove_computer(&self, id: &ComputerId, force: bool) -> Result<()> {
         self.await_reconcile().await?;
         let mailbox = match self.mailbox(id) {
             Ok(mailbox) => mailbox,
@@ -583,7 +584,7 @@ impl SandboxManager {
             // an intent nobody acknowledged, or a tombstone a previous
             // removal did not finish — and the claim is what serializes this
             // against a create of the same id arriving now.
-            Err(VmmError::NotFound(_)) => {
+            Err(ComputerError::NotFound(_)) => {
                 let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
                     .join("sandboxes")
                     .join(id);
@@ -592,7 +593,7 @@ impl SandboxManager {
                     id,
                     ComputerRuntime::new(
                         id.clone(),
-                        SandboxSpec {
+                        ComputerSpec {
                             id: Some(id.clone()),
                             ..Default::default()
                         },
@@ -603,15 +604,15 @@ impl SandboxManager {
                     Ok(_reservation) => {
                         let commit = self.records.cancel_pending_or_missing(id)?;
                         if let Some(error) = commit.durability_error {
-                            return Err(VmmError::Unavailable(format!(
+                            return Err(ComputerError::Unavailable(format!(
                                 "sandbox {id} removal is visible, but durability is unconfirmed: {error}"
                             )));
                         }
-                        info!(sandbox_id = %id, "sandbox already removed");
+                        info!(computer_id = %id, "sandbox already removed");
                         return Ok(());
                     }
                     // A create won the race for the id; remove what it made.
-                    Err(VmmError::AlreadyExists(_)) => self.mailbox(id)?,
+                    Err(ComputerError::AlreadyExists(_)) => self.mailbox(id)?,
                     Err(error) => return Err(error),
                 }
             }
@@ -620,7 +621,7 @@ impl SandboxManager {
         mailbox
             .ask(id, |reply| Command::Remove { force, reply })
             .await?;
-        info!(sandbox_id = %id, "sandbox removed");
+        info!(computer_id = %id, "sandbox removed");
         Ok(())
     }
 
@@ -640,12 +641,12 @@ impl SandboxManager {
     }
 
     /// Return the current state and metadata of a sandbox.
-    pub fn inspect_sandbox(&self, id: &SandboxId) -> Result<SandboxInfo> {
+    pub fn inspect_computer(&self, id: &ComputerId) -> Result<ComputerInfo> {
         let snapshot = self.snapshot(id)?;
         // Size the retained artifacts after the read: the sizing stats files
         // and scans the catalog, and the snapshot is a borrow of a `watch`
         // the actor writes.
-        let artifacts = (snapshot.state == SandboxState::Paused)
+        let artifacts = (snapshot.state == ComputerState::Paused)
             .then(|| super::pause::paused_artifacts(&self.config, id, &snapshot));
         let mut info = snapshot_to_info(id, &snapshot);
         if let Some(artifacts) = artifacts {
@@ -655,17 +656,17 @@ impl SandboxManager {
     }
 
     /// List sandboxes, optionally filtered by state string and/or labels.
-    pub fn list_sandboxes(
+    pub fn list_computers(
         &self,
         state_filter: Option<&str>,
         label_filter: &HashMap<String, String>,
-    ) -> Result<Vec<SandboxSummary>> {
+    ) -> Result<Vec<ComputerSummary>> {
         self.check_reconcile()?;
         // Snapshot every computer's read view under the map read guard. No
         // per-computer lock is taken at all, so the "never hold the map lock
         // while holding an instance lock" discipline this fold used to need
         // has nothing left to violate.
-        let computers: Vec<(SandboxId, ComputerSnapshot)> = self
+        let computers: Vec<(ComputerId, ComputerSnapshot)> = self
             .computers
             .read()
             .unwrap()
@@ -674,39 +675,40 @@ impl SandboxManager {
             .collect();
         // The second pass pays one catalog listing for the whole response
         // instead of one per paused sandbox.
-        let mut summaries: Vec<(SandboxSummary, Option<super::pause::PausedArtifacts>)> = computers
-            .iter()
-            .filter_map(|(id, snapshot)| {
-                if let Some(sf) = state_filter
-                    && !sf.is_empty()
-                    && snapshot.state.to_string() != sf
-                {
-                    return None;
-                }
-                // Label filter: all supplied key-value pairs must match.
-                for (k, v) in label_filter {
-                    if snapshot.labels.get(k).map(String::as_str) != Some(v.as_str()) {
+        let mut summaries: Vec<(ComputerSummary, Option<super::pause::PausedArtifacts>)> =
+            computers
+                .iter()
+                .filter_map(|(id, snapshot)| {
+                    if let Some(sf) = state_filter
+                        && !sf.is_empty()
+                        && snapshot.state.to_string() != sf
+                    {
                         return None;
                     }
-                }
-                let summary = SandboxSummary {
-                    id: id.clone(),
-                    state: snapshot.state,
-                    labels: snapshot.labels.clone(),
-                    ip_address: snapshot
-                        .lease
-                        .as_ref()
-                        .map(|lease| lease.ip.to_string())
-                        .unwrap_or_default(),
-                    created_at: snapshot.created_at,
-                    paused_at: snapshot.paused_at,
-                    storage_bytes: 0,
-                };
-                let artifacts = (snapshot.state == SandboxState::Paused)
-                    .then(|| super::pause::paused_artifacts(&self.config, id, snapshot));
-                Some((summary, artifacts))
-            })
-            .collect();
+                    // Label filter: all supplied key-value pairs must match.
+                    for (k, v) in label_filter {
+                        if snapshot.labels.get(k).map(String::as_str) != Some(v.as_str()) {
+                            return None;
+                        }
+                    }
+                    let summary = ComputerSummary {
+                        id: id.clone(),
+                        state: snapshot.state,
+                        labels: snapshot.labels.clone(),
+                        ip_address: snapshot
+                            .lease
+                            .as_ref()
+                            .map(|lease| lease.ip.to_string())
+                            .unwrap_or_default(),
+                        created_at: snapshot.created_at,
+                        paused_at: snapshot.paused_at,
+                        storage_bytes: 0,
+                    };
+                    let artifacts = (snapshot.state == ComputerState::Paused)
+                        .then(|| super::pause::paused_artifacts(&self.config, id, snapshot));
+                    Some((summary, artifacts))
+                })
+                .collect();
 
         if summaries.iter().any(|(_, artifacts)| artifacts.is_some()) {
             let catalog = self.snapshots.list_all().unwrap_or_default();
@@ -726,27 +728,27 @@ impl SandboxManager {
     }
 
     /// Subscribe to sandbox lifecycle events.
-    pub fn subscribe_events(&self) -> broadcast::Receiver<SandboxEvent> {
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ComputerEvent> {
         self.events_tx.subscribe()
     }
 
     /// Verify the computer is `Ready` and return the agent inside it.
     ///
-    /// A paused computer answers [`VmmError::Paused`], not `WrongState`, so
+    /// A paused computer answers [`ComputerError::Paused`], not `WrongState`, so
     /// the daemon can resume it transparently and retry (CORE-21).
-    pub(super) fn require_ready_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
-        self.agent_in(id, &[SandboxState::Ready], "Ready")
+    pub(super) fn require_ready_agent(&self, id: &ComputerId) -> Result<Arc<dyn GuestAgent>> {
+        self.agent_in(id, &[ComputerState::Ready], "Ready")
     }
 
     /// Verify the computer is alive (Ready or Running) and return the agent
     /// inside it. Unlike [`Self::require_ready_agent`], an in-flight workload
     /// does not block the operation — file I/O works alongside Run/Exec.
-    /// Paused states map to [`VmmError::Paused`] for the daemon's transparent
+    /// Paused states map to [`ComputerError::Paused`] for the daemon's transparent
     /// resume, as above.
-    pub(super) fn require_alive_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
+    pub(super) fn require_alive_agent(&self, id: &ComputerId) -> Result<Arc<dyn GuestAgent>> {
         self.agent_in(
             id,
-            &[SandboxState::Ready, SandboxState::Running],
+            &[ComputerState::Ready, ComputerState::Running],
             "Ready or Running",
         )
     }
@@ -759,15 +761,15 @@ impl SandboxManager {
     /// an exec costs a clone of an `Arc` rather than a scheduling hop.
     fn agent_in(
         &self,
-        id: &SandboxId,
-        allowed: &[SandboxState],
+        id: &ComputerId,
+        allowed: &[ComputerState],
         expected: &str,
     ) -> Result<Arc<dyn GuestAgent>> {
         let snapshot = self.snapshot(id)?;
         if !allowed.contains(&snapshot.state) {
             return Err(match snapshot.state {
-                SandboxState::Pausing | SandboxState::Paused => VmmError::Paused(id.clone()),
-                state => VmmError::WrongState {
+                ComputerState::Pausing | ComputerState::Paused => ComputerError::Paused(id.clone()),
+                state => ComputerError::WrongState {
                     id: id.clone(),
                     expected: expected.to_owned(),
                     actual: state.to_string(),
@@ -776,19 +778,19 @@ impl SandboxManager {
         }
         snapshot
             .agent
-            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no running vm to reach")))
+            .ok_or_else(|| ComputerError::Vsock(format!("sandbox {id} has no running vm to reach")))
     }
 }
 
 /// A computer's read snapshot as `Inspect` reports it.
-fn snapshot_to_info(id: &SandboxId, snapshot: &ComputerSnapshot) -> SandboxInfo {
-    SandboxInfo {
+fn snapshot_to_info(id: &ComputerId, snapshot: &ComputerSnapshot) -> ComputerInfo {
+    ComputerInfo {
         id: id.clone(),
         state: snapshot.state,
         labels: snapshot.labels.clone(),
         vcpus: snapshot.vcpus,
         memory_mib: snapshot.memory_mib,
-        network: snapshot.lease.as_ref().map(|lease| SandboxNetworkInfo {
+        network: snapshot.lease.as_ref().map(|lease| ComputerNetworkInfo {
             ip_address: lease.ip.to_string(),
             gateway: lease.gateway.to_string(),
         }),
@@ -808,7 +810,7 @@ fn snapshot_to_info(id: &SandboxId, snapshot: &ComputerSnapshot) -> SandboxInfo 
 
 /// Files a listed checkpoint occupies on disk, for storage accounting.
 ///
-/// The listing counterpart of [`SandboxManager::checkpoint_paths`]: it reads
+/// The listing counterpart of [`ComputerManager::checkpoint_paths`]: it reads
 /// an already-loaded [`SnapshotInfo`] so a multi-sandbox response pays one
 /// catalog scan rather than one per paused sandbox.
 fn snapshot_files(info: &crate::snapshot::SnapshotInfo) -> Vec<PathBuf> {
@@ -835,7 +837,7 @@ mod tests {
                 ..arcbox_vm_driver::testkit::FakeDriver::new().capabilities()
             })
             .build();
-        SandboxManager::new(
+        ComputerManager::new(
             config.clone(),
             NodeEnvironment {
                 driver: Arc::new(driver),

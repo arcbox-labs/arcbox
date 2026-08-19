@@ -29,9 +29,9 @@ pub mod resume;
 use super::effect::ReleaseScope;
 use super::event::{Event, RestoreOrigin};
 use crate::agent::GuestAgent;
-use crate::error::VmmError;
+use crate::error::ComputerError;
 use crate::sandbox::CheckpointInfo;
-use crate::sandbox::record::SandboxProvisionOutcome;
+use crate::sandbox::record::ComputerProvisionOutcome;
 
 /// What a sub-task hands back: its own success value, or the failure class
 /// the machine branches on.
@@ -46,13 +46,13 @@ pub type TaskResult<T = ()> = std::result::Result<T, TaskFailure>;
 #[derive(Debug)]
 pub struct TaskFailure {
     event: Event,
-    error: VmmError,
+    error: ComputerError,
 }
 
 impl TaskFailure {
     /// Whatever usable state the computer had survives: the flow unwound what
     /// it had allocated.
-    pub fn recoverable(error: VmmError) -> Self {
+    pub fn recoverable(error: ComputerError) -> Self {
         Self {
             event: Event::Failure,
             error,
@@ -61,7 +61,7 @@ impl TaskFailure {
 
     /// The guest is quiesced with no verb able to thaw it: the port is
     /// hold-then-kill by design, so the computer cannot go back to `Ready`.
-    pub fn frozen(error: VmmError) -> Self {
+    pub fn frozen(error: ComputerError) -> Self {
         Self {
             event: Event::Frozen,
             error,
@@ -70,7 +70,7 @@ impl TaskFailure {
 
     /// The flow could not unwind what it had allocated, so the computer
     /// cannot go back to the phase it came from — see [`Event::Stranded`].
-    pub fn stranded(error: VmmError) -> Self {
+    pub fn stranded(error: ComputerError) -> Self {
         Self {
             event: Event::Stranded,
             error,
@@ -88,7 +88,7 @@ impl TaskFailure {
     }
 
     /// The error the parked caller gets.
-    pub(super) fn into_error(self) -> VmmError {
+    pub(super) fn into_error(self) -> ComputerError {
         self.error
     }
 }
@@ -144,7 +144,7 @@ pub trait ComputerTasks: Send + Sync + 'static {
     async fn restore(
         &self,
         origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)>;
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)>;
 
     /// Capture a checkpoint. `hold` keeps the guest quiesced afterwards (the
     /// pause path): progress past the memory image would diverge from the

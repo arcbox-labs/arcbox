@@ -20,11 +20,11 @@ use tracing::warn;
 
 use crate::agent::{ClockSync, GuestAgentFactory};
 use crate::config::{JailerConfig, RuntimeConfig};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::sandbox::pause::{PAUSED_ROOTFS_FILE, ResumeFailure, ResumedRuntime};
 use crate::sandbox::reconcile::JournaledLease;
 use crate::sandbox::spec::restore_spec;
-use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
+use crate::sandbox::{self, ComputerId, ROOTFS_DISK_ID};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -39,7 +39,7 @@ use crate::snapshot_cow::{CowHandle, CowManager};
     reason = "the resume spans the resource set its computer owns"
 )]
 pub async fn restore_paused(
-    id: &SandboxId,
+    id: &ComputerId,
     jailer: &JailerConfig,
     snap_meta: &SnapshotMeta,
     vm_dir: &Path,
@@ -66,7 +66,7 @@ pub async fn restore_paused(
         if networked {
             lease = Some(
                 network
-                    .reserve(&VmId::new(id.as_str())?, sandbox::sandbox_network_policy())
+                    .reserve(&VmId::new(id.as_str())?, sandbox::computer_network_policy())
                     .await?,
             );
         }
@@ -76,7 +76,7 @@ pub async fn restore_paused(
             // journal and the datapath cannot disagree.
             let net =
                 net.map(|lease| JournaledLease::from_snapshot(lease, snap_meta.net_invariant));
-            sandbox::reconcile::SandboxStateRecord::new(id, pid, net, cow, config, None)
+            sandbox::reconcile::ComputerStateRecord::new(id, pid, net, cow, config, None)
                 .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
         };
         journal(None, None, lease.as_ref())?;
@@ -112,7 +112,7 @@ pub async fn restore_paused(
         let preserved_cow = sandbox::preserved_cow_file(config, id);
         let rootfs = if preserved_cow.exists() {
             let template = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
-                VmmError::Snapshot(format!(
+                ComputerError::Snapshot(format!(
                     "pause checkpoint for {id} records no rootfs template"
                 ))
             })?;
@@ -132,7 +132,7 @@ pub async fn restore_paused(
             // of a guest rootfs, and nothing else holds a copy of it.
             let parked = vm_dir.join(PAUSED_ROOTFS_FILE);
             if !parked.exists() {
-                return Err(VmmError::Snapshot(format!(
+                return Err(ComputerError::Snapshot(format!(
                     "paused sandbox {id} has neither a preserved overlay nor a parked rootfs"
                 )));
             }
@@ -182,10 +182,10 @@ pub async fn restore_paused(
                 {
                     Ok(Ok(ClockSync::Synced)) => {}
                     Ok(Ok(ClockSync::AgentError(code))) => {
-                        warn!(sandbox_id = %id, code, "agent could not set the clock after resume");
+                        warn!(computer_id = %id, code, "agent could not set the clock after resume");
                     }
-                    Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after resume failed: {e}"),
-                    Err(_) => warn!(sandbox_id = %id, "clock sync after resume timed out"),
+                    Ok(Err(e)) => warn!(computer_id = %id, "clock sync after resume failed: {e}"),
+                    Err(_) => warn!(computer_id = %id, "clock sync after resume timed out"),
                 }
             });
         }
@@ -208,7 +208,7 @@ pub async fn restore_paused(
                 agent.reconfigure_network(&cmd),
             )
             .await
-            .map_err(|_| VmmError::Vsock("net reconfig after resume timed out".into()))
+            .map_err(|_| ComputerError::Vsock("net reconfig after resume timed out".into()))
             .and_then(|r| r)?;
         }
 
@@ -258,7 +258,7 @@ pub async fn restore_paused(
 /// that failed before it handed the parked disk over never moved it, so
 /// the file is still sitting in `vm_dir` where a clean pause left it.
 async fn park_copy_mode_rootfs(
-    id: &SandboxId,
+    id: &ComputerId,
     vm_dir: &Path,
     config: &RuntimeConfig,
     prepared: Option<&Arc<dyn PreparedVm>>,
@@ -275,7 +275,7 @@ async fn park_copy_mode_rootfs(
     {
         Ok(_) => true,
         Err(error) => {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
+            warn!(computer_id = %id, error = %error, "resume unwind: parking rootfs failed");
             false
         }
     }
@@ -290,7 +290,7 @@ async fn park_copy_mode_rootfs(
     reason = "the unwind spans everything the failed resume re-created"
 )]
 async fn unwind_resume(
-    id: &SandboxId,
+    id: &ComputerId,
     vm_dir: &Path,
     config: &RuntimeConfig,
     cow_manager: &CowManager,
@@ -304,7 +304,7 @@ async fn unwind_resume(
     if let Some(prepared) = prepared {
         // SIGKILL plus the driver's bounded wait for the reaper.
         if let Err(error) = prepared.discard().await {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: the vmm did not exit");
+            warn!(computer_id = %id, error = %error, "resume unwind: the vmm did not exit");
             clean = false;
         }
     }
@@ -312,19 +312,19 @@ async fn unwind_resume(
     if let Some(handle) = cow_handle
         && let Err(error) = cow_manager.detach_keep_cow(&handle).await
     {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: overlay detach failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: overlay detach failed");
         clean = false;
     }
 
     if let Some(lease) = net_lease
         && let Err(error) = network.quarantine(lease).await
     {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: network quarantine failed");
         clean = false;
     }
 
     if clean && let Err(error) = sandbox::reconcile::clear_state_record(vm_dir) {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: journal removal failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: journal removal failed");
         clean = false;
     }
     clean

@@ -6,7 +6,7 @@
 //! the path consumers name. This module is the tokio client the
 //! manager drives: one vsock connection per operation, dialed through the
 //! driver port's [`Vsock`] capability, timeouts, and the mapping of the
-//! agent's errno-prefixed `FILE_ERR` payloads onto typed [`VmmError`]
+//! agent's errno-prefixed `FILE_ERR` payloads onto typed [`ComputerError`]
 //! variants (`decode_file_err`).
 
 use std::time::Duration;
@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 
 use super::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 use crate::agent::{DirWatch, FsEvents};
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 
 /// Per-operation timeout for file I/O over vsock.
 const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
@@ -57,7 +57,7 @@ pub(super) async fn write_file(
     data: &[u8],
 ) -> Result<()> {
     if data.len() > MAX_FILE_SIZE {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "file too large ({} bytes, max {MAX_FILE_SIZE})",
             data.len()
         )));
@@ -65,37 +65,37 @@ pub(super) async fn write_file(
 
     tokio::time::timeout(FILE_IO_TIMEOUT, write_file_inner(vsock, path, mode, data))
         .await
-        .map_err(|_| VmmError::Vsock("file write: timed out".into()))?
+        .map_err(|_| ComputerError::Vsock("file write: timed out".into()))?
 }
 
 async fn write_file_inner(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8]) -> Result<()> {
     let mut stream = connect_to_port(vsock, FILE_PORT).await?;
 
     let req = serde_json::to_vec(&WriteReq { path, mode })
-        .map_err(|e| VmmError::Vsock(format!("serialize WriteReq: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("serialize WriteReq: {e}")))?;
     write_frame(&mut stream, FILE_WRITE_REQ, &req)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write FILE_WRITE_REQ: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write FILE_WRITE_REQ: {e}")))?;
 
     // Stream data in MAX_FRAME_SIZE chunks.
     for chunk in data.chunks(MAX_FRAME_SIZE) {
         write_frame(&mut stream, FILE_DATA, chunk)
             .await
-            .map_err(|e| VmmError::Vsock(format!("write FILE_DATA: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("write FILE_DATA: {e}")))?;
     }
     write_frame(&mut stream, FILE_DONE, &[])
         .await
-        .map_err(|e| VmmError::Vsock(format!("write FILE_DONE: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write FILE_DONE: {e}")))?;
 
     // Read the agent's response.
     let (resp_type, payload) = read_frame(&mut stream)
         .await
-        .map_err(|e| VmmError::Vsock(format!("read write response: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("read write response: {e}")))?;
 
     match resp_type {
         FILE_ACK => Ok(()),
         FILE_ERR => Err(decode_file_err(&payload)),
-        other => Err(VmmError::Vsock(format!(
+        other => Err(ComputerError::Vsock(format!(
             "file write: unexpected response type 0x{other:02x}"
         ))),
     }
@@ -105,29 +105,29 @@ async fn write_file_inner(vsock: &dyn Vsock, path: &str, mode: u32, data: &[u8])
 pub(super) async fn read_file(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
     tokio::time::timeout(FILE_IO_TIMEOUT, read_file_inner(vsock, path))
         .await
-        .map_err(|_| VmmError::Vsock("file read: timed out".into()))?
+        .map_err(|_| ComputerError::Vsock("file read: timed out".into()))?
 }
 
 async fn read_file_inner(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
     let mut stream = connect_to_port(vsock, FILE_PORT).await?;
 
     let req = serde_json::to_vec(&ReadReq { path })
-        .map_err(|e| VmmError::Vsock(format!("serialize ReadReq: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("serialize ReadReq: {e}")))?;
     write_frame(&mut stream, FILE_READ_REQ, &req)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write FILE_READ_REQ: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write FILE_READ_REQ: {e}")))?;
 
     // Collect FILE_DATA chunks until FILE_DONE or FILE_ERR.
     let mut buf = Vec::new();
     loop {
         let (frame_type, payload) = read_frame(&mut stream)
             .await
-            .map_err(|e| VmmError::Vsock(format!("read file data: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("read file data: {e}")))?;
         match frame_type {
             FILE_DATA => {
                 buf.extend_from_slice(&payload);
                 if buf.len() > MAX_FILE_SIZE {
-                    return Err(VmmError::Vsock(format!(
+                    return Err(ComputerError::Vsock(format!(
                         "file too large (>{MAX_FILE_SIZE} bytes)"
                     )));
                 }
@@ -135,7 +135,7 @@ async fn read_file_inner(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
             FILE_DONE => return Ok(buf),
             FILE_ERR => return Err(decode_file_err(&payload)),
             other => {
-                return Err(VmmError::Vsock(format!(
+                return Err(ComputerError::Vsock(format!(
                     "file read: unexpected frame type 0x{other:02x}"
                 )));
             }
@@ -148,16 +148,16 @@ async fn read_file_inner(vsock: &dyn Vsock, path: &str) -> Result<Vec<u8>> {
 /// Every verb — path verbs and read/write alike — carries the errno
 /// prefixes from [`proto`]; anything else (including all errors from old
 /// vm-agents) stays a vsock error.
-fn decode_file_err(payload: &[u8]) -> VmmError {
+fn decode_file_err(payload: &[u8]) -> ComputerError {
     let text = String::from_utf8_lossy(payload).into_owned();
     if let Some(path) = text.strip_prefix(proto::ERR_NOT_FOUND) {
-        VmmError::PathNotFound(path.to_owned())
+        ComputerError::PathNotFound(path.to_owned())
     } else if let Some(path) = text.strip_prefix(proto::ERR_NOT_A_DIRECTORY) {
-        VmmError::NotADirectory(path.to_owned())
+        ComputerError::NotADirectory(path.to_owned())
     } else if let Some(path) = text.strip_prefix(proto::ERR_NOT_EMPTY) {
-        VmmError::DirectoryNotEmpty(path.to_owned())
+        ComputerError::DirectoryNotEmpty(path.to_owned())
     } else {
-        VmmError::Vsock(text)
+        ComputerError::Vsock(text)
     }
 }
 
@@ -169,32 +169,32 @@ async fn unary_file_op(
     req: &(impl Serialize + Sync),
     ok_type: u8,
 ) -> Result<Vec<u8>> {
-    let payload =
-        serde_json::to_vec(req).map_err(|e| VmmError::Vsock(format!("serialize request: {e}")))?;
+    let payload = serde_json::to_vec(req)
+        .map_err(|e| ComputerError::Vsock(format!("serialize request: {e}")))?;
     let op = async {
         let mut stream = connect_to_port(vsock, FILE_PORT).await?;
         write_frame(&mut stream, req_type, &payload)
             .await
-            .map_err(|e| VmmError::Vsock(format!("write request 0x{req_type:02x}: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("write request 0x{req_type:02x}: {e}")))?;
         let (resp_type, resp) = read_frame(&mut stream)
             .await
-            .map_err(|e| VmmError::Vsock(format!("read response: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("read response: {e}")))?;
         match resp_type {
             t if t == ok_type => Ok(resp),
             FILE_ERR => Err(decode_file_err(&resp)),
-            other => Err(VmmError::Vsock(format!(
+            other => Err(ComputerError::Vsock(format!(
                 "unexpected response type 0x{other:02x}"
             ))),
         }
     };
     tokio::time::timeout(FILE_IO_TIMEOUT, op)
         .await
-        .map_err(|_| VmmError::Vsock("file operation timed out".into()))?
+        .map_err(|_| ComputerError::Vsock("file operation timed out".into()))?
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T> {
     serde_json::from_slice(payload)
-        .map_err(|e| VmmError::Vsock(format!("malformed agent response: {e}")))
+        .map_err(|e| ComputerError::Vsock(format!("malformed agent response: {e}")))
 }
 
 /// Stat one path inside the sandbox (symlinks reported, not followed).
@@ -230,7 +230,7 @@ pub(super) async fn make_dir(vsock: &dyn Vsock, path: &str, mode: u32) -> Result
 
 /// Remove a file, symlink, or directory inside the sandbox. A non-empty
 /// directory requires `recursive` and fails with
-/// [`VmmError::DirectoryNotEmpty`] otherwise.
+/// [`ComputerError::DirectoryNotEmpty`] otherwise.
 pub(super) async fn remove_entry(vsock: &dyn Vsock, path: &str, recursive: bool) -> Result<()> {
     let req = RemoveReq {
         path: path.to_owned(),
@@ -269,7 +269,7 @@ impl FsEvents for VsockWatch {
             .stream
             .read(&mut ty)
             .await
-            .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("watch read: {e}")))?;
         if n == 0 {
             return Ok(None);
         }
@@ -277,21 +277,24 @@ impl FsEvents for VsockWatch {
             .stream
             .read_u32_le()
             .await
-            .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))? as usize;
+            .map_err(|e| ComputerError::Vsock(format!("watch read: {e}")))?
+            as usize;
         if len > MAX_FRAME_SIZE {
-            return Err(VmmError::Vsock(format!("watch frame too large: {len}")));
+            return Err(ComputerError::Vsock(format!(
+                "watch frame too large: {len}"
+            )));
         }
         let mut payload = vec![0u8; len];
         if len > 0 {
             self.stream
                 .read_exact(&mut payload)
                 .await
-                .map_err(|e| VmmError::Vsock(format!("watch read: {e}")))?;
+                .map_err(|e| ComputerError::Vsock(format!("watch read: {e}")))?;
         }
         match ty[0] {
             FILE_EVENT => Ok(Some(parse_json(&payload)?)),
             FILE_ERR => Err(decode_file_err(&payload)),
-            other => Err(VmmError::Vsock(format!(
+            other => Err(ComputerError::Vsock(format!(
                 "unexpected watch frame type 0x{other:02x}"
             ))),
         }
@@ -307,26 +310,26 @@ pub(super) async fn watch_dir(vsock: &dyn Vsock, path: &str, recursive: bool) ->
         recursive,
     };
     let payload = serde_json::to_vec(&req)
-        .map_err(|e| VmmError::Vsock(format!("serialize WatchReq: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("serialize WatchReq: {e}")))?;
     let setup = async {
         let mut stream = connect_to_port(vsock, FILE_PORT).await?;
         write_frame(&mut stream, FILE_WATCH_REQ, &payload)
             .await
-            .map_err(|e| VmmError::Vsock(format!("write FILE_WATCH_REQ: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("write FILE_WATCH_REQ: {e}")))?;
         let (resp_type, resp) = read_frame(&mut stream)
             .await
-            .map_err(|e| VmmError::Vsock(format!("read watch ack: {e}")))?;
+            .map_err(|e| ComputerError::Vsock(format!("read watch ack: {e}")))?;
         match resp_type {
             FILE_ACK => Ok(DirWatch::new(Box::new(VsockWatch { stream }))),
             FILE_ERR => Err(decode_file_err(&resp)),
-            other => Err(VmmError::Vsock(format!(
+            other => Err(ComputerError::Vsock(format!(
                 "unexpected watch ack type 0x{other:02x}"
             ))),
         }
     };
     tokio::time::timeout(FILE_IO_TIMEOUT, setup)
         .await
-        .map_err(|_| VmmError::Vsock("watch setup timed out".into()))?
+        .map_err(|_| ComputerError::Vsock("watch setup timed out".into()))?
 }
 
 #[cfg(test)]
@@ -539,20 +542,20 @@ mod tests {
     fn file_err_prefixes_decode_to_typed_errors() {
         assert!(matches!(
             decode_file_err(b"ENOENT: /a/b"),
-            VmmError::PathNotFound(p) if p == "/a/b"
+            ComputerError::PathNotFound(p) if p == "/a/b"
         ));
         assert!(matches!(
             decode_file_err(b"ENOTDIR: /a/file"),
-            VmmError::NotADirectory(p) if p == "/a/file"
+            ComputerError::NotADirectory(p) if p == "/a/file"
         ));
         assert!(matches!(
             decode_file_err(b"ENOTEMPTY: /a/dir"),
-            VmmError::DirectoryNotEmpty(p) if p == "/a/dir"
+            ComputerError::DirectoryNotEmpty(p) if p == "/a/dir"
         ));
         // Old-agent / free-form errors stay vsock errors.
         assert!(matches!(
             decode_file_err(b"read file: boom"),
-            VmmError::Vsock(m) if m == "read file: boom"
+            ComputerError::Vsock(m) if m == "read file: boom"
         ));
     }
 
@@ -615,7 +618,7 @@ mod tests {
         .await;
 
         let err = remove_entry(&vsock, "/full", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::DirectoryNotEmpty(p) if p == "/full"));
+        assert!(matches!(err, ComputerError::DirectoryNotEmpty(p) if p == "/full"));
     }
 
     #[tokio::test]
@@ -629,7 +632,7 @@ mod tests {
         .await;
 
         let err = read_file(&vsock, "/missing").await.unwrap_err();
-        assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
+        assert!(matches!(err, ComputerError::PathNotFound(p) if p == "/missing"));
     }
 
     #[tokio::test]
@@ -652,7 +655,7 @@ mod tests {
         let err = write_file(&vsock, "/plain.txt/sub", 0, b"x")
             .await
             .unwrap_err();
-        assert!(matches!(err, VmmError::NotADirectory(p) if p == "/plain.txt/sub"));
+        assert!(matches!(err, ComputerError::NotADirectory(p) if p == "/plain.txt/sub"));
     }
 
     #[tokio::test]
@@ -694,6 +697,6 @@ mod tests {
         .await;
 
         let err = watch_dir(&vsock, "/missing", false).await.unwrap_err();
-        assert!(matches!(err, VmmError::PathNotFound(p) if p == "/missing"));
+        assert!(matches!(err, ComputerError::PathNotFound(p) if p == "/missing"));
     }
 }

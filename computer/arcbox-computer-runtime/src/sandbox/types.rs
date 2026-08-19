@@ -1,7 +1,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-pub type SandboxId = String;
+pub type ComputerId = String;
 
 /// A sandbox's network as the boot flow carries it: the lease the guest
 /// network reserved, the NIC it returned when it activated that lease, and
@@ -44,7 +44,7 @@ impl NetworkAttachment {
 
 /// Lifecycle state of a sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxState {
+pub enum ComputerState {
     /// VMM prepared; VM still booting.
     Starting,
     /// VM booted and ready to accept workloads (or last workload exited).
@@ -65,7 +65,7 @@ pub enum SandboxState {
     Paused,
 }
 
-impl std::fmt::Display for SandboxState {
+impl std::fmt::Display for ComputerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Starting => write!(f, "starting"),
@@ -80,7 +80,7 @@ impl std::fmt::Display for SandboxState {
     }
 }
 
-// Spec types (input to SandboxManager methods)
+// Spec types (input to ComputerManager methods)
 
 /// What happens when a sandbox's idle timeout expires (CORE-21).
 ///
@@ -114,14 +114,14 @@ pub struct LifecycleUpdate {
 
 /// Network configuration supplied at sandbox creation time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SandboxNetworkSpec {
+pub struct ComputerNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
 }
 
 /// A single bind-mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SandboxMountSpec {
+pub struct ComputerMountSpec {
     pub source: String,
     pub target: String,
     pub readonly: bool,
@@ -136,7 +136,7 @@ pub struct SandboxMountSpec {
 /// boundary (see the guest agent's `SandboxService::create`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SandboxSpec {
+pub struct ComputerSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
     pub id: Option<String>,
     /// Arbitrary key-value metadata (filtering, listing).
@@ -160,9 +160,9 @@ pub struct SandboxSpec {
     /// User to run the initial command as.
     pub user: String,
     /// Bind mounts into the sandbox.
-    pub mounts: Vec<SandboxMountSpec>,
+    pub mounts: Vec<ComputerMountSpec>,
     /// Network configuration.
-    pub network: SandboxNetworkSpec,
+    pub network: ComputerNetworkSpec,
     /// Auto-destroy TTL in seconds (0 = no limit).
     pub ttl_seconds: u32,
     /// SSH public key injected via MMDS (None = no SSH setup).
@@ -186,7 +186,7 @@ pub struct SandboxSpec {
 }
 
 /// A template's pre-warmed boot-to-ready snapshot, threaded through
-/// [`SandboxSpec`] (CORE-107).
+/// [`ComputerSpec`] (CORE-107).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateWarmRef {
     /// Snapshot id in the snapshot catalog.
@@ -198,7 +198,7 @@ pub struct TemplateWarmRef {
 
 /// Parameters to restore a sandbox from a checkpoint.
 #[derive(Debug, Clone, Default)]
-pub struct RestoreSandboxSpec {
+pub struct RestoreComputerSpec {
     /// Caller-supplied ID (None = auto-generate).
     pub id: Option<String>,
     /// Source checkpoint/snapshot ID.
@@ -214,9 +214,9 @@ pub struct RestoreSandboxSpec {
 // Public output types (returned to callers / gRPC layer)
 
 /// Lightweight summary for `List` operations.
-pub struct SandboxSummary {
-    pub id: SandboxId,
-    pub state: SandboxState,
+pub struct ComputerSummary {
+    pub id: ComputerId,
+    pub state: ComputerState,
     pub labels: HashMap<String, String>,
     /// Allocated IP address (empty when network mode is `"none"`).
     pub ip_address: String,
@@ -228,13 +228,13 @@ pub struct SandboxSummary {
 }
 
 /// Detailed sandbox state for `Inspect`.
-pub struct SandboxInfo {
-    pub id: SandboxId,
-    pub state: SandboxState,
+pub struct ComputerInfo {
+    pub id: ComputerId,
+    pub state: ComputerState,
     pub labels: HashMap<String, String>,
     pub vcpus: u32,
     pub memory_mib: u64,
-    pub network: Option<SandboxNetworkInfo>,
+    pub network: Option<ComputerNetworkInfo>,
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
@@ -252,15 +252,15 @@ pub struct SandboxInfo {
     pub on_idle: IdleAction,
 }
 
-/// Network details within `SandboxInfo`.
-pub struct SandboxNetworkInfo {
+/// Network details within `ComputerInfo`.
+pub struct ComputerNetworkInfo {
     pub ip_address: String,
     pub gateway: String,
 }
 
 // Events
 
-/// The `action` values a [`SandboxEvent`] carries, in lifecycle order.
+/// The `action` values a [`ComputerEvent`] carries, in lifecycle order.
 ///
 /// `action` stays a `String` on the event (it crosses the API as one), but
 /// every emit site and match in this crate goes through these constants, so
@@ -282,8 +282,8 @@ pub mod action {
 
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
-pub struct SandboxEvent {
-    pub sandbox_id: SandboxId,
+pub struct ComputerEvent {
+    pub computer_id: ComputerId,
     /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.
@@ -292,10 +292,10 @@ pub struct SandboxEvent {
     pub attributes: HashMap<String, String>,
 }
 
-impl SandboxEvent {
-    pub fn new(sandbox_id: &str, action: &str) -> Self {
+impl ComputerEvent {
+    pub fn new(computer_id: &str, action: &str) -> Self {
         Self {
-            sandbox_id: sandbox_id.to_owned(),
+            computer_id: computer_id.to_owned(),
             action: action.to_owned(),
             timestamp_ns: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             attributes: HashMap::new(),
@@ -333,11 +333,11 @@ pub struct CheckpointInfo {
 pub struct CheckpointSummary {
     pub id: String,
     /// ID of the sandbox that was checkpointed.
-    pub sandbox_id: String,
+    pub computer_id: String,
     pub name: String,
     pub labels: HashMap<String, String>,
     pub snapshot_dir: String,
     pub created_at: String,
 }
 
-// SandboxManager
+// ComputerManager

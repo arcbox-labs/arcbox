@@ -4,7 +4,7 @@
 //! with its known busybox userland, or a stock distro on a bare-metal
 //! node — and every part that differs is supplied here rather than built
 //! in the code. There is no default and no member is optional:
-//! [`SandboxManager::new`](crate::SandboxManager::new) builds none of the
+//! [`ComputerManager::new`](crate::ComputerManager::new) builds none of the
 //! four, so what VMM its Computers run on is the composer's decision and
 //! never a fallback taken here (vm-stack-redesign R3, charter D4).
 //!
@@ -30,7 +30,7 @@ pub struct NodeEnvironment {
     /// flows spawn the VMM ahead of the guest, every flow stages the files
     /// its computer boots from, and the guest agent is reached over vsock.
     /// A driver that cannot is refused by
-    /// [`SandboxManager::new`](crate::SandboxManager::new) rather than at
+    /// [`ComputerManager::new`](crate::ComputerManager::new) rather than at
     /// the first boot.
     pub driver: Arc<dyn VmDriver>,
     /// What the sandboxes' NICs attach to, behind the guest-network port

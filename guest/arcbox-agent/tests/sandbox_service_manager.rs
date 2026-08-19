@@ -6,9 +6,7 @@ use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::error::SandboxError;
 use arcbox_agent::sandbox::SandboxService;
 use arcbox_computer_runtime::RuntimeConfig;
-use arcbox_computer_runtime::config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
-};
+use arcbox_computer_runtime::config::{ComputerConfig, DefaultVmConfig, GrpcConfig, NetworkConfig};
 use arcbox_connect::sandbox_v1::{
     CreateSandboxRequest, InspectSandboxRequest, ListSandboxesRequest, NetworkMode, NetworkSpec,
     RemoveSandboxRequest, SandboxState, StartExecutionRequest, StopSandboxRequest,
@@ -28,7 +26,7 @@ fn test_config() -> GuestConfig {
     let data_dir = format!("/tmp/arcbox-agent-test-{}", std::process::id());
 
     let runtime = RuntimeConfig {
-        firecracker: FirecrackerConfig {
+        firecracker: ComputerConfig {
             jailer: None,
             data_dir: data_dir.clone(),
             // Direct mode cannot restore (and so never pools or serves

@@ -1,4 +1,4 @@
-//! Template-catalog surface on [`SandboxManager`] (CORE-107).
+//! Template-catalog surface on [`ComputerManager`] (CORE-107).
 //!
 //! Thin delegation to [`TemplateCatalog`](crate::template_catalog::TemplateCatalog)
 //! plus the artifact side effects the catalog itself never performs: draining
@@ -6,7 +6,7 @@
 //! Build orchestration (rootfs conversion, prewarm) lives in the guest agent
 //! and lands its results here via [`register_template_draft`].
 //!
-//! [`register_template_draft`]: SandboxManager::register_template_draft
+//! [`register_template_draft`]: ComputerManager::register_template_draft
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,9 +14,9 @@ use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::SandboxManager;
-use super::types::{SandboxId, SandboxSpec, SandboxState};
-use crate::error::{Result, VmmError};
+use super::ComputerManager;
+use super::types::{ComputerId, ComputerSpec, ComputerState};
+use crate::error::{ComputerError, Result};
 use crate::snapshot::{SnapshotDraft, SnapshotGeometry};
 use crate::template_catalog::{
     ReleasedArtifacts, ResolvedTemplate, TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry,
@@ -39,7 +39,7 @@ pub struct PromotedSnapshot {
     pub artifact_bytes: u64,
 }
 
-impl SandboxManager {
+impl ComputerManager {
     /// Resolve a `name[:version]` catalog reference.
     pub fn get_template(&self, reference: &str) -> Result<ResolvedTemplate> {
         self.templates.resolve(reference).map_err(Into::into)
@@ -99,19 +99,19 @@ impl SandboxManager {
         crate::template_catalog::validate_template_name(template_name)?;
         let source = self.snapshots.find_by_id(source_snapshot_id)?;
         if source.name.as_deref() == Some(super::pause::PAUSE_SNAPSHOT_NAME) {
-            return Err(VmmError::FailedPrecondition(format!(
+            return Err(ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} is the internal pause checkpoint of a \
                  paused sandbox; checkpoint the sandbox instead"
             )));
         }
         let geometry = source.geometry.ok_or_else(|| {
-            VmmError::FailedPrecondition(format!(
+            ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} predates geometry recording; \
                  re-checkpoint the sandbox with this agent and promote the new snapshot"
             ))
         })?;
         let rootfs_path = source.rootfs_path.clone().ok_or_else(|| {
-            VmmError::FailedPrecondition(format!(
+            ComputerError::FailedPrecondition(format!(
                 "snapshot {source_snapshot_id} records no rootfs path; \
                  re-checkpoint the sandbox and promote the new snapshot"
             ))
@@ -161,7 +161,7 @@ impl SandboxManager {
         defaults: &TemplateDefaultsSpec,
     ) -> Result<PrewarmOutcome> {
         if self.config.firecracker.jailer.is_none() {
-            return Err(VmmError::FailedPrecondition(
+            return Err(ComputerError::FailedPrecondition(
                 "prewarm requires jailer mode (snapshot restore does)".into(),
             ));
         }
@@ -176,7 +176,7 @@ impl SandboxManager {
             self.config.defaults.memory_mib
         };
         // Short id on purpose: it must fit the driver's own id budget
-        // (`VmDriver::id_budget`, enforced by `validate_new_sandbox_id`) —
+        // (`VmDriver::id_budget`, enforced by `validate_new_computer_id`) —
         // `template-build-<full uuid>` was 51 chars and overflowed AF_UNIX's
         // `sun_path`, failing the builder boot as an opaque socket timeout.
         // 16 hex chars keep collisions out of reach for an ephemeral,
@@ -184,7 +184,7 @@ impl SandboxManager {
         let mut suffix = Uuid::new_v4().simple().to_string();
         suffix.truncate(16);
         let builder_id = format!("tpl-build-{suffix}");
-        let spec = SandboxSpec {
+        let spec = ComputerSpec {
             id: Some(builder_id.clone()),
             rootfs: rootfs_path.to_owned(),
             vcpus,
@@ -195,7 +195,7 @@ impl SandboxManager {
             ..Default::default()
         };
         let (id, _ip) = self
-            .create_sandbox_inner(
+            .create_computer_inner(
                 spec,
                 &Uuid::new_v4().to_string(),
                 super::lifecycle::WarmPolicy::Disabled,
@@ -208,11 +208,11 @@ impl SandboxManager {
         // vCPUs/memory allocated. The fresh snapshot is dropped too — no
         // record references it yet — and the error names the builder id so
         // the operator can remove it and retry.
-        if let Err(remove_error) = self.remove_sandbox(&id, true).await {
+        if let Err(remove_error) = self.remove_computer(&id, true).await {
             if let Ok((snapshot_id, _)) = &checkpoint {
                 self.discard_promoted_snapshot(snapshot_id).await;
             }
-            return Err(VmmError::Unavailable(format!(
+            return Err(ComputerError::Unavailable(format!(
                 "prewarm builder sandbox {id} could not be removed ({remove_error}); \
                  remove it manually and retry the build"
             )));
@@ -231,23 +231,23 @@ impl SandboxManager {
     /// Wait for the builder to reach READY, then checkpoint it under the
     /// template label. Polled rather than event-driven: a lagged broadcast
     /// receiver would miss the READY edge, while polling cannot.
-    async fn prewarm_checkpoint(&self, id: &SandboxId, template: &str) -> Result<(String, u64)> {
+    async fn prewarm_checkpoint(&self, id: &ComputerId, template: &str) -> Result<(String, u64)> {
         const READY_POLL_MS: u64 = 250;
         const READY_TIMEOUT_SECS: u64 = 180;
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(READY_TIMEOUT_SECS);
         loop {
-            let info = self.inspect_sandbox(id)?;
+            let info = self.inspect_computer(id)?;
             match info.state {
-                SandboxState::Ready => break,
-                SandboxState::Failed => {
-                    return Err(VmmError::FailedPrecondition(format!(
+                ComputerState::Ready => break,
+                ComputerState::Failed => {
+                    return Err(ComputerError::FailedPrecondition(format!(
                         "prewarm boot failed: {}",
                         info.error.unwrap_or_else(|| "unknown boot failure".into())
                     )));
                 }
                 _ if tokio::time::Instant::now() >= deadline => {
-                    return Err(VmmError::DeadlineExceeded(format!(
+                    return Err(ComputerError::DeadlineExceeded(format!(
                         "prewarm builder did not reach READY within {READY_TIMEOUT_SECS}s"
                     )));
                 }
@@ -338,7 +338,7 @@ pub struct PrewarmOutcome {
 /// the template.
 pub(super) fn template_restore_eligible(
     config: &crate::config::RuntimeConfig,
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     caller_supplied_boot: bool,
     warm: &crate::sandbox::TemplateWarmRef,
 ) -> bool {
@@ -359,33 +359,33 @@ fn clone_or_copy(src: &Path, dst: &Path) -> Result<u64> {
     {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let source = std::fs::File::open(src).map_err(VmmError::Io)?;
+        let source = std::fs::File::open(src).map_err(ComputerError::Io)?;
         let dest = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(dst)
-            .map_err(VmmError::Io)?;
+            .map_err(ComputerError::Io)?;
         // SAFETY: both fds are open for the duration of the call; FICLONE
         // only clones extents from the source fd into the destination fd.
         let rc = unsafe { libc::ioctl(dest.as_raw_fd(), libc::FICLONE as _, source.as_raw_fd()) };
         if rc == 0 {
-            dest.sync_all().map_err(VmmError::Io)?;
-            return Ok(source.metadata().map_err(VmmError::Io)?.len());
+            dest.sync_all().map_err(ComputerError::Io)?;
+            return Ok(source.metadata().map_err(ComputerError::Io)?.len());
         }
         // Reflink unsupported here (non-Btrfs staging, cross-subvolume
         // boundary) — fall back to a plain copy below.
         drop(dest);
         let _ = std::fs::remove_file(dst);
     }
-    let bytes = std::fs::copy(src, dst).map_err(VmmError::Io)?;
-    let dest = std::fs::File::open(dst).map_err(VmmError::Io)?;
+    let bytes = std::fs::copy(src, dst).map_err(ComputerError::Io)?;
+    let dest = std::fs::File::open(dst).map_err(ComputerError::Io)?;
     std::fs::set_permissions(dst, {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::Permissions::from_mode(0o600)
     })
-    .map_err(VmmError::Io)?;
-    dest.sync_all().map_err(VmmError::Io)?;
+    .map_err(ComputerError::Io)?;
+    dest.sync_all().map_err(ComputerError::Io)?;
     Ok(bytes)
 }
 
@@ -395,17 +395,17 @@ mod tests {
     use std::path::Path;
 
     use crate::config::RuntimeConfig;
-    use crate::sandbox::SandboxManager;
+    use crate::sandbox::ComputerManager;
     use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
     use crate::template_catalog::{
         TEMPLATE_LABEL, TemplateDefaultsSpec, TemplateEntry, WarmArtifact,
     };
 
-    async fn manager(data_dir: &Path) -> SandboxManager {
+    async fn manager(data_dir: &Path) -> ComputerManager {
         let mut config = RuntimeConfig::default();
         config.firecracker.data_dir = data_dir.to_string_lossy().into_owned();
         let environment = crate::testkit::fake_environment(&config).unwrap();
-        let manager = SandboxManager::new(config, environment).unwrap();
+        let manager = ComputerManager::new(config, environment).unwrap();
         manager.await_reconcile().await.unwrap();
         manager
     }

@@ -4,7 +4,7 @@
 //! Moved here from `sandbox::boot` by R3 PR-F1b, unchanged: these are the
 //! bodies `Effect::SpawnBoot` and `Effect::SpawnGate` name, and the actor
 //! will run them through [`ComputerTasks`](super::ComputerTasks) once PR-F2
-//! flips the manager. Until then `sandbox::boot::boot_sandbox` is still the
+//! flips the manager. Until then `sandbox::boot::boot_computer` is still the
 //! caller.
 
 use std::path::{Path, PathBuf};
@@ -17,11 +17,11 @@ use tracing::{debug, warn};
 
 use crate::agent::{ClockSync, GuestAgent, GuestAgentFactory, ReadyGate};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
 use crate::sandbox::spec::build_vm_spec;
-use crate::sandbox::{self, NetworkAttachment, SandboxSpec, SandboxState};
+use crate::sandbox::{self, ComputerSpec, ComputerState, NetworkAttachment};
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 pub type BootOutput = (Arc<dyn VmHandle>, Box<dyn ReadyGate>);
@@ -37,7 +37,7 @@ const AGENT_GATE_TIMEOUT: Duration = Duration::from_secs(35);
 const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct BootFailure {
-    pub error: VmmError,
+    pub error: ComputerError,
     pub prepared: Option<Arc<dyn PreparedVm>>,
     pub cow_handle: Option<CowHandle>,
 }
@@ -74,8 +74,10 @@ pub async fn wait_for_agent(
         Ok(agent) => {
             match tokio::time::timeout(AGENT_GATE_TIMEOUT, ready_gate.wait(handle, &agent)).await {
                 Ok(Ok(())) => Ok(agent),
-                Ok(Err(error)) => Err(VmmError::Vsock(format!("agent readiness gate: {error}"))),
-                Err(_) => Err(VmmError::Vsock(format!(
+                Ok(Err(error)) => Err(ComputerError::Vsock(format!(
+                    "agent readiness gate: {error}"
+                ))),
+                Err(_) => Err(ComputerError::Vsock(format!(
                     "agent readiness gate: the guest agent did not answer within {}s",
                     AGENT_GATE_TIMEOUT.as_secs()
                 ))),
@@ -103,15 +105,15 @@ pub async fn wait_for_agent(
                 Ok(Ok(ClockSync::Synced)) => {}
                 Ok(Ok(ClockSync::AgentError(code))) => {
                     warn!(
-                        sandbox_id = %id, code,
+                        computer_id = %id, code,
                         "agent could not set the clock; continuing with a possibly skewed clock"
                     );
                 }
                 Ok(Err(error)) => {
-                    warn!(sandbox_id = %id, %error, "cold-boot clock sync failed; continuing");
+                    warn!(computer_id = %id, %error, "cold-boot clock sync failed; continuing");
                 }
                 Err(_) => {
-                    warn!(sandbox_id = %id, "cold-boot clock sync timed out; continuing");
+                    warn!(computer_id = %id, "cold-boot clock sync timed out; continuing");
                 }
             }
         });
@@ -144,7 +146,7 @@ pub async fn wait_for_agent(
 )]
 pub async fn do_boot(
     id: &str,
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     net: Option<&NetworkAttachment>,
     vm_dir: &Path,
     driver: &dyn VmDriver,
@@ -182,7 +184,7 @@ pub async fn do_boot(
     };
 
     let process_pid = sandbox::journaled_pid(&*prepared);
-    let journal_error = sandbox::reconcile::SandboxStateRecord::new(
+    let journal_error = sandbox::reconcile::ComputerStateRecord::new(
         id,
         process_pid,
         net.map(NetworkAttachment::journaled),
@@ -201,10 +203,10 @@ pub async fn do_boot(
         computer.state
     };
 
-    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+    if matches!(state, ComputerState::Stopping | ComputerState::Stopped) {
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
-            error: VmmError::WrongState {
+            error: ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
@@ -239,7 +241,7 @@ pub async fn do_boot(
     let paths: Result<(PathBuf, PathBuf)> = async {
         if fc_cfg.jailer.is_some() {
             let journal = |cow: Option<&CowHandle>| {
-                sandbox::reconcile::SandboxStateRecord::new(
+                sandbox::reconcile::ComputerStateRecord::new(
                     id,
                     process_pid,
                     net.map(NetworkAttachment::journaled),
@@ -284,7 +286,7 @@ pub async fn do_boot(
             let rootfs = match cow_manager.setup(id, &spec.rootfs).await {
                 Ok(handle) => {
                     cow_handle = Some(handle);
-                    let record = sandbox::reconcile::SandboxStateRecord::new(
+                    let record = sandbox::reconcile::ComputerStateRecord::new(
                         id,
                         process_pid,
                         net.map(NetworkAttachment::journaled),
@@ -300,7 +302,7 @@ pub async fn do_boot(
                         return Err(e.into());
                     }
                     debug!(
-                        sandbox_id = %id,
+                        computer_id = %id,
                         error = %e,
                         "dm-snapshot unavailable, using rootfs directly"
                     );
@@ -329,9 +331,9 @@ pub async fn do_boot(
         prepared: None,
         cow_handle: None,
     })?;
-    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+    if matches!(state, ComputerState::Stopping | ComputerState::Stopped) {
         return Err(BootFailure {
-            error: VmmError::WrongState {
+            error: ComputerError::WrongState {
                 id: id.to_owned(),
                 expected: "a sandbox still booting".into(),
                 actual: state.to_string(),
@@ -347,7 +349,7 @@ pub async fn do_boot(
     // listening — otherwise the guest is reset and the one readiness event
     // is lost. Which observer that is, and whether there is one at all, is
     // the agent port's business.
-    let failed = |error: VmmError| BootFailure {
+    let failed = |error: ComputerError| BootFailure {
         error,
         prepared: None,
         cow_handle: None,

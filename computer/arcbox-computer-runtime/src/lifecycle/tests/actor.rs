@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{GuestAgent, GuestAgentFactory};
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{
     Command, ComputerActor, ComputerSeed, ComputerSnapshot, Deadlines, Seeded, WorkloadOutcome,
 };
@@ -25,11 +25,11 @@ use crate::lifecycle::effect::ReleaseScope;
 use crate::lifecycle::event::{PauseReason, Provision, RestoreOrigin};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::lifecycle::tasks::{CaptureSpec, ComputerTasks, Drain, TaskFailure, TaskResult};
-use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
-use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
+use crate::sandbox::reconcile::{ComputerStateRecord, write_state_record};
+use crate::sandbox::record::{ComputerProvisionOutcome, ComputerRecordStore};
 use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{
-    CheckpointInfo, IdleAction, LifecycleUpdate, SandboxEvent, SandboxSpec, SandboxState,
+    CheckpointInfo, ComputerEvent, ComputerSpec, ComputerState, IdleAction, LifecycleUpdate,
 };
 use crate::testkit::agent::FakeAgentFactory;
 
@@ -126,7 +126,7 @@ impl ComputerTasks for Script {
                 drop(handed_off);
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 self.cleanup_finished.store(true, Ordering::SeqCst);
-                Err(TaskFailure::recoverable(VmmError::Process(
+                Err(TaskFailure::recoverable(ComputerError::Process(
                     "the vmm would not spawn".into(),
                 )))
             }
@@ -155,7 +155,7 @@ impl ComputerTasks for Script {
     async fn restore(
         &self,
         _origin: RestoreOrigin,
-    ) -> TaskResult<(Arc<dyn GuestAgent>, SandboxProvisionOutcome)> {
+    ) -> TaskResult<(Arc<dyn GuestAgent>, ComputerProvisionOutcome)> {
         self.record("restore");
         let takes = *self.restore_takes.lock().unwrap();
         if let Some(takes) = takes {
@@ -163,11 +163,11 @@ impl ComputerTasks for Script {
         }
         self.restore_finished.store(true, Ordering::SeqCst);
         if self.restore_fails.load(Ordering::SeqCst) {
-            return Err(TaskFailure::recoverable(VmmError::Process(
+            return Err(TaskFailure::recoverable(ComputerError::Process(
                 "the checkpoint would not load".into(),
             )));
         }
-        Ok((Arc::clone(&self.agent), SandboxProvisionOutcome::default()))
+        Ok((Arc::clone(&self.agent), ComputerProvisionOutcome::default()))
     }
 
     async fn checkpoint(
@@ -208,7 +208,7 @@ impl ComputerTasks for Script {
             tokio::time::sleep(takes).await;
         }
         if self.release_fails.load(Ordering::SeqCst) {
-            return Err(TaskFailure::recoverable(VmmError::Process(
+            return Err(TaskFailure::recoverable(ComputerError::Process(
                 "the vmm would not die".into(),
             )));
         }
@@ -223,7 +223,7 @@ struct Harness {
     registered: Arc<AtomicBool>,
     runtime: crate::lifecycle::runtime::Runtime,
     snapshot: watch::Receiver<ComputerSnapshot>,
-    events: broadcast::Receiver<SandboxEvent>,
+    events: broadcast::Receiver<ComputerEvent>,
     script: Arc<Script>,
     actor: tokio::task::JoinHandle<()>,
     _timers: watch::Sender<bool>,
@@ -254,22 +254,22 @@ impl Harness {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let runtime = Arc::new(Mutex::new(ComputerRuntime::new(
             "box".to_owned(),
-            SandboxSpec::default(),
+            ComputerSpec::default(),
             None,
             dir.path().to_path_buf(),
         )));
         let (snapshot_tx, snapshot) = watch::channel(ComputerSnapshot::project(
             &runtime.lock().unwrap(),
-            SandboxState::Starting,
+            ComputerState::Starting,
             deadlines,
         ));
         let (timers, timers_enabled) = watch::channel(true);
         if journal {
             let config = RuntimeConfig::default();
-            let record = SandboxStateRecord::new("box", None, None, None, &config, None).unwrap();
+            let record = ComputerStateRecord::new("box", None, None, None, &config, None).unwrap();
             write_state_record(dir.path(), &record).unwrap();
         }
-        let records = Arc::new(SandboxRecordStore::new(dir.path()).unwrap());
+        let records = Arc::new(ComputerRecordStore::new(dir.path()).unwrap());
         // No durable record by default: these tests exercise the actor, not
         // the store, so the record writes are no-ops. The crash journal is
         // not — it is a file beside them, and its ordering is the thing
@@ -279,9 +279,9 @@ impl Harness {
                 .provision_intent(
                     "box",
                     "key",
-                    SandboxSpec {
+                    ComputerSpec {
                         id: Some("box".to_owned()),
-                        ..SandboxSpec::default()
+                        ..ComputerSpec::default()
                     },
                 )
                 .unwrap()
@@ -330,16 +330,16 @@ impl Harness {
     async fn boot_to_ready(&mut self) {
         self.send(|reply| Command::Provision {
             provision: Provision::Boot { warm: false },
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             reply,
         })
         .ok()
         .await;
-        self.settled(SandboxState::Ready).await;
+        self.settled(ComputerState::Ready).await;
     }
 
     /// Waits for the snapshot to reach `state`.
-    async fn settled(&mut self, state: SandboxState) {
+    async fn settled(&mut self, state: ComputerState) {
         self.snapshot
             .wait_for(|snapshot| snapshot.state == state)
             .await
@@ -365,7 +365,7 @@ impl Harness {
     }
 
     /// The next event carrying `action`.
-    async fn next_event(&mut self, action: &str) -> SandboxEvent {
+    async fn next_event(&mut self, action: &str) -> ComputerEvent {
         loop {
             let event = self.events.recv().await.expect("the event bus stays open");
             if event.action == action {
@@ -392,7 +392,7 @@ impl Waiter {
         self.0.await.unwrap().unwrap();
     }
 
-    async fn error(self) -> VmmError {
+    async fn error(self) -> ComputerError {
         self.0.await.unwrap().unwrap_err()
     }
 }
@@ -448,7 +448,7 @@ async fn a_force_remove_preempts_a_boot_that_has_handed_its_resources_over() {
     harness
         .send(|reply| Command::Provision {
             provision: Provision::Boot { warm: false },
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             reply,
         })
         .ok()
@@ -467,14 +467,14 @@ async fn a_force_remove_preempts_a_boot_that_has_handed_its_resources_over() {
 #[tokio::test(start_paused = true)]
 async fn a_teardown_stalls_until_the_boot_hands_its_resources_over() {
     // Aborting before the handoff would strand whatever the task still owns,
-    // so the teardown re-parks the task and retries — `expire_sandbox`'s
+    // so the teardown re-parks the task and retries — `expire_computer`'s
     // backoff loop, collapsed into the actor.
     let handoff_at = Duration::from_secs(25);
     let mut harness = Harness::start(Boot::HandsOffAfter(handoff_at), no_deadlines()).await;
     harness
         .send(|reply| Command::Provision {
             provision: Provision::Boot { warm: false },
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             reply,
         })
         .ok()
@@ -504,7 +504,7 @@ async fn a_superseded_tasks_completion_cannot_drive_the_machine() {
     // on the handoff at the moment the task signals it and completes.
     let created = harness.send(|reply| Command::Provision {
         provision: Provision::Boot { warm: false },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
     let removed = harness.send(|reply| Command::Remove { force: true, reply });
@@ -519,12 +519,12 @@ async fn a_superseded_tasks_completion_cannot_drive_the_machine() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stop_during_a_launch_is_served_once_the_launch_lands() {
-    // Today's `stop_sandbox` answers WrongState here; the actor defers it,
+    // Today's `stop_computer` answers WrongState here; the actor defers it,
     // which is what stops a stop from racing a boot mid-acquisition.
     let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
     let created = harness.send(|reply| Command::Provision {
         provision: Provision::Boot { warm: false },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
     let stopped = harness.send(|reply| Command::Stop {
@@ -584,7 +584,7 @@ async fn the_idle_window_is_the_actors_own_timer() {
 async fn a_failure_keeps_its_crash_journal_when_the_release_fails() {
     // The journal names exactly the resources a restart would have to
     // reclaim, so it may only go once the release that frees them has
-    // *finished* — `fail_live_sandbox` gates on the write being confirmed
+    // *finished* — `fail_live_computer` gates on the write being confirmed
     // AND the cleanup completing, and so must this.
     let mut harness = Harness::journalled(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
@@ -592,7 +592,7 @@ async fn a_failure_keeps_its_crash_journal_when_the_release_fails() {
     harness.script.release_fails.store(true, Ordering::SeqCst);
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     harness.awaited("release").await;
     tokio::task::yield_now().await;
     assert!(
@@ -608,7 +608,7 @@ async fn a_failure_drops_its_crash_journal_once_the_release_is_done() {
     assert!(harness.has_journal());
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     while harness.has_journal() {
         tokio::task::yield_now().await;
     }
@@ -617,7 +617,7 @@ async fn a_failure_drops_its_crash_journal_once_the_release_is_done() {
 #[tokio::test(start_paused = true)]
 async fn a_removal_whose_release_fails_answers_its_caller() {
     // `removing` coalesces the failure, so nothing else ever will — and
-    // `remove_sandbox_impl` hands the release error straight back today.
+    // `remove_computer_impl` hands the release error straight back today.
     let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
     harness.script.release_fails.store(true, Ordering::SeqCst);
@@ -650,7 +650,7 @@ async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
     let harness = Harness::start(Boot::HandsOffThenPanics, no_deadlines()).await;
     harness.send(|reply| Command::Provision {
         provision: Provision::Boot { warm: false },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
     let error = harness
@@ -658,7 +658,7 @@ async fn a_panicked_sub_task_is_reported_rather_than_swallowed() {
         .error()
         .await;
     assert!(error.to_string().contains("panicked"), "{error}");
-    // The teardown stopped where `remove_sandbox_impl` stops — no release —
+    // The teardown stopped where `remove_computer_impl` stops — no release —
     // so the record and its crash journal survive for the startup sweep.
     assert!(!harness.script.calls().contains(&"release"));
 
@@ -679,7 +679,7 @@ async fn a_boot_that_never_handed_off_is_joined_so_its_own_cleanup_finishes() {
     let harness = Harness::start(Boot::DropsHandoffThenCleansUp, no_deadlines()).await;
     harness.send(|reply| Command::Provision {
         provision: Provision::Boot { warm: false },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
     // Let the actor observe the dropped signal before the teardown asks.
@@ -708,7 +708,7 @@ async fn a_restore_is_joined_rather_than_aborted() {
         provision: Provision::Restore {
             origin: RestoreOrigin::Restore,
         },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
     tokio::task::yield_now().await;
@@ -733,7 +733,7 @@ async fn a_stop_during_the_gates_own_cmd_is_still_deferred() {
     harness
         .send(|reply| Command::Provision {
             provision: Provision::Boot { warm: false },
-            outcome: SandboxProvisionOutcome::default(),
+            outcome: ComputerProvisionOutcome::default(),
             reply,
         })
         .ok()
@@ -749,7 +749,7 @@ async fn a_stop_during_the_gates_own_cmd_is_still_deferred() {
         })
         .ok()
         .await;
-    harness.settled(SandboxState::Running).await;
+    harness.settled(ComputerState::Running).await;
     let stopped = harness.send(|reply| Command::Stop {
         budget: Duration::from_secs(30),
         reply,
@@ -779,7 +779,7 @@ async fn a_claim_the_machine_refuses_is_answered_wrong_state() {
         })
         .error()
         .await;
-    assert!(matches!(error, VmmError::WrongState { .. }), "{error}");
+    assert!(matches!(error, ComputerError::WrongState { .. }), "{error}");
 
     // ...and a non-forced remove is refused for the same reason.
     let error = harness
@@ -789,7 +789,7 @@ async fn a_claim_the_machine_refuses_is_answered_wrong_state() {
         })
         .error()
         .await;
-    assert!(matches!(error, VmmError::WrongState { .. }), "{error}");
+    assert!(matches!(error, ComputerError::WrongState { .. }), "{error}");
 }
 
 /// A restore that fails is unwound by a force remove, and its caller must not
@@ -810,7 +810,7 @@ async fn a_failed_restore_answers_only_once_its_teardown_has_freed_the_id() {
         provision: Provision::Restore {
             origin: RestoreOrigin::WarmCreate,
         },
-        outcome: SandboxProvisionOutcome::default(),
+        outcome: ComputerProvisionOutcome::default(),
         reply,
     });
 
@@ -830,7 +830,7 @@ async fn a_failed_restore_answers_only_once_its_teardown_has_freed_the_id() {
 /// A paused computer records what it retained where its readers look.
 ///
 /// `Inspect` and `List` size the checkpoint and the disk overlay from the
-/// runtime, and a resume finds its checkpoint there — `pause_sandbox` wrote
+/// runtime, and a resume finds its checkpoint there — `pause_computer` wrote
 /// both at the `Paused` commit, and nothing else does.
 #[tokio::test(start_paused = true)]
 async fn a_paused_computer_records_what_it_retained() {
@@ -855,7 +855,7 @@ async fn a_paused_computer_records_what_it_retained() {
     // is the very next thing a client does, and the effects that write those
     // fields run after the transition published the snapshot.
     let snapshot = harness.snapshot.borrow();
-    assert_eq!(snapshot.state, SandboxState::Paused);
+    assert_eq!(snapshot.state, ComputerState::Paused);
     assert_eq!(snapshot.pause_snapshot_id.as_deref(), Some("snap"));
     assert!(snapshot.paused_at.is_some());
 }
@@ -890,7 +890,7 @@ async fn an_idle_pause_says_so_on_its_event() {
 /// A record that will not delete stalls the teardown instead of reporting it
 /// done.
 ///
-/// `remove_sandbox_impl` propagates a failed `finish_remove` *before* it drops
+/// `remove_computer_impl` propagates a failed `finish_remove` *before* it drops
 /// its map entry: the record still owns the id, and only a retry that re-runs
 /// the deletion can free it. Unregistering and announcing REMOVED anyway
 /// would leave that id un-creatable — `cancel_pending_or_missing` refuses
@@ -1138,7 +1138,7 @@ async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
     let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
     let journal =
-        SandboxStateRecord::new("box", None, None, None, &RuntimeConfig::default(), None).unwrap();
+        ComputerStateRecord::new("box", None, None, None, &RuntimeConfig::default(), None).unwrap();
     write_state_record(harness.dir.path(), &journal).unwrap();
 
     let record_path = harness.dir.path().join("sandbox-records").join("box.json");
@@ -1146,7 +1146,7 @@ async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
     std::fs::create_dir(&record_path).unwrap();
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(

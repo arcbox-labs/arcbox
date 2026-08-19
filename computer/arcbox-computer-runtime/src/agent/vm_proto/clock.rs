@@ -7,12 +7,12 @@ use tracing::info;
 
 use super::{MSG_CLOCK_SYNC, MSG_EXIT, connect_to_agent, read_frame, write_frame};
 use crate::agent::ClockSync;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 
 /// Synchronise the guest clock to the current host time.
 ///
 /// Sends [`MSG_CLOCK_SYNC`] to the exec channel (vsock port 52) and waits for
-/// `MSG_EXIT`.  Called immediately after `restore_sandbox()` completes so
+/// `MSG_EXIT`.  Called immediately after `restore_computer()` completes so
 /// the guest does not run with a stale timestamp from snapshot creation time,
 /// and by the cold-boot path as the agent-readiness gate. `Err` means the
 /// round trip itself failed (connect, transport, malformed reply); an agent
@@ -28,10 +28,10 @@ pub async fn sync_clock(vsock: &dyn Vsock) -> Result<ClockSync> {
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| VmmError::Vsock(format!("system time error: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("system time error: {e}")))?;
 
     let secs = i64::try_from(now.as_secs())
-        .map_err(|e| VmmError::Vsock(format!("unix timestamp overflow: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("unix timestamp overflow: {e}")))?;
     let nanos = now.subsec_nanos();
 
     let result = sync_clock_on_stream(&mut stream, secs, nanos).await;
@@ -58,20 +58,20 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
 
     write_frame(stream, MSG_CLOCK_SYNC, &payload)
         .await
-        .map_err(|e| VmmError::Vsock(format!("write MSG_CLOCK_SYNC: {e}")))?;
+        .map_err(|e| ComputerError::Vsock(format!("write MSG_CLOCK_SYNC: {e}")))?;
 
     let (msg_type, payload) = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
         .await
-        .map_err(|_| VmmError::Vsock("clock sync: timed out waiting for response".into()))?
-        .map_err(|e| VmmError::Vsock(format!("read clock sync response: {e}")))?;
+        .map_err(|_| ComputerError::Vsock("clock sync: timed out waiting for response".into()))?
+        .map_err(|e| ComputerError::Vsock(format!("read clock sync response: {e}")))?;
 
     if msg_type != MSG_EXIT {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "clock sync: unexpected response type 0x{msg_type:02x}"
         )));
     }
     if payload.len() < 4 {
-        return Err(VmmError::Vsock(format!(
+        return Err(ComputerError::Vsock(format!(
             "clock sync: payload too short ({} bytes, expected 4)",
             payload.len()
         )));

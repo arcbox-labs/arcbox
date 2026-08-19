@@ -1,6 +1,6 @@
 //! Sandbox checkpoint / restore handlers.
 
-use arcbox_computer_runtime::{RestoreSandboxSpec, SandboxState};
+use arcbox_computer_runtime::{ComputerState, RestoreComputerSpec};
 use arcbox_connect::sandbox_v1;
 use buffa::Message;
 
@@ -18,7 +18,7 @@ impl SandboxService {
         let _operation = self.operations.lock(&req.sandbox_id).await;
         let info = self
             .manager
-            .checkpoint_sandbox(&req.sandbox_id, req.name, req.labels.into_iter().collect())
+            .checkpoint_computer(&req.sandbox_id, req.name, req.labels.into_iter().collect())
             .await
             .map_err(SandboxError::from)?;
         Ok(convert::checkpoint_to_proto(info))
@@ -37,7 +37,7 @@ impl SandboxService {
         if !req.id.is_empty() {
             self.clear_stale_completed_create(&req.id);
         }
-        let spec = RestoreSandboxSpec {
+        let spec = RestoreComputerSpec {
             id: if req.id.is_empty() {
                 None
             } else {
@@ -50,13 +50,13 @@ impl SandboxService {
         };
         let (id, ip_address) = self
             .manager
-            .restore_sandbox_keyed(spec, &restore_key)
+            .restore_computer_keyed(spec, &restore_key)
             .await
             .map_err(SandboxError::from)?;
-        let live = self.manager.inspect_sandbox(&id).is_ok_and(|info| {
+        let live = self.manager.inspect_computer(&id).is_ok_and(|info| {
             matches!(
                 info.state,
-                SandboxState::Starting | SandboxState::Ready | SandboxState::Running
+                ComputerState::Starting | ComputerState::Ready | ComputerState::Running
             ) && info
                 .network
                 .is_some_and(|network| network.ip_address == ip_address)

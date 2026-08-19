@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex};
 use arcbox_vm_driver::net::GuestNetwork;
 
 use crate::config::RuntimeConfig;
-use crate::error::{Result, VmmError};
+use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pause::PAUSED_ROOTFS_FILE;
-use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
+use crate::sandbox::{self, ComputerId, ROOTFS_DISK_ID};
 use crate::snapshot_cow::CowManager;
 
 /// Free the VM and the network of a checkpointed sandbox while keeping its
@@ -50,7 +50,7 @@ use crate::snapshot_cow::CowManager;
 /// overlay renamed onto the sandbox-id path, so `Paused` is always reached
 /// with every retained resource keyed by the sandbox id.
 pub async fn release_for_pause(
-    id: &SandboxId,
+    id: &ComputerId,
     arc: &Arc<Mutex<ComputerRuntime>>,
     config: &RuntimeConfig,
     cow_manager: &CowManager,
@@ -97,14 +97,14 @@ pub async fn release_for_pause(
             None => false,
         };
         if !parked {
-            return Err(VmmError::Snapshot(format!(
+            return Err(ComputerError::Snapshot(format!(
                 "computer {id} runs on a copied rootfs but nothing could be taken out of its \
                  vm's area; pausing it would leave nothing to resume from"
             )));
         }
     }
 
-    super::release::kill_sandbox_process(id, arc).await?;
+    super::release::kill_computer_process(id, arc).await?;
     let owner = super::release::resource_owner(id, arc);
 
     // Disk: detach the overlay but keep its COW file.
@@ -122,7 +122,7 @@ pub async fn release_for_pause(
         if detached != retained && detached.exists() {
             tokio::fs::rename(&detached, &retained)
                 .await
-                .map_err(VmmError::Io)?;
+                .map_err(ComputerError::Io)?;
         }
     }
 
@@ -153,7 +153,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::sandbox::SandboxSpec;
+    use crate::sandbox::ComputerSpec;
     use crate::snapshot_cow::CowOptions;
 
     /// Which grip on its VM a computer holds.
@@ -202,7 +202,7 @@ mod tests {
         }
         let mut computer = ComputerRuntime::new(
             "job".to_owned(),
-            SandboxSpec::default(),
+            ComputerSpec::default(),
             None,
             vm_dir.clone(),
         );
@@ -309,7 +309,7 @@ mod tests {
         .await;
 
         match refused {
-            Err(VmmError::Snapshot(message)) => {
+            Err(ComputerError::Snapshot(message)) => {
                 assert!(message.contains("nothing to resume from"), "{message}");
             }
             other => panic!("expected a refusal, got {other:?}"),

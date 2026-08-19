@@ -1,7 +1,7 @@
 //! Reachability, and the two projections over every leaf.
 
 use super::harness::{LEAVES, explore, ordinal};
-use crate::sandbox::SandboxState;
+use crate::sandbox::ComputerState;
 use crate::sandbox::record::PersistPhase;
 
 #[test]
@@ -28,24 +28,24 @@ fn every_leaf_projects_onto_a_public_state() {
     // one leaf with two answers: the boot's own `cmd` claims the workload
     // slot before READY, and from there a caller reads `Running` — which is
     // what stops an Inspect-polling client from stealing that slot.
-    let expected: [&[SandboxState]; LEAVES] = [
-        &[SandboxState::Starting],                        // provisioning
-        &[SandboxState::Starting],                        // staging
-        &[SandboxState::Starting],                        // booting
-        &[SandboxState::Starting],                        // restoring
-        &[SandboxState::Starting, SandboxState::Running], // gating
-        &[SandboxState::Ready],                           // ready
-        &[SandboxState::Running],                         // running
-        &[SandboxState::Ready],                           // checkpointing
-        &[SandboxState::Pausing],                         // capturing
-        &[SandboxState::Pausing],                         // releasing
-        &[SandboxState::Paused],                          // paused
-        &[SandboxState::Starting],                        // resuming
-        &[SandboxState::Stopping],                        // stopping
-        &[SandboxState::Stopped],                         // stopped
-        &[SandboxState::Failed],                          // failed
-        &[SandboxState::Stopping],                        // removing
-        &[SandboxState::Stopped],                         // gone
+    let expected: [&[ComputerState]; LEAVES] = [
+        &[ComputerState::Starting],                         // provisioning
+        &[ComputerState::Starting],                         // staging
+        &[ComputerState::Starting],                         // booting
+        &[ComputerState::Starting],                         // restoring
+        &[ComputerState::Starting, ComputerState::Running], // gating
+        &[ComputerState::Ready],                            // ready
+        &[ComputerState::Running],                          // running
+        &[ComputerState::Ready],                            // checkpointing
+        &[ComputerState::Pausing],                          // capturing
+        &[ComputerState::Pausing],                          // releasing
+        &[ComputerState::Paused],                           // paused
+        &[ComputerState::Starting],                         // resuming
+        &[ComputerState::Stopping],                         // stopping
+        &[ComputerState::Stopped],                          // stopped
+        &[ComputerState::Failed],                           // failed
+        &[ComputerState::Stopping],                         // removing
+        &[ComputerState::Stopped],                          // gone
     ];
     for node in explore() {
         let public = node.state.to_public();
