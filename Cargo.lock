@@ -2266,6 +2266,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "containerregistry-auth"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e5d5e0a75abf9041460a1b7345863e14be68e3c5a229f74e20163723ad15cd"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "containerregistry-image"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2288,6 +2300,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "containerregistry-registry"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a88c4672c90a301d5c54d2b570ead9f8cbdc99b2612e2f96679c80623d020f8"
+dependencies = [
+ "containerregistry-auth",
+ "containerregistry-image",
+ "httpdate",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4761,8 +4790,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32117a443cb043dbc1876d75bf0c55b58ecc662642cac06d8f569ce6f9b9ac6e"
 dependencies = [
  "arcbox-ext4",
+ "containerregistry-auth",
  "containerregistry-image",
  "containerregistry-layout",
+ "containerregistry-registry",
  "flate2",
  "tar",
  "thiserror 2.0.18",

@@ -14,6 +14,10 @@ use super::{RootfsBuilder, has_ext4_magic, rootfs_err};
 /// Capacity of the default busybox rootfs image. The image file is written
 /// sparsely; per-sandbox writes land in the dm-snapshot COW overlay, so this
 /// bounds a sandbox's writable space, not host disk use.
+///
+/// Four whole block groups — see
+/// [`ROOTFS_CAPACITY_GRANULARITY`](super::ROOTFS_CAPACITY_GRANULARITY) for why
+/// that is a requirement and not a coincidence.
 const DEFAULT_ROOTFS_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Serializes default-rootfs builds so concurrent creates don't each rebuild
@@ -276,6 +280,17 @@ fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_image_is_a_mountable_number_of_block_groups() {
+        // This path names its own capacity, so `build_rootfs`'s check never
+        // sees it; a capacity short of whole groups would only surface as a
+        // sandbox that cannot boot.
+        assert_eq!(
+            DEFAULT_ROOTFS_SIZE % super::super::ROOTFS_CAPACITY_GRANULARITY,
+            0
+        );
+    }
 
     #[test]
     fn default_rootfs_builds_and_contains_init_chain() {

@@ -13,6 +13,12 @@ description       = "Sandbox orchestration over nested microVMs behind the arcbo
 # the real boot path with no VMM. Off by default so production builds
 # carry none of it.
 testkit = ["arcbox-vm-driver/testkit"]
+# `oci2rootfs::RemoteRef`, so a composer can pull an image from a registry
+# and hand the resolved source to `RootfsBuilder::build_rootfs` through this
+# crate's own `oci2rootfs` re-export — no second pin of that dependency, and
+# no chance of a version-skewed `ImageSource`. Off by default: it carries a
+# registry client and a TLS stack that a guest-only build never needs.
+remote-image = ["oci2rootfs/remote"]
 
 [dependencies]
 arcbox-atomic-file.workspace = true
@@ -49,6 +55,9 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 arcbox-vm-driver = { workspace = true, features = ["testkit"] }
 arcbox-constants.workspace = true
+# The integration tests mount a built image and read it back through the
+# kernel's own ext4 driver — the view a booting Computer gets.
+nix = { workspace = true, features = ["mount"] }
 
 [lints]
 workspace = true

@@ -61,6 +61,12 @@ pub mod sandbox;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+/// The image-conversion stack [`RootfsBuilder`] is built on, re-exported so a
+/// composer resolves a [`RootfsSource::Image`] — a registry pull through
+/// `RemoteRef` (feature `remote-image`), whose `ImageConfig` and manifest
+/// digest it keeps — without pinning the dependency a second time.
+pub use oci2rootfs;
+
 /// Boot-parameter vocabulary shared with `vm-agent` (`arcbox_vm_proto::boot`).
 pub use arcbox_vm_proto::boot as boot_proto;
 
@@ -76,7 +82,9 @@ pub use agent::{ExecInputMsg, ExitStatus, OutputChunk, PortWait, StartCommand};
 pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig};
 pub use environment::NodeEnvironment;
 pub use error::{Result, VmmError};
-pub use rootfs::{RootfsBuilder, RootfsPaths};
+pub use rootfs::{
+    ROOTFS_CAPACITY_GRANULARITY, RootfsBuilder, RootfsPaths, RootfsSource, RootfsSpec,
+};
 pub use sandbox::pause_reason;
 pub use sandbox::{
     CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
