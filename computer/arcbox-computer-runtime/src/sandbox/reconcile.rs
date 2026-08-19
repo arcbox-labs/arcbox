@@ -1473,7 +1473,7 @@ fn validate_state_record(
 mod tests {
     use std::collections::HashMap;
 
-    use super::super::SandboxSpec;
+    use super::super::ComputerSpec;
     use super::super::record::{PersistPhase, ProvisionIntent, SandboxProvisionOutcome};
     use super::*;
 
@@ -1640,9 +1640,9 @@ mod tests {
     }
 
     fn record_in_phase(store: &SandboxRecordStore, id: &str, phase: PersistPhase) -> SandboxRecord {
-        let spec = SandboxSpec {
+        let spec = ComputerSpec {
             id: Some(id.into()),
-            ..SandboxSpec::default()
+            ..ComputerSpec::default()
         };
         let record = match store.provision_intent(id, "create-key", spec).unwrap() {
             ProvisionIntent::Created(record) => record,

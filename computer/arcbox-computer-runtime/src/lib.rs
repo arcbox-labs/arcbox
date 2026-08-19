@@ -38,7 +38,7 @@
 //! - [`RootfsBuilder`] — OCI/overlay2 → ext4 with `/sbin/vm-agent` injected,
 //!   and the default busybox image; the composer supplies [`RootfsPaths`]
 //! - [`SandboxState`] — a computer's public lifecycle state
-//! - [`RuntimeConfig`] / [`SandboxSpec`] — configuration types
+//! - [`RuntimeConfig`] / [`ComputerSpec`] — configuration types
 //!
 //! This crate names no VMM and no network implementation. Sandboxes reach
 //! both only through `arcbox-vm-driver`'s ports, and the composer supplies
@@ -79,9 +79,9 @@ pub use error::{ComputerError, Result};
 pub use rootfs::{RootfsBuilder, RootfsPaths};
 pub use sandbox::pause_reason;
 pub use sandbox::{
-    CheckpointInfo, CheckpointSummary, IdleAction, LifecycleUpdate, RestoreSandboxSpec,
-    SandboxEvent, SandboxId, SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkIdentity,
-    SandboxNetworkInfo, SandboxNetworkSpec, SandboxSpec, SandboxState, SandboxSummary,
+    CheckpointInfo, CheckpointSummary, ComputerId, ComputerMountSpec, ComputerNetworkIdentity,
+    ComputerNetworkInfo, ComputerNetworkSpec, ComputerSpec, IdleAction, LifecycleUpdate,
+    RestoreComputerSpec, SandboxEvent, SandboxInfo, SandboxManager, SandboxState, SandboxSummary,
     TemplateWarmRef,
 };
 pub use sandbox::{

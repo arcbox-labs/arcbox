@@ -65,7 +65,7 @@ pub struct ExecutionSnapshot {
     /// Execution id, unique within its sandbox.
     pub id: String,
     /// Owning sandbox.
-    pub sandbox_id: SandboxId,
+    pub sandbox_id: ComputerId,
     /// Whether the workload runs on a pseudo-TTY.
     pub tty: bool,
     /// When the workload was dispatched.
@@ -188,7 +188,7 @@ struct ExecState {
 /// A live or recently-exited execution.
 pub(super) struct Execution {
     id: String,
-    sandbox_id: SandboxId,
+    sandbox_id: ComputerId,
     tty: bool,
     started_at: DateTime<Utc>,
     /// The started command, kept to distinguish an idempotent start retry
@@ -207,7 +207,7 @@ pub(super) struct Execution {
 impl Execution {
     fn new(
         id: String,
-        sandbox_id: SandboxId,
+        sandbox_id: ComputerId,
         spec: &ExecutionSpec,
         input_tx: mpsc::Sender<ExecInputMsg>,
     ) -> Self {
@@ -408,7 +408,7 @@ impl Execution {
     }
 }
 
-type ExecKey = (SandboxId, String);
+type ExecKey = (ComputerId, String);
 
 /// Registry of executions, keyed by `(sandbox_id, execution_id)`.
 #[derive(Default)]
@@ -646,7 +646,7 @@ impl SandboxManager {
     /// existing execution instead of dispatching a second process.
     pub async fn start_execution(
         &self,
-        sandbox_id: &SandboxId,
+        sandbox_id: &ComputerId,
         spec: ExecutionSpec,
     ) -> Result<ExecutionSnapshot> {
         let id = match &spec.id {
@@ -829,7 +829,7 @@ impl SandboxManager {
     ///
     /// The sandbox must exist; an unknown id is `NotFound` rather than an
     /// empty list, so a caller can tell "no executions" from a typo.
-    pub fn list_executions(&self, sandbox_id: &SandboxId) -> Result<Vec<ExecutionSnapshot>> {
+    pub fn list_executions(&self, sandbox_id: &ComputerId) -> Result<Vec<ExecutionSnapshot>> {
         self.computer(sandbox_id)?;
         let mut snapshots = self.executions.list(sandbox_id);
         snapshots.sort_by(|a, b| {
@@ -848,7 +848,7 @@ impl SandboxManager {
     /// accepted connections.
     pub async fn wait_sandbox_port(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         port: u16,
         timeout: Duration,
     ) -> Result<()> {

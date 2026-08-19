@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{ComputerError, Result};
-use crate::sandbox::{SandboxId, SandboxSpec, validate_id};
+use crate::sandbox::{ComputerId, ComputerSpec, validate_id};
 
 pub(super) const RECORD_VERSION: u32 = 1;
 
@@ -62,10 +62,10 @@ pub struct SandboxProvisionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRecord {
     pub(super) version: u32,
-    pub(in crate::sandbox) id: SandboxId,
+    pub(in crate::sandbox) id: ComputerId,
     pub(crate) generation: Uuid,
     pub(in crate::sandbox) request_key: String,
-    pub(in crate::sandbox) effective_spec: SandboxSpec,
+    pub(in crate::sandbox) effective_spec: ComputerSpec,
     pub(in crate::sandbox) phase: SandboxPhase,
     pub(in crate::sandbox) provision_outcome: Option<SandboxProvisionOutcome>,
     pub(in crate::sandbox) created_at: DateTime<Utc>,
@@ -127,7 +127,7 @@ impl SandboxTransition {
 }
 
 impl SandboxRecord {
-    pub(super) fn new(id: &str, request_key: &str, effective_spec: SandboxSpec) -> Self {
+    pub(super) fn new(id: &str, request_key: &str, effective_spec: ComputerSpec) -> Self {
         let created_at = Utc::now();
         let ttl_deadline = (effective_spec.ttl_seconds > 0)
             .then(|| created_at + chrono::Duration::seconds(i64::from(effective_spec.ttl_seconds)));
@@ -430,9 +430,9 @@ mod tests {
         SandboxRecord::new(
             id,
             "key",
-            SandboxSpec {
+            ComputerSpec {
                 id: Some(id.to_owned()),
-                ..SandboxSpec::default()
+                ..ComputerSpec::default()
             },
         )
     }

@@ -21,7 +21,7 @@ use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
 use crate::sandbox::spec::build_vm_spec;
-use crate::sandbox::{self, NetworkAttachment, SandboxSpec, SandboxState};
+use crate::sandbox::{self, ComputerSpec, NetworkAttachment, SandboxState};
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 pub type BootOutput = (Arc<dyn VmHandle>, Box<dyn ReadyGate>);
@@ -146,7 +146,7 @@ pub async fn wait_for_agent(
 )]
 pub async fn do_boot(
     id: &str,
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     net: Option<&NetworkAttachment>,
     vm_dir: &Path,
     driver: &dyn VmDriver,

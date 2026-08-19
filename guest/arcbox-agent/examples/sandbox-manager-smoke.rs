@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use arcbox_computer_runtime::{
-    RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState,
+    ComputerSpec, RestoreComputerSpec, SandboxEvent, SandboxManager, SandboxState,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
     let t0 = Instant::now();
     let (id, ip) = manager
-        .create_sandbox(SandboxSpec {
+        .create_sandbox(ComputerSpec {
             id: Some("smoke-1".into()),
             ..Default::default()
         })
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut events_n = manager.subscribe_events();
         let (id2, ip2) = manager
-            .create_sandbox(SandboxSpec {
+            .create_sandbox(ComputerSpec {
                 id: Some("smoke-net-2".into()),
                 ..Default::default()
             })
@@ -309,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
 
         let mut events2 = manager.subscribe_events();
         let (rid, rip) = manager
-            .restore_sandbox(RestoreSandboxSpec {
+            .restore_sandbox(RestoreComputerSpec {
                 id: Some("smoke-restored".into()),
                 snapshot_id,
                 labels: HashMap::new(),

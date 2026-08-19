@@ -18,14 +18,14 @@ impl SandboxManager {
         &self,
         id: &str,
         request_key: &str,
-    ) -> Result<Option<(SandboxId, String)>> {
+    ) -> Result<Option<(ComputerId, String)>> {
         self.await_reconcile().await?;
         self.records
             .replay_provision(id, request_key)
             .map(|outcome| outcome.map(|outcome| (id.to_owned(), outcome.ip_address)))
     }
 
-    pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<(SandboxId, String)> {
+    pub async fn create_sandbox(&self, spec: ComputerSpec) -> Result<(ComputerId, String)> {
         self.create_sandbox_keyed(spec, &Uuid::new_v4().to_string())
             .await
     }
@@ -33,9 +33,9 @@ impl SandboxManager {
     /// Create a sandbox with a stable key for durable request replay.
     pub async fn create_sandbox_keyed(
         &self,
-        spec: SandboxSpec,
+        spec: ComputerSpec,
         request_key: &str,
-    ) -> Result<(SandboxId, String)> {
+    ) -> Result<(ComputerId, String)> {
         self.create_sandbox_inner(spec, request_key, WarmPolicy::Auto)
             .await
     }
@@ -49,7 +49,7 @@ impl SandboxManager {
     /// (terminal events prompt it; a 1 s rescan backstops), so this
     /// normally resolves within a second or two. On expiry the fallback
     /// proceeds anyway and `reserve` surfaces the honest UNAVAILABLE.
-    async fn await_network_release(&self, id: &SandboxId) {
+    async fn await_network_release(&self, id: &ComputerId) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match self.reconcile_network().pending_cleanups().await {
@@ -81,10 +81,10 @@ impl SandboxManager {
     /// a duplicate full-memory snapshot).
     pub(super) async fn create_sandbox_inner(
         &self,
-        mut spec: SandboxSpec,
+        mut spec: ComputerSpec,
         request_key: &str,
         warm_policy: WarmPolicy,
-    ) -> Result<(SandboxId, String)> {
+    ) -> Result<(ComputerId, String)> {
         // Do not allocate any per-id resources until the startup orphan sweep
         // has run — otherwise a re-created same-id sandbox races it.
         self.await_reconcile().await?;
@@ -518,7 +518,7 @@ impl SandboxManager {
     /// outlives the remaining budget. All runtime resources (TAP + IP,
     /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
     /// inspectable record and the log directory survive until `Remove`.
-    pub async fn stop_sandbox(&self, id: &SandboxId, timeout_seconds: u32) -> Result<()> {
+    pub async fn stop_sandbox(&self, id: &ComputerId, timeout_seconds: u32) -> Result<()> {
         self.await_reconcile().await?;
         let budget = Duration::from_secs(u64::from(if timeout_seconds > 0 {
             timeout_seconds
@@ -545,7 +545,7 @@ impl SandboxManager {
     /// `Adopt`. The `PreparedVm` a booted sandbox also holds needs no such
     /// step: it kills on drop only while it is still unconsumed.
     pub async fn detach_all(&self) -> Result<()> {
-        let live: Vec<(SandboxId, Arc<dyn VmHandle>)> = self
+        let live: Vec<(ComputerId, Arc<dyn VmHandle>)> = self
             .computers
             .read()
             .unwrap()
@@ -576,7 +576,7 @@ impl SandboxManager {
     }
 
     /// Forcibly destroy a sandbox and release all resources immediately.
-    pub async fn remove_sandbox(&self, id: &SandboxId, force: bool) -> Result<()> {
+    pub async fn remove_sandbox(&self, id: &ComputerId, force: bool) -> Result<()> {
         self.await_reconcile().await?;
         let mailbox = match self.mailbox(id) {
             Ok(mailbox) => mailbox,
@@ -593,7 +593,7 @@ impl SandboxManager {
                     id,
                     ComputerRuntime::new(
                         id.clone(),
-                        SandboxSpec {
+                        ComputerSpec {
                             id: Some(id.clone()),
                             ..Default::default()
                         },
@@ -641,7 +641,7 @@ impl SandboxManager {
     }
 
     /// Return the current state and metadata of a sandbox.
-    pub fn inspect_sandbox(&self, id: &SandboxId) -> Result<SandboxInfo> {
+    pub fn inspect_sandbox(&self, id: &ComputerId) -> Result<SandboxInfo> {
         let snapshot = self.snapshot(id)?;
         // Size the retained artifacts after the read: the sizing stats files
         // and scans the catalog, and the snapshot is a borrow of a `watch`
@@ -666,7 +666,7 @@ impl SandboxManager {
         // per-computer lock is taken at all, so the "never hold the map lock
         // while holding an instance lock" discipline this fold used to need
         // has nothing left to violate.
-        let computers: Vec<(SandboxId, ComputerSnapshot)> = self
+        let computers: Vec<(ComputerId, ComputerSnapshot)> = self
             .computers
             .read()
             .unwrap()
@@ -735,7 +735,7 @@ impl SandboxManager {
     ///
     /// A paused computer answers [`ComputerError::Paused`], not `WrongState`, so
     /// the daemon can resume it transparently and retry (CORE-21).
-    pub(super) fn require_ready_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
+    pub(super) fn require_ready_agent(&self, id: &ComputerId) -> Result<Arc<dyn GuestAgent>> {
         self.agent_in(id, &[SandboxState::Ready], "Ready")
     }
 
@@ -744,7 +744,7 @@ impl SandboxManager {
     /// does not block the operation — file I/O works alongside Run/Exec.
     /// Paused states map to [`ComputerError::Paused`] for the daemon's transparent
     /// resume, as above.
-    pub(super) fn require_alive_agent(&self, id: &SandboxId) -> Result<Arc<dyn GuestAgent>> {
+    pub(super) fn require_alive_agent(&self, id: &ComputerId) -> Result<Arc<dyn GuestAgent>> {
         self.agent_in(
             id,
             &[SandboxState::Ready, SandboxState::Running],
@@ -760,7 +760,7 @@ impl SandboxManager {
     /// an exec costs a clone of an `Arc` rather than a scheduling hop.
     fn agent_in(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         allowed: &[SandboxState],
         expected: &str,
     ) -> Result<Arc<dyn GuestAgent>> {
@@ -782,14 +782,14 @@ impl SandboxManager {
 }
 
 /// A computer's read snapshot as `Inspect` reports it.
-fn snapshot_to_info(id: &SandboxId, snapshot: &ComputerSnapshot) -> SandboxInfo {
+fn snapshot_to_info(id: &ComputerId, snapshot: &ComputerSnapshot) -> SandboxInfo {
     SandboxInfo {
         id: id.clone(),
         state: snapshot.state,
         labels: snapshot.labels.clone(),
         vcpus: snapshot.vcpus,
         memory_mib: snapshot.memory_mib,
-        network: snapshot.lease.as_ref().map(|lease| SandboxNetworkInfo {
+        network: snapshot.lease.as_ref().map(|lease| ComputerNetworkInfo {
             ip_address: lease.ip.to_string(),
             gateway: lease.gateway.to_string(),
         }),

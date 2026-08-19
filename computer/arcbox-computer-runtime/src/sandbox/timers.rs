@@ -34,7 +34,7 @@ impl SandboxManager {
     /// its (re-armed) TTL, and new idle knobs apply on the next `Ready`.
     pub async fn set_sandbox_lifecycle(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         update: LifecycleUpdate,
     ) -> Result<()> {
         self.await_reconcile().await?;

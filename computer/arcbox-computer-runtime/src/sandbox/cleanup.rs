@@ -66,9 +66,9 @@ mod tests {
         let boot_parked = driver.park_next_boot();
         let (id, _) = manager
             .create_sandbox_keyed(
-                SandboxSpec {
+                ComputerSpec {
                     id: Some("job".into()),
-                    network: SandboxNetworkSpec {
+                    network: ComputerNetworkSpec {
                         mode: "none".into(),
                     },
                     ..Default::default()

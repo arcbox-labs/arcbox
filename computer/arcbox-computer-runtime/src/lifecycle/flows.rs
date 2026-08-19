@@ -34,7 +34,7 @@ use crate::sandbox::pool::SlotPool;
 use crate::sandbox::record::SandboxProvisionOutcome;
 use crate::sandbox::record::SandboxRecordStore;
 use crate::sandbox::warm::WarmPublishTicket;
-use crate::sandbox::{CheckpointInfo, NetworkAttachment, SandboxEvent, SandboxId};
+use crate::sandbox::{CheckpointInfo, ComputerId, NetworkAttachment, SandboxEvent};
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::CowManager;
 
@@ -93,7 +93,7 @@ pub struct RestoreLaunch {
 
 /// One computer's flows.
 pub struct ComputerFlows {
-    id: SandboxId,
+    id: ComputerId,
     computer: Arc<Mutex<ComputerRuntime>>,
     services: Arc<ComputerServices>,
     mailbox: WeakMailbox,
@@ -102,7 +102,7 @@ pub struct ComputerFlows {
 
 impl ComputerFlows {
     pub fn new(
-        id: SandboxId,
+        id: ComputerId,
         computer: Arc<Mutex<ComputerRuntime>>,
         services: Arc<ComputerServices>,
         mailbox: &Mailbox,

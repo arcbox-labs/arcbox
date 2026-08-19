@@ -94,7 +94,7 @@ pub async fn start_run_workload(
 
 impl SandboxManager {
     /// This computer's workload slot: its actor, behind the seam.
-    pub(super) fn workload_slot(&self, id: &SandboxId) -> Result<Arc<dyn WorkloadSlot>> {
+    pub(super) fn workload_slot(&self, id: &ComputerId) -> Result<Arc<dyn WorkloadSlot>> {
         Ok(Arc::new(crate::lifecycle::flows::ActorSlot {
             id: id.clone(),
             mailbox: self.mailbox(id)?,
@@ -107,7 +107,7 @@ impl SandboxManager {
     )]
     pub async fn run_in_sandbox(
         &self,
-        id: &SandboxId,
+        id: &ComputerId,
         cmd: Vec<String>,
         env: HashMap<String, String>,
         working_dir: String,

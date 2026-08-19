@@ -33,7 +33,7 @@ use crate::config::RuntimeConfig;
 use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::pause::PAUSED_ROOTFS_FILE;
-use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
+use crate::sandbox::{self, ComputerId, ROOTFS_DISK_ID};
 use crate::snapshot_cow::CowManager;
 
 /// Free the VM and the network of a checkpointed sandbox while keeping its
@@ -50,7 +50,7 @@ use crate::snapshot_cow::CowManager;
 /// overlay renamed onto the sandbox-id path, so `Paused` is always reached
 /// with every retained resource keyed by the sandbox id.
 pub async fn release_for_pause(
-    id: &SandboxId,
+    id: &ComputerId,
     arc: &Arc<Mutex<ComputerRuntime>>,
     config: &RuntimeConfig,
     cow_manager: &CowManager,
@@ -153,7 +153,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::sandbox::SandboxSpec;
+    use crate::sandbox::ComputerSpec;
     use crate::snapshot_cow::CowOptions;
 
     /// Which grip on its VM a computer holds.
@@ -202,7 +202,7 @@ mod tests {
         }
         let mut computer = ComputerRuntime::new(
             "job".to_owned(),
-            SandboxSpec::default(),
+            ComputerSpec::default(),
             None,
             vm_dir.clone(),
         );

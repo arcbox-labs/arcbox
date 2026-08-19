@@ -40,13 +40,13 @@ once, here.
 
 ```rust
 use std::sync::Arc;
-use arcbox_computer_runtime::{NodeEnvironment, RuntimeConfig, SandboxManager, SandboxSpec};
+use arcbox_computer_runtime::{NodeEnvironment, RuntimeConfig, SandboxManager, ComputerSpec};
 
 // `environment` is the composer's; see below.
 let manager = Arc::new(SandboxManager::new(RuntimeConfig::default(), environment)?);
 
 let (id, ip) = manager
-    .create_sandbox(SandboxSpec {
+    .create_sandbox(ComputerSpec {
         vcpus: 1,
         memory_mib: 512,
         ..Default::default()

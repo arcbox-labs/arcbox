@@ -1,7 +1,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-pub type SandboxId = String;
+pub type ComputerId = String;
 
 /// A sandbox's network as the boot flow carries it: the lease the guest
 /// network reserved, the NIC it returned when it activated that lease, and
@@ -114,14 +114,14 @@ pub struct LifecycleUpdate {
 
 /// Network configuration supplied at sandbox creation time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SandboxNetworkSpec {
+pub struct ComputerNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
 }
 
 /// A single bind-mount into the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SandboxMountSpec {
+pub struct ComputerMountSpec {
     pub source: String,
     pub target: String,
     pub readonly: bool,
@@ -136,7 +136,7 @@ pub struct SandboxMountSpec {
 /// boundary (see the guest agent's `SandboxService::create`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SandboxSpec {
+pub struct ComputerSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
     pub id: Option<String>,
     /// Arbitrary key-value metadata (filtering, listing).
@@ -160,9 +160,9 @@ pub struct SandboxSpec {
     /// User to run the initial command as.
     pub user: String,
     /// Bind mounts into the sandbox.
-    pub mounts: Vec<SandboxMountSpec>,
+    pub mounts: Vec<ComputerMountSpec>,
     /// Network configuration.
-    pub network: SandboxNetworkSpec,
+    pub network: ComputerNetworkSpec,
     /// Auto-destroy TTL in seconds (0 = no limit).
     pub ttl_seconds: u32,
     /// SSH public key injected via MMDS (None = no SSH setup).
@@ -186,7 +186,7 @@ pub struct SandboxSpec {
 }
 
 /// A template's pre-warmed boot-to-ready snapshot, threaded through
-/// [`SandboxSpec`] (CORE-107).
+/// [`ComputerSpec`] (CORE-107).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateWarmRef {
     /// Snapshot id in the snapshot catalog.
@@ -198,7 +198,7 @@ pub struct TemplateWarmRef {
 
 /// Parameters to restore a sandbox from a checkpoint.
 #[derive(Debug, Clone, Default)]
-pub struct RestoreSandboxSpec {
+pub struct RestoreComputerSpec {
     /// Caller-supplied ID (None = auto-generate).
     pub id: Option<String>,
     /// Source checkpoint/snapshot ID.
@@ -215,7 +215,7 @@ pub struct RestoreSandboxSpec {
 
 /// Lightweight summary for `List` operations.
 pub struct SandboxSummary {
-    pub id: SandboxId,
+    pub id: ComputerId,
     pub state: SandboxState,
     pub labels: HashMap<String, String>,
     /// Allocated IP address (empty when network mode is `"none"`).
@@ -229,12 +229,12 @@ pub struct SandboxSummary {
 
 /// Detailed sandbox state for `Inspect`.
 pub struct SandboxInfo {
-    pub id: SandboxId,
+    pub id: ComputerId,
     pub state: SandboxState,
     pub labels: HashMap<String, String>,
     pub vcpus: u32,
     pub memory_mib: u64,
-    pub network: Option<SandboxNetworkInfo>,
+    pub network: Option<ComputerNetworkInfo>,
     pub created_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
     pub last_exited_at: Option<DateTime<Utc>>,
@@ -253,7 +253,7 @@ pub struct SandboxInfo {
 }
 
 /// Network details within `SandboxInfo`.
-pub struct SandboxNetworkInfo {
+pub struct ComputerNetworkInfo {
     pub ip_address: String,
     pub gateway: String,
 }
@@ -283,7 +283,7 @@ pub mod action {
 /// A sandbox lifecycle event broadcast to subscribers.
 #[derive(Debug, Clone)]
 pub struct SandboxEvent {
-    pub sandbox_id: SandboxId,
+    pub sandbox_id: ComputerId,
     /// One of the [`action`] constants.
     pub action: String,
     /// Unix nanoseconds.

@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arcbox_computer_runtime::agent::VmProtoAgentFactory;
 use arcbox_computer_runtime::{
-    ComputerError, NodeEnvironment, RootfsBuilder, RootfsPaths, SandboxManager, SandboxMountSpec,
-    SandboxNetworkSpec, SandboxSpec, SandboxState,
+    ComputerError, ComputerMountSpec, ComputerNetworkSpec, ComputerSpec, NodeEnvironment,
+    RootfsBuilder, RootfsPaths, SandboxManager, SandboxState,
 };
 use arcbox_connect::sandbox_v1;
 use arcbox_fc_driver::{FcDriver, FcDriverConfig};
@@ -562,7 +562,7 @@ impl SandboxService {
     pub(crate) fn sandbox_network_identity(
         &self,
         sandbox_id: &str,
-    ) -> Result<arcbox_computer_runtime::SandboxNetworkIdentity, SandboxError> {
+    ) -> Result<arcbox_computer_runtime::ComputerNetworkIdentity, SandboxError> {
         self.manager
             .sandbox_network_identity(sandbox_id)
             .map_err(SandboxError::from)
@@ -736,8 +736,8 @@ fn deregister_sandbox_dns(id: &str) {
     }
 }
 
-/// Convert a `CreateSandboxRequest` proto to a [`SandboxSpec`].
-fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
+/// Convert a `CreateSandboxRequest` proto to a [`ComputerSpec`].
+fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> ComputerSpec {
     // An unset `limits`/`network` field derefs to the default instance, and
     // an unknown wire value falls back to UNSPECIFIED — the proto3 defaults.
     let (vcpus, memory_mib) = (req.limits.vcpus, req.limits.memory_mib);
@@ -746,7 +746,7 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         // UNSPECIFIED defaults to a networked sandbox.
         sandbox_v1::NetworkMode::Enabled | sandbox_v1::NetworkMode::Unspecified => "tap",
     };
-    SandboxSpec {
+    ComputerSpec {
         id: if req.id.is_empty() {
             None
         } else {
@@ -767,13 +767,13 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
         mounts: req
             .mounts
             .into_iter()
-            .map(|m| SandboxMountSpec {
+            .map(|m| ComputerMountSpec {
                 source: m.source,
                 target: m.target,
                 readonly: m.readonly,
             })
             .collect(),
-        network: SandboxNetworkSpec { mode: mode.into() },
+        network: ComputerNetworkSpec { mode: mode.into() },
         ttl_seconds: req.ttl_seconds,
         ssh_public_key: req.ssh_public_key,
         idle_timeout_seconds: req.idle_timeout_seconds,

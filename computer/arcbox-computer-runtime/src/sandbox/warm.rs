@@ -41,7 +41,7 @@ fn fingerprint(path: &Path) -> std::io::Result<FileFingerprint> {
 
 /// Derive the warm key for an effective (defaults-applied) create spec,
 /// fingerprinting the kernel and rootfs files on disk.
-pub(super) fn derive_warm_key(spec: &SandboxSpec) -> std::io::Result<WarmKey> {
+pub(super) fn derive_warm_key(spec: &ComputerSpec) -> std::io::Result<WarmKey> {
     Ok(warm_key(
         spec,
         fingerprint(Path::new(&spec.kernel))?,
@@ -108,7 +108,7 @@ pub struct WarmPublishTicket {
 /// a cmd-less boot, `Starting` when the tail is still holding the workload
 /// slot for the initial cmd.
 pub async fn publish_after_boot(
-    sandbox_id: &SandboxId,
+    sandbox_id: &ComputerId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
     cow_manager: &CowManager,
@@ -176,7 +176,7 @@ impl From<crate::lifecycle::tasks::checkpoint::CheckpointFailure> for PublishFai
 /// (see [`super::policy::warm`]).
 /// Returns `None` when the key was already cached by a concurrent create.
 async fn publish_warm_snapshot(
-    sandbox_id: &SandboxId,
+    sandbox_id: &ComputerId,
     ticket: &WarmPublishTicket,
     computer: &Arc<Mutex<ComputerRuntime>>,
     cow_manager: &CowManager,
@@ -256,14 +256,14 @@ mod tests {
         warm_key(&base_spec(), fingerprint_of(7), fingerprint_of(42))
     }
 
-    fn base_spec() -> SandboxSpec {
-        SandboxSpec {
+    fn base_spec() -> ComputerSpec {
+        ComputerSpec {
             kernel: "/run/kernel/vmlinux".into(),
             rootfs: "/data/rootfs.ext4".into(),
             boot_args: "console=ttyS0 quiet".into(),
             vcpus: 2,
             memory_mib: 512,
-            network: SandboxNetworkSpec { mode: "tap".into() },
+            network: ComputerNetworkSpec { mode: "tap".into() },
             ..Default::default()
         }
     }

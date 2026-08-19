@@ -29,7 +29,7 @@ use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
 use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{
-    CheckpointInfo, IdleAction, LifecycleUpdate, SandboxEvent, SandboxSpec, SandboxState,
+    CheckpointInfo, ComputerSpec, IdleAction, LifecycleUpdate, SandboxEvent, SandboxState,
 };
 use crate::testkit::agent::FakeAgentFactory;
 
@@ -254,7 +254,7 @@ impl Harness {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let runtime = Arc::new(Mutex::new(ComputerRuntime::new(
             "box".to_owned(),
-            SandboxSpec::default(),
+            ComputerSpec::default(),
             None,
             dir.path().to_path_buf(),
         )));
@@ -279,9 +279,9 @@ impl Harness {
                 .provision_intent(
                     "box",
                     "key",
-                    SandboxSpec {
+                    ComputerSpec {
                         id: Some("box".to_owned()),
-                        ..SandboxSpec::default()
+                        ..ComputerSpec::default()
                     },
                 )
                 .unwrap()

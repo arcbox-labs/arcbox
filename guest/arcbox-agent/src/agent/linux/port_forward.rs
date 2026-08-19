@@ -32,7 +32,7 @@ use std::net::Ipv4Addr;
 use std::process::Output;
 
 use anyhow::{Context, Result, bail};
-use arcbox_computer_runtime::SandboxNetworkIdentity;
+use arcbox_computer_runtime::ComputerNetworkIdentity;
 use arcbox_tap_net::ExposeTarget;
 use arcbox_tap_net::invariant;
 use tokio::process::Command;
@@ -103,7 +103,7 @@ impl PortForwardManager {
     pub async fn forward(
         &mut self,
         sandbox_id: &str,
-        identity: &SandboxNetworkIdentity,
+        identity: &ComputerNetworkIdentity,
         sandbox_port: u16,
         protocol: Protocol,
     ) -> Result<u16> {
@@ -314,7 +314,7 @@ impl PortForwardManager {
 /// composed over, and installing the wrong DNAT would strand the mapping
 /// silently.
 fn expose_rule_specs(
-    identity: &SandboxNetworkIdentity,
+    identity: &ComputerNetworkIdentity,
     guest_port: u16,
     sandbox_port: u16,
     protocol: Protocol,
@@ -648,8 +648,8 @@ mod tests {
         assert_eq!(args[..8], dnat[..8]);
     }
 
-    fn identity(expose: HostIngress) -> SandboxNetworkIdentity {
-        SandboxNetworkIdentity {
+    fn identity(expose: HostIngress) -> ComputerNetworkIdentity {
+        ComputerNetworkIdentity {
             ip: "172.20.0.2".parse().unwrap(),
             cleanup_token: "generation".into(),
             expose,

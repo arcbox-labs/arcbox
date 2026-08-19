@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::agent::ExitStatus;
-use crate::sandbox::{SandboxId, SandboxSpec, SandboxState};
+use crate::sandbox::{ComputerId, ComputerSpec, SandboxState};
 use crate::snapshot_cow::CowHandle;
 
 /// A computer's runtime state as its actor and its sub-tasks share it.
@@ -31,13 +31,13 @@ pub type Runtime = Arc<Mutex<ComputerRuntime>>;
 /// the one thing an abort must not be able to strand.
 pub struct ComputerRuntime {
     /// Unique identifier.
-    pub id: SandboxId,
+    pub id: ComputerId,
     /// Durable lifecycle record generation.
     pub(crate) record_generation: Option<Uuid>,
     /// User-supplied labels.
     pub labels: HashMap<String, String>,
     /// Original creation spec.
-    pub spec: SandboxSpec,
+    pub spec: ComputerSpec,
     /// The public lifecycle state, mirrored here from the actor's machine on
     /// every transition. A sub-task reads it to see a teardown that started
     /// while it was running — the cooperative half of preemption, which an
@@ -106,8 +106,8 @@ pub struct ComputerRuntime {
 
 impl ComputerRuntime {
     pub(crate) fn new(
-        id: SandboxId,
-        spec: SandboxSpec,
+        id: ComputerId,
+        spec: ComputerSpec,
         network: Option<NetworkLease>,
         vm_dir: PathBuf,
     ) -> Self {
@@ -115,8 +115,8 @@ impl ComputerRuntime {
     }
 
     pub(crate) fn new_with_generation(
-        id: SandboxId,
-        spec: SandboxSpec,
+        id: ComputerId,
+        spec: ComputerSpec,
         network: Option<NetworkLease>,
         vm_dir: PathBuf,
         generation: Uuid,
@@ -125,8 +125,8 @@ impl ComputerRuntime {
     }
 
     fn new_inner(
-        id: SandboxId,
-        spec: SandboxSpec,
+        id: ComputerId,
+        spec: ComputerSpec,
         network: Option<NetworkLease>,
         vm_dir: PathBuf,
         record_generation: Option<Uuid>,

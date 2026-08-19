@@ -24,7 +24,7 @@ pub(super) struct RestoreRequest {
     /// `ttl_seconds`) — plus, on the warm-create origin, the initial
     /// workload fields; the boot-recipe fields are ignored — the snapshot
     /// carries the boot state.
-    pub(super) spec: SandboxSpec,
+    pub(super) spec: ComputerSpec,
     /// Which API surface this restore serves; decides the event contract.
     pub(super) origin: RestoreOrigin,
 }
@@ -48,7 +48,7 @@ impl SandboxManager {
     /// Checkpoint a `Ready` sandbox into the snapshot catalog.
     pub async fn checkpoint_sandbox(
         &self,
-        sandbox_id: &SandboxId,
+        sandbox_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
@@ -76,7 +76,7 @@ impl SandboxManager {
     /// exactly what the label guard refuses.
     pub(super) async fn capture_checkpoint(
         &self,
-        sandbox_id: &SandboxId,
+        sandbox_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
@@ -97,7 +97,7 @@ impl SandboxManager {
     /// The restored sandbox starts in `Ready` state immediately.
     ///
     /// Returns `(sandbox_id, ip_address)`.
-    pub async fn restore_sandbox(&self, spec: RestoreSandboxSpec) -> Result<(SandboxId, String)> {
+    pub async fn restore_sandbox(&self, spec: RestoreComputerSpec) -> Result<(ComputerId, String)> {
         self.restore_sandbox_keyed(spec, &Uuid::new_v4().to_string())
             .await
     }
@@ -105,10 +105,10 @@ impl SandboxManager {
     /// Restore with a stable request key for durable replay.
     pub async fn restore_sandbox_keyed(
         &self,
-        spec: RestoreSandboxSpec,
+        spec: RestoreComputerSpec,
         restore_key: &str,
-    ) -> Result<(SandboxId, String)> {
-        let RestoreSandboxSpec {
+    ) -> Result<(ComputerId, String)> {
+        let RestoreComputerSpec {
             id,
             snapshot_id,
             labels,
@@ -119,7 +119,7 @@ impl SandboxManager {
             RestoreRequest {
                 snapshot_id,
                 network_override,
-                spec: SandboxSpec {
+                spec: ComputerSpec {
                     id,
                     labels,
                     ttl_seconds,
@@ -137,7 +137,7 @@ impl SandboxManager {
         &self,
         request: RestoreRequest,
         restore_key: &str,
-    ) -> Result<(SandboxId, String)> {
+    ) -> Result<(ComputerId, String)> {
         // Gate on the startup sweep before touching per-id resources (see
         // create_sandbox / await_reconcile).
         self.await_reconcile().await?;

@@ -24,7 +24,7 @@ use crate::error::{ComputerError, Result};
 use crate::sandbox::pause::{PAUSED_ROOTFS_FILE, ResumeFailure, ResumedRuntime};
 use crate::sandbox::reconcile::JournaledLease;
 use crate::sandbox::spec::restore_spec;
-use crate::sandbox::{self, ROOTFS_DISK_ID, SandboxId};
+use crate::sandbox::{self, ComputerId, ROOTFS_DISK_ID};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot_cow::{CowHandle, CowManager};
 
@@ -39,7 +39,7 @@ use crate::snapshot_cow::{CowHandle, CowManager};
     reason = "the resume spans the resource set its computer owns"
 )]
 pub async fn restore_paused(
-    id: &SandboxId,
+    id: &ComputerId,
     jailer: &JailerConfig,
     snap_meta: &SnapshotMeta,
     vm_dir: &Path,
@@ -258,7 +258,7 @@ pub async fn restore_paused(
 /// that failed before it handed the parked disk over never moved it, so
 /// the file is still sitting in `vm_dir` where a clean pause left it.
 async fn park_copy_mode_rootfs(
-    id: &SandboxId,
+    id: &ComputerId,
     vm_dir: &Path,
     config: &RuntimeConfig,
     prepared: Option<&Arc<dyn PreparedVm>>,
@@ -290,7 +290,7 @@ async fn park_copy_mode_rootfs(
     reason = "the unwind spans everything the failed resume re-created"
 )]
 async fn unwind_resume(
-    id: &SandboxId,
+    id: &ComputerId,
     vm_dir: &Path,
     config: &RuntimeConfig,
     cow_manager: &CowManager,

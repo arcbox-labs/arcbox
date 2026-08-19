@@ -20,7 +20,7 @@ use crate::lifecycle::tasks::{TaskFailure, TaskResult};
 use crate::sandbox::boot::run_ready_probe;
 use crate::sandbox::warm::{WarmPublishTicket, publish_after_boot};
 use crate::sandbox::workload::{WorkloadClaim, WorkloadSlot, start_run_workload};
-use crate::sandbox::{SandboxId, SandboxSpec, SandboxState};
+use crate::sandbox::{ComputerId, ComputerSpec, SandboxState};
 
 impl ComputerFlows {
     pub(super) async fn boot_vm(
@@ -148,7 +148,7 @@ impl ComputerFlows {
     /// `false` when there was nothing to start or the guest refused it.
     pub(super) async fn start_initial_cmd(
         &self,
-        spec: &SandboxSpec,
+        spec: &ComputerSpec,
         agent: &dyn GuestAgent,
     ) -> bool {
         if spec.cmd.is_empty() {
@@ -225,7 +225,7 @@ impl Attachment {
 /// The single-workload slot as the actor owns it: the claim, its rollback and
 /// the exit are all lifecycle transitions, so all three are mailbox verbs.
 pub struct ActorSlot {
-    pub id: SandboxId,
+    pub id: ComputerId,
     pub mailbox: Mailbox,
 }
 

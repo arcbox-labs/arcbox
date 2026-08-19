@@ -46,8 +46,8 @@ use std::time::Duration;
 use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxEvent,
-    SandboxManager, SandboxNetworkSpec, SandboxSpec, SandboxState,
+    ComputerNetworkSpec, ComputerSpec, DefaultVmConfig, FirecrackerConfig, GrpcConfig,
+    NetworkConfig, RuntimeConfig, SandboxEvent, SandboxManager, SandboxState,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,10 +104,10 @@ fn try_config(data_dir: &str) -> Option<GuestConfig> {
     })
 }
 
-/// Return a SandboxSpec with networking disabled (no TAP, no root required).
-fn no_tap() -> SandboxSpec {
-    SandboxSpec {
-        network: SandboxNetworkSpec {
+/// Return a ComputerSpec with networking disabled (no TAP, no root required).
+fn no_tap() -> ComputerSpec {
+    ComputerSpec {
+        network: ComputerNetworkSpec {
             mode: "none".into(),
         },
         ..Default::default()
@@ -454,7 +454,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
         let mgr = manager(cfg);
         finalize_startup_cleanup(&mgr).await;
         let mut events = mgr.subscribe_events();
-        let (id, ip) = mgr.create_sandbox(SandboxSpec::default()).await.unwrap();
+        let (id, ip) = mgr.create_sandbox(ComputerSpec::default()).await.unwrap();
         assert!(
             wait_for_event(&mut events, &id, "ready").await,
             "sandbox did not reach ready"

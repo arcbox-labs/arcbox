@@ -22,7 +22,7 @@ use arcbox_computer_runtime::config::{JailerConfig, RuntimeConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
-    NodeEnvironment, OutputChunk, SandboxEvent, SandboxId, SandboxManager, SandboxSpec,
+    ComputerId, ComputerSpec, NodeEnvironment, OutputChunk, SandboxEvent, SandboxManager,
     SandboxState,
 };
 use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
@@ -260,11 +260,11 @@ impl Fixture {
 
     /// Create a computer and wait until it is `Ready` — the state every
     /// data-plane and lifecycle verb is specified against.
-    pub async fn ready(&self, id: &str) -> SandboxId {
+    pub async fn ready(&self, id: &str) -> ComputerId {
         let id = self
-            .booted(SandboxSpec {
+            .booted(ComputerSpec {
                 id: Some(id.to_owned()),
-                ..SandboxSpec::default()
+                ..ComputerSpec::default()
             })
             .await;
         self.await_state(&id, SandboxState::Ready).await;
@@ -276,7 +276,7 @@ impl Fixture {
     /// Not the same as [`Self::ready`]: a spec carrying an initial `cmd`
     /// publishes READY and RUNNING in the same breath, so a computer whose
     /// cmd does not exit is announced ready and observed `Running`.
-    pub async fn booted(&self, spec: SandboxSpec) -> SandboxId {
+    pub async fn booted(&self, spec: ComputerSpec) -> ComputerId {
         let mut events = self.manager.subscribe_events();
         let (id, _ip) = self
             .manager
@@ -292,7 +292,7 @@ impl Fixture {
     /// Every verb answers from the computer's actor and several of them
     /// leave work running behind the answer, so a read taken right after
     /// one can still see the state it started from.
-    pub async fn await_state(&self, id: &SandboxId, state: SandboxState) {
+    pub async fn await_state(&self, id: &ComputerId, state: SandboxState) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
         loop {
             let seen = self.manager.inspect_sandbox(id);
@@ -311,7 +311,7 @@ impl Fixture {
     }
 
     /// Wait until `id` is no longer registered, or fail the test.
-    pub async fn await_gone(&self, id: &SandboxId) {
+    pub async fn await_gone(&self, id: &ComputerId) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while self.manager.inspect_sandbox(id).is_ok() {
             assert!(
@@ -337,7 +337,7 @@ impl Fixture {
     /// Wait until `id` is `Failed` with its crash journal cleared, which
     /// is the last thing a release does and therefore the one observation
     /// that covers the whole of it.
-    pub async fn await_released(&self, id: &SandboxId) {
+    pub async fn await_released(&self, id: &ComputerId) {
         self.await_state(id, SandboxState::Failed).await;
         let journal = self.vm_dir(id).join("state.json");
         let deadline = tokio::time::Instant::now() + DEADLINE;
@@ -351,7 +351,7 @@ impl Fixture {
     }
 
     /// Run `cmd` in `id` and collect everything the guest wrote to stdout.
-    pub async fn run(&self, id: &SandboxId, cmd: &[&str]) -> Vec<u8> {
+    pub async fn run(&self, id: &ComputerId, cmd: &[&str]) -> Vec<u8> {
         let mut output = self
             .manager
             .run_in_sandbox(
@@ -449,10 +449,10 @@ pub fn drain_actions(events: &mut broadcast::Receiver<SandboxEvent>, id: &str) -
 
 /// A spec whose initial command never exits, so the computer stays busy
 /// until something tears it down.
-pub fn never_exits(id: &str) -> SandboxSpec {
-    SandboxSpec {
+pub fn never_exits(id: &str) -> ComputerSpec {
+    ComputerSpec {
         id: Some(id.to_owned()),
         cmd: vec!["/bin/wedged".into()],
-        ..SandboxSpec::default()
+        ..ComputerSpec::default()
     }
 }

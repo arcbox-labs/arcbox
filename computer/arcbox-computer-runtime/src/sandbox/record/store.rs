@@ -25,7 +25,7 @@ use super::phase::{
 };
 use crate::error::{ComputerError, Result};
 use crate::sandbox::types::IdleAction;
-use crate::sandbox::{SandboxSpec, validate_id};
+use crate::sandbox::{ComputerSpec, validate_id};
 
 const RECORDS_DIR: &str = "sandbox-records";
 
@@ -142,7 +142,7 @@ impl SandboxRecordStore {
         &self,
         id: &str,
         request_key: &str,
-        effective_spec: SandboxSpec,
+        effective_spec: ComputerSpec,
     ) -> Result<ProvisionIntent> {
         validate_provision_input(id, request_key)?;
 
@@ -391,11 +391,11 @@ fn generation_mismatch(id: &str, expected: Uuid, actual: Uuid) -> ComputerError 
 mod tests {
     use super::*;
 
-    fn spec(id: &str) -> SandboxSpec {
-        SandboxSpec {
+    fn spec(id: &str) -> ComputerSpec {
+        ComputerSpec {
             id: Some(id.to_owned()),
             ttl_seconds: 60,
-            ..SandboxSpec::default()
+            ..ComputerSpec::default()
         }
     }
 

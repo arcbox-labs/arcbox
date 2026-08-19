@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::RuntimeConfig;
 use crate::error::{ComputerError, Result};
-use crate::sandbox::SandboxSpec;
+use crate::sandbox::ComputerSpec;
 
 /// Most distinct warm keys cached at once, mirroring the restore pool's
 /// distinct-snapshot cap. Evicting a key deletes its snapshot (and drains
@@ -58,7 +58,7 @@ pub(in crate::sandbox) struct FileFingerprint {
 /// The warm key for an effective (defaults-applied) create spec and the
 /// fingerprints of the boot inputs it resolves to.
 pub(in crate::sandbox) fn warm_key(
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     kernel: FileFingerprint,
     rootfs: FileFingerprint,
 ) -> WarmKey {
@@ -96,7 +96,7 @@ pub(in crate::sandbox) fn warm_key(
 /// caller-chosen identity into the snapshot, so it disqualifies too.
 pub(in crate::sandbox) fn warm_eligible(
     config: &RuntimeConfig,
-    spec: &SandboxSpec,
+    spec: &ComputerSpec,
     caller_supplied_boot: bool,
 ) -> bool {
     config.firecracker.warm_create
@@ -206,7 +206,7 @@ impl WarmCache {
 mod tests {
     use super::*;
     use crate::config::JailerConfig;
-    use crate::sandbox::{SandboxMountSpec, SandboxNetworkSpec};
+    use crate::sandbox::{ComputerMountSpec, ComputerNetworkSpec};
 
     fn kernel_fingerprint() -> FileFingerprint {
         FileFingerprint {
@@ -228,14 +228,14 @@ mod tests {
         }
     }
 
-    fn base_spec() -> SandboxSpec {
-        SandboxSpec {
+    fn base_spec() -> ComputerSpec {
+        ComputerSpec {
             kernel: "/run/kernel/vmlinux".into(),
             rootfs: "/data/rootfs.ext4".into(),
             boot_args: "console=ttyS0 quiet".into(),
             vcpus: 2,
             memory_mib: 512,
-            network: SandboxNetworkSpec { mode: "tap".into() },
+            network: ComputerNetworkSpec { mode: "tap".into() },
             ..Default::default()
         }
     }
@@ -262,7 +262,7 @@ mod tests {
         );
     }
 
-    type SpecEdit = Box<dyn Fn(&mut SandboxSpec)>;
+    type SpecEdit = Box<dyn Fn(&mut ComputerSpec)>;
     type FingerprintEdit = Box<dyn Fn(&mut FileFingerprint)>;
 
     #[test]
@@ -362,7 +362,7 @@ mod tests {
         assert!(!warm_eligible(&config, &explicit_ip, false));
 
         let mut mounted = base_spec();
-        mounted.mounts.push(SandboxMountSpec {
+        mounted.mounts.push(ComputerMountSpec {
             source: "/src".into(),
             target: "/dst".into(),
             readonly: true,
