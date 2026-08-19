@@ -64,7 +64,7 @@ The restructure plan and its locked decisions live in the company repo:
     direct) supplies its own without forking the module. `stat`/`mknod`
     are syscalls, not applets, so they have no seam. The crate's own
     `dmsetup` search list is the stock-distro one; the System VM's
-    `/arcbox/bin/dmsetup` comes from the guest agent's `VmmConfig`
+    `/arcbox/bin/dmsetup` comes from the guest agent's `RuntimeConfig`
     (`firecracker.dmsetup_candidates`), not from here.
     Adding a new host operation means adding a trait method, never a
     hard-coded binary path. BusyBox's `losetup` has no `--show` (no long
