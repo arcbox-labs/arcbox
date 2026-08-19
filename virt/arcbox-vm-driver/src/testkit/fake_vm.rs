@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use super::fake_driver::{Knobs, NAME};
+use super::fake_staging::StagingArea;
 use super::fake_vsock::{FakeListener, Inbound, echo_peer};
 use super::lock;
 use crate::capability::{
     AfterCheckpoint, Balloon, BalloonStats, Checkpoint, CheckpointFormat, CheckpointImage,
-    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Vsock, VsockListen,
+    CheckpointKind, CheckpointOptions, Console, DebugSnapshot, Detach, Staging, Vsock, VsockListen,
     VsockListener,
 };
 use crate::driver::{
@@ -74,6 +75,10 @@ pub(super) struct VmInner {
     /// Guest-initiated connections; shared with the prepared process the VM
     /// was booted on, so listeners bound before boot keep working.
     inbound: Arc<Inbound>,
+    /// Where this VM's files were staged. Derived from the record, so a
+    /// handle over an adopted VM names the same area the prepared process
+    /// that staged them did.
+    area: StagingArea,
     console: Mutex<Vec<u8>>,
     balloon_target_bytes: AtomicU64,
     /// Every `shutdown` this VM was asked for, in order.
@@ -96,6 +101,7 @@ impl VmInner {
         restored: bool,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(16);
+        let area = StagingArea::new(&record.runtime_dir);
         Arc::new(Self {
             spec,
             record,
@@ -106,6 +112,7 @@ impl VmInner {
             restored,
             events,
             inbound,
+            area,
             console: Mutex::new(Vec::new()),
             balloon_target_bytes: AtomicU64::new(balloon_target_bytes),
             shutdowns: Mutex::new(Vec::new()),
@@ -257,6 +264,10 @@ impl VmHandle for FakeVm {
 
     fn detach(&self) -> Option<&dyn Detach> {
         self.vm.caps.adopt.then_some(&self.ownership)
+    }
+
+    fn staging(&self) -> Option<&dyn Staging> {
+        self.vm.caps.staging.then_some(&self.vm.area)
     }
 
     fn balloon(&self) -> Option<&dyn Balloon> {

@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::capability::{
-    Adopt, Balloon, Checkpoint, CheckpointImage, Console, DebugSnapshot, Detach, Prepare, Vsock,
-    VsockListen,
+    Adopt, Balloon, Checkpoint, CheckpointImage, Console, DebugSnapshot, Detach, Prepare, Staging,
+    Vsock, VsockListen,
 };
 use crate::error::Result;
 use crate::spec::{DiskSpec, IsolationSpec, NicSpec, VmId, VmSpec};
@@ -146,6 +146,22 @@ pub trait VmHandle: Send + Sync {
         None
     }
 
+    /// The area this VM's files live in — the same one
+    /// [`PreparedVm::staging`](crate::PreparedVm::staging) stages into,
+    /// reached from the other grip on the same VM. `Some` iff
+    /// [`DriverCapabilities::staging`].
+    ///
+    /// The prepared VM is not the only grip that reaches an area: one this
+    /// driver *adopted* has no [`PreparedVm`](crate::PreparedVm) — the VMM
+    /// outlived the process that prepared it — and would otherwise have no
+    /// route to what was staged into it. Taking a disk back out
+    /// ([`Staging::unstage_disk`]) is what an orchestrator whose VM runs on
+    /// a staged disk must do before it stops that VM, and the VM it has to
+    /// do it for may well be an adopted one.
+    fn staging(&self) -> Option<&dyn Staging> {
+        None
+    }
+
     /// The memory balloon. `Some` iff the driver has one and the spec set
     /// [`VmSpec::balloon`].
     fn balloon(&self) -> Option<&dyn Balloon> {
@@ -189,9 +205,9 @@ pub struct DriverCapabilities {
     pub adopt: bool,
     /// The VMM can be spawned ahead of a boot ([`Prepare`]).
     pub prepare: bool,
-    /// Prepared VMs expose [`Staging`](crate::Staging): the files a VM
-    /// boots from are brought into an area of its own and named by where
-    /// they landed.
+    /// Prepared VMs and handles expose [`Staging`]: the files a VM boots
+    /// from are brought into an area of its own and named by where they
+    /// landed.
     pub staging: bool,
     /// Handles expose a memory balloon.
     pub balloon: bool,

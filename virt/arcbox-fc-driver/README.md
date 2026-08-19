@@ -6,14 +6,16 @@ jailer) chroot-relative paths, owns the `firecracker`/`jailer` process,
 and serves the port's capabilities over it: `Vsock` and `VsockListen`
 through the hybrid-vsock Unix socket, `Checkpoint` through
 pause → snapshot → resume, `Prepare` for warm pools that spawn ahead of a
-boot, `Staging` for bringing that boot's files into the jail before it,
-`Adopt`/`Detach` for VMs that outlive the process that booted them.
+boot, `Staging` for bringing that boot's files into the jail before it — and for
+taking one back out afterwards, from the prepared VM or from a handle —
+`Adopt`/`Detach` for VMs that outlive the process that booted them, and
+`Adopt::discard_area` for the jail of one that did not.
 
-Nothing above this crate names Firecracker. The sandbox manager
-(`arcbox-computer-runtime`) reaches it through `dyn VmDriver` — during the
-R1 migration it also calls the moved staging helpers directly, an edge R3
-removes — and the only other things it depends on are the port and
-`fc-sdk`: no snapshot catalog, no engine, no orchestrator.
+Nothing above this crate names Firecracker except the composition root
+that picks it. The sandbox manager (`arcbox-computer-runtime`) reaches
+every VM through `dyn VmDriver`, jail layout included; the only other
+things this crate depends on are the port and `fc-sdk`: no snapshot
+catalog, no engine, no orchestrator.
 
 ## Layout
 
@@ -30,8 +32,9 @@ removes — and the only other things it depends on are the port and
 | `listener` | the port's `VsockListener` over a `{uds}_{port}` socket |
 | `discover` | finding a Firecracker that outlived its booter: the recorded pid and any `/proc` candidate, held to the same `--id` / `--api-sock` / jail-root test |
 | `adopt` | rebuilding a handle over what `discover` found: a bounded API reconnect for the full `FcHandle`, else `FcProcessHandle` over the process alone |
-| `prepared` | `FcPrepared: PreparedVm + VsockListen + Staging` — a spawned VMM waiting for a spec, and the jail its files are staged into |
-| `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach`; `FcProcessHandle: VmHandle + Detach`, over a VMM whose API is unreachable |
+| `staging` | `JailStaging: Staging` — one VM's jail as its staging area, built from a `VmLayout` so both grips on the VM reach the same one |
+| `prepared` | `FcPrepared: PreparedVm + VsockListen` — a spawned VMM waiting for a spec, and the jail its files are staged into |
+| `handle` | `FcHandle: VmHandle + Vsock + VsockListen + Checkpoint + Detach`; `FcProcessHandle: VmHandle + Detach`, over a VMM whose API is unreachable. Both offer `Staging`: the area is named by the layout, and asks the VMM nothing |
 | `driver` | `FcDriver: VmDriver + Prepare + Adopt` |
 
 ## Usage
@@ -106,12 +109,16 @@ this.
   is `{jail}/run/firecracker.socket`, the vsock socket
   `/run/firecracker.vsock` inside and `{jail}/run/firecracker.vsock` outside.
 
-  `Staging` on a prepared VM stages the same files under the same names
-  ahead of the boot that renders them, which is how a warm pool pays for a
-  checkpoint's memory file before a restore asks for it; `unstage_disk`
-  takes a disk back out of the jail, so it survives the VM. Without a jail
-  every staging verb is the identity. Removing the jail itself is still
-  the caller's, not `discard`'s — see the note on `FcPrepared::discard`.
+  `Staging` stages the same files under the same names ahead of the boot
+  that renders them, which is how a warm pool pays for a checkpoint's
+  memory file before a restore asks for it; `unstage_disk` takes a disk
+  back out of the jail, so it survives the VM. It is reached from either
+  grip on a VM — the prepared VM, and the handle, which is all a VM this
+  driver adopted has. Without a jail every staging verb is the identity.
+
+  The jail itself goes with whichever grip owns the VMM: `FcPrepared::discard`
+  for a VM this process spawned, `shutdown` for one it adopted, and
+  `Adopt::discard_area` for one that is gone and left neither.
 
   Those sockets are also what bounds a VM id: each must fit AF_UNIX's 107
   bytes, so `id_budget` answers with what the chroot base and binary name

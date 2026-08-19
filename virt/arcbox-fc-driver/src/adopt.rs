@@ -61,18 +61,13 @@ pub(crate) async fn rebuild(
     let (info, devices) = match tokio::time::timeout(api_timeout, describe(&client)).await {
         Ok(Ok(answered)) => answered,
         Ok(Err(error)) => {
-            return Ok(process_only(
-                process,
-                record,
-                layout.jail().cloned(),
-                &error.to_string(),
-            ));
+            return Ok(process_only(process, record, layout, &error.to_string()));
         }
         Err(_) => {
             return Ok(process_only(
                 process,
                 record,
-                layout.jail().cloned(),
+                layout,
                 &format!("no answer within {api_timeout:?}"),
             ));
         }
@@ -96,18 +91,19 @@ async fn describe(client: &Client) -> crate::error::Result<(InstanceInfo, FullVm
 /// The fallback, and the warning that says why: the VM stays a process
 /// this driver can kill, and nothing more.
 ///
-/// The jail still comes along. Where the VM runs is read off the process,
-/// not asked of the API, so an unreachable API costs the handle its
-/// devices — never its ability to take the area down with the VM.
+/// The layout still comes along. Where the VM runs is read off the process,
+/// not asked of the API, so an unreachable API costs the handle its devices
+/// — never the disks staged into its area, nor its ability to take that
+/// area down with the VM.
 fn process_only(
     process: Arc<FcProcess>,
     record: VmRecord,
-    jail: Option<crate::jail::Jail>,
+    layout: VmLayout,
     why: &str,
 ) -> Box<dyn VmHandle> {
     tracing::warn!(vm = %record.id, pid = process.pid(), socket = %process.api_socket().display(),
         "the adopted vmm's api did not answer ({why}); adopting the process alone: kill-able, nothing else");
-    Box::new(FcProcessHandle::new(process, record, jail))
+    Box::new(FcProcessHandle::new(process, record, layout))
 }
 
 #[cfg(test)]

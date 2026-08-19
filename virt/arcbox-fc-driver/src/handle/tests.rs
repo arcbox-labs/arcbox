@@ -53,7 +53,7 @@ fn with_client(
 /// written in place and nothing has to be moved out afterwards (the
 /// scripted Firecracker writes no files).
 fn in_jail(vm: &FcHandle) -> PathBuf {
-    vm.layout
+    vm.layout()
         .jail()
         .expect("checkpoints are taken on jailed vms")
         .root
@@ -132,7 +132,7 @@ async fn only_an_adopted_vm_takes_its_jail_with_the_kill() {
 
     let spawned = handle(dir.path(), isolation.clone(), false);
     let area = spawned
-        .layout
+        .layout()
         .jail()
         .unwrap()
         .root
@@ -252,7 +252,7 @@ async fn snapshots_are_written_in_place_or_staged_in_the_jail() {
     }
 
     let vm = handle(dir.path(), jail(dir.path()), false);
-    let root = vm.layout.jail().unwrap().root.clone();
+    let root = vm.layout().jail().unwrap().root.clone();
     let inside = root.join("snapshots/abc");
     tokio::fs::create_dir_all(&inside).await.unwrap();
     match vm.snapshot_site(&inside).await.unwrap() {

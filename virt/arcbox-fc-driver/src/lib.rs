@@ -80,6 +80,7 @@ pub mod prepared;
 pub mod process;
 pub mod render;
 pub mod spawn;
+pub mod staging;
 pub mod vsock;
 
 pub use config::FcDriverConfig;
@@ -87,6 +88,7 @@ pub use driver::FcDriver;
 pub use error::FcError;
 pub use handle::{FcHandle, FcProcessHandle};
 pub use prepared::FcPrepared;
+pub use staging::JailStaging;
 
 /// The driver's name.
 ///

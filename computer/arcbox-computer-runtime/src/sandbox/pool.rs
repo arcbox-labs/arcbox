@@ -190,7 +190,7 @@ async fn stage_slot(
     // Everything the restore would otherwise pay for on its critical path,
     // brought into the area this slot's VMM reads from — under the same
     // names a restore renders, so claiming the slot stages nothing twice.
-    let staging = super::staging_capability(&*prepared);
+    let staging = super::staging_capability(prepared.staging());
     if let Some(kernel) = snapshot.kernel_path.as_deref() {
         if let Err(error) = staging.stage_kernel(Path::new(kernel)).await {
             return Err(carry(error.into(), Some(prepared), None));

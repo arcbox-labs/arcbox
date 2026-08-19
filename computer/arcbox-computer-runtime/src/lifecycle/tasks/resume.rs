@@ -100,7 +100,7 @@ pub async fn restore_paused(
                 .await?,
         );
         let pid = sandbox::journaled_pid(&*spawned);
-        let staging = sandbox::staging_capability(&*spawned);
+        let staging = sandbox::staging_capability(spawned.staging());
         prepared = Some(Arc::clone(&spawned));
         journal(pid, None, lease.as_ref())?;
 
@@ -269,7 +269,7 @@ async fn park_copy_mode_rootfs(
     if sandbox::preserved_cow_file(config, id).exists() {
         return true;
     }
-    match sandbox::staging_capability(&**prepared)
+    match sandbox::staging_capability(prepared.staging())
         .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
         .await
     {

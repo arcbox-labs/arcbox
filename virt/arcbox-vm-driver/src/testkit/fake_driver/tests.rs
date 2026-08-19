@@ -513,3 +513,34 @@ async fn a_discarded_prepared_vm_refuses_listeners_before_and_after_its_boot() {
         Some(Error::WrongState { .. })
     ));
 }
+
+/// Discarding the area of a VM that is still running is a caller bug the
+/// port forbids, and the fake is where it is caught: on disk, tearing a
+/// live VM's area down looks exactly like tearing a dead one's down.
+#[tokio::test]
+async fn the_area_of_a_running_vm_is_refused_and_a_dead_ones_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = FakeDriver::new();
+    let vm = driver.boot(spec("vm-1"), dir.path()).await.unwrap();
+    let adopt = driver.adopt().unwrap();
+    let record = vm.record();
+
+    assert!(matches!(
+        adopt
+            .discard_area(&record, &IsolationSpec::None)
+            .await
+            .err(),
+        Some(Error::WrongState { .. })
+    ));
+    assert!(driver.discarded_areas().is_empty(), "nothing was recorded");
+
+    vm.shutdown(ShutdownMode::Kill).await.unwrap();
+    adopt
+        .discard_area(&record, &IsolationSpec::None)
+        .await
+        .unwrap();
+    assert_eq!(
+        driver.discarded_areas(),
+        [(record.id.clone(), IsolationSpec::None)]
+    );
+}

@@ -16,7 +16,7 @@
 //! killed.** In copy mode the staged rootfs *is* the paused computer's
 //! disk, and it lives wherever the driver put it — an area a kill is
 //! entitled to take with it, and one nothing here can name. So the disk is
-//! taken back out through the port first, while the grip that staged it is
+//! taken back out through the port first, while a grip on that area is
 //! still held; only then is the VMM discarded. The other order reports a
 //! successful pause and leaves the resume that follows with no disk, which
 //! is why it is stated here rather than left to the reader of two
@@ -57,43 +57,49 @@ pub async fn release_for_pause(
     network: &dyn GuestNetwork,
 ) -> Result<()> {
     // Copy mode: the staged rootfs IS this computer's disk. Take it out of
-    // the VM's area first — the guest is quiesced, the grip that staged it
-    // is still held, and after the kill neither is true.
-    let (prepared, in_copy_mode, vm_dir) = {
+    // the VM's area first — the guest is quiesced, a grip on the VM is
+    // still held, and after the kill neither is true.
+    let (prepared, handle, in_copy_mode, vm_dir) = {
         let computer = arc.lock().unwrap();
         (
             computer.prepared.clone(),
+            computer.handle.clone(),
             computer.cow_handle.is_none(),
             computer.vm_dir.clone(),
         )
     };
     if in_copy_mode {
-        let prepared = prepared.ok_or_else(|| {
-            // A computer this process adopted rather than booted (CORE-135)
-            // holds no prepared VM, so nothing here can reach into the area
-            // its disk sits in. Refusing before the checkpoint's guest is
-            // killed leaves the disk where it is and the pause retryable;
-            // the routes an adopted computer is missing arrive with R3
-            // PR-G3.
-            VmmError::Unavailable(format!(
-                "computer {id} runs on a copied rootfs and was adopted after an agent \
-                 restart, so its disk cannot be taken out of the vm it was staged into; \
-                 it can be stopped or removed, but not paused"
-            ))
-        })?;
+        // Either grip reaches the area, and both name the same one: a
+        // computer booted here holds the prepared VM, one this process
+        // adopted after an agent restart (CORE-135) holds only the handle.
+        let staging = prepared
+            .as_deref()
+            .map(|prepared| sandbox::staging_capability(prepared.staging()))
+            .or_else(|| {
+                handle
+                    .as_deref()
+                    .map(|handle| sandbox::staging_capability(handle.staging()))
+            });
         // Nothing taken out is a refusal, not a skip: in copy mode the
         // VM's area is where this computer's only writable disk lives, so
-        // `false` means there is no disk to pause. Discarding anyway would
-        // commit `Paused` with neither a preserved overlay nor a parked
-        // rootfs — the exact state resume refuses to start from, reached
-        // after the disk is already unrecoverable.
-        if !sandbox::staging_capability(&*prepared)
-            .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
-            .await?
-        {
+        // `false` means there is no disk to pause — as does holding no grip
+        // on the VM to ask through, which the checkpoint this follows would
+        // already have refused. Discarding anyway would commit `Paused`
+        // with neither a preserved overlay nor a parked rootfs — the exact
+        // state resume refuses to start from, reached after the disk is
+        // already unrecoverable.
+        let parked = match staging {
+            Some(staging) => {
+                staging
+                    .unstage_disk(ROOTFS_DISK_ID, &vm_dir.join(PAUSED_ROOTFS_FILE))
+                    .await?
+            }
+            None => false,
+        };
+        if !parked {
             return Err(VmmError::Snapshot(format!(
-                "computer {id} runs on a copied rootfs but its vm has no disk staged to take \
-                 out; pausing it would leave nothing to resume from"
+                "computer {id} runs on a copied rootfs but nothing could be taken out of its \
+                 vm's area; pausing it would leave nothing to resume from"
             )));
         }
     }
@@ -141,27 +147,46 @@ mod tests {
     use std::path::PathBuf;
 
     use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
-    use arcbox_vm_driver::{DiskSource, IsolationSpec, PreparedVm, VmDriver as _, VmId};
+    use arcbox_vm_driver::{
+        BootSpec, ConsoleSpec, DiskSource, IsolationSpec, PreparedVm, ShutdownMode, VmDriver as _,
+        VmId, VmSpec,
+    };
 
     use super::*;
     use crate::sandbox::SandboxSpec;
     use crate::snapshot_cow::CowOptions;
 
+    /// Which grip on its VM a computer holds.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Grip {
+        /// Booted by this process, so the prepared VM is still around.
+        Prepared,
+        /// Adopted after an agent restart (CORE-135): the prepared VM died
+        /// with the process that made it, and only the handle is left.
+        AdoptedHandle,
+    }
+
     /// A copy-mode computer — no overlay, its disk staged into its VM's
     /// area — with `staged` written there under the root disk's id when
     /// asked for.
+    ///
+    /// Answers with the prepared VM whichever grip the computer ends up
+    /// holding, because the staging area is the same one either way and the
+    /// caller needs a way to look into it.
     async fn copy_mode_computer(
         data_dir: &std::path::Path,
         driver: &FakeDriver,
         staged: Option<&[u8]>,
+        grip: Grip,
     ) -> (Arc<Mutex<ComputerRuntime>>, Arc<dyn PreparedVm>, PathBuf) {
         let vm_dir = data_dir.join("sandboxes/job");
         std::fs::create_dir_all(&vm_dir).unwrap();
+        let id = VmId::new("job").unwrap();
         let prepared: Arc<dyn PreparedVm> = Arc::from(
             driver
                 .prepare()
                 .unwrap()
-                .prepare(&VmId::new("job").unwrap(), &IsolationSpec::None, &vm_dir)
+                .prepare(&id, &IsolationSpec::None, &vm_dir)
                 .await
                 .unwrap(),
         );
@@ -181,8 +206,38 @@ mod tests {
             None,
             vm_dir.clone(),
         );
-        computer.prepared = Some(Arc::clone(&prepared));
+        match grip {
+            Grip::Prepared => computer.prepared = Some(Arc::clone(&prepared)),
+            // The guest is running and nothing holds the process that
+            // spawned it, exactly as a sweep hands a computer back.
+            Grip::AdoptedHandle => {
+                computer.handle = Some(Arc::from(prepared.boot(vm_spec(&id)).await.unwrap()));
+            }
+        }
         (Arc::new(Mutex::new(computer)), prepared, vm_dir)
+    }
+
+    /// The least a fake VM needs to boot.
+    fn vm_spec(id: &VmId) -> VmSpec {
+        VmSpec {
+            id: id.clone(),
+            cpus: 1,
+            memory_mib: 128,
+            boot: BootSpec::Kernel {
+                image: "/vmlinux".into(),
+                cmdline: String::new(),
+                initrd: None,
+            },
+            disks: vec![],
+            nics: vec![],
+            vsock: None,
+            shares: vec![],
+            console: ConsoleSpec::Off,
+            balloon: false,
+            entropy: false,
+            dirty_tracking: false,
+            isolation: IsolationSpec::None,
+        }
     }
 
     fn config(data_dir: &std::path::Path) -> VmmConfig {
@@ -202,8 +257,13 @@ mod tests {
     async fn the_copy_mode_disk_is_parked_before_the_vm_is_discarded() {
         let data_dir = tempfile::tempdir().unwrap();
         let driver = FakeDriver::new();
-        let (computer, prepared, vm_dir) =
-            copy_mode_computer(data_dir.path(), &driver, Some(b"the guest's disk")).await;
+        let (computer, prepared, vm_dir) = copy_mode_computer(
+            data_dir.path(),
+            &driver,
+            Some(b"the guest's disk"),
+            Grip::Prepared,
+        )
+        .await;
         let config = config(data_dir.path());
         let cow = CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap();
 
@@ -234,7 +294,8 @@ mod tests {
     async fn a_copy_mode_pause_with_no_staged_disk_is_refused_before_the_kill() {
         let data_dir = tempfile::tempdir().unwrap();
         let driver = FakeDriver::new();
-        let (computer, prepared, vm_dir) = copy_mode_computer(data_dir.path(), &driver, None).await;
+        let (computer, prepared, vm_dir) =
+            copy_mode_computer(data_dir.path(), &driver, None, Grip::Prepared).await;
         let config = config(data_dir.path());
         let cow = CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap();
 
@@ -255,5 +316,50 @@ mod tests {
         }
         assert!(prepared.alive(), "the vm is left running for a retry");
         assert!(!vm_dir.join(PAUSED_ROOTFS_FILE).exists());
+    }
+
+    /// The regression CORE-135 left open: a copy-mode computer this process
+    /// adopted rather than booted holds no prepared VM, and pausing it used
+    /// to be refused outright — it could be stopped or removed, never
+    /// paused. Its disk is reachable through the handle, so it pauses like
+    /// any other, landing where resume looks for it.
+    #[tokio::test]
+    async fn an_adopted_copy_mode_computer_pauses_through_its_handle() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let (computer, _prepared, vm_dir) = copy_mode_computer(
+            data_dir.path(),
+            &driver,
+            Some(b"the guest's disk"),
+            Grip::AdoptedHandle,
+        )
+        .await;
+        assert!(
+            computer.lock().unwrap().prepared.is_none(),
+            "an adopted computer has only its handle"
+        );
+        let config = config(data_dir.path());
+        let cow = CowManager::new(CowOptions::new(&config.firecracker.data_dir)).unwrap();
+
+        release_for_pause(
+            &"job".to_owned(),
+            &computer,
+            &config,
+            &cow,
+            &FakeNetwork::new(),
+        )
+        .await
+        .expect("an adopted copy-mode computer pauses");
+
+        assert_eq!(
+            std::fs::read(vm_dir.join(PAUSED_ROOTFS_FILE)).unwrap(),
+            b"the guest's disk"
+        );
+        // Through the handle, since there is no prepared VM to discard —
+        // and asked to die rather than merely dropped.
+        assert_eq!(
+            driver.shutdowns(&VmId::new("job").unwrap()),
+            [ShutdownMode::Kill]
+        );
     }
 }

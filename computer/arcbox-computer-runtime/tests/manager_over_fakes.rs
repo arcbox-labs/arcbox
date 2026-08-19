@@ -1103,23 +1103,31 @@ async fn a_detached_computer_is_adopted_by_the_next_process_and_serves_an_exec()
     );
 }
 
-/// An adopted computer running on a copied rootfs cannot be paused: its
-/// disk lives in the VM's area, and this process holds no grip on that VM
-/// to reach in with. The refusal is raised before the pause takes anything
-/// out — the boundary R3 PR-G3 moves.
+/// An adopted computer running on a copied rootfs pauses like any other.
 ///
-/// What the refusal costs is the part worth pinning. `release_for_pause`
-/// declines before its own kill, but a release that fails has no
-/// recoverable arm in `releasing` the way a failed *capture* does in
-/// `capturing`, so the computer takes the shared failure path: killed
-/// through its handle, released, durably `Failed`. A caller therefore
-/// loses the computer to a pause that was refused for its safety — and
-/// the kill it loses it to is the grip's completed kill, which on a real
-/// adapter takes the jail, and in copy mode the rootfs inside it. Asserted
-/// as it behaves, not as it should: the fix belongs with the routes G3
-/// adds, and this is the test that will say when they arrive.
+/// Its disk lives in the VM's area and this process holds no prepared VM to
+/// reach in with, so until the handle grew a staging accessor the pause was
+/// refused — and the refusal cost the computer. `release_for_pause`
+/// declines before its own kill, but a failed *release* has no recoverable
+/// arm in `releasing` the way a failed *capture* has in `capturing`, so a
+/// pause refused for a computer's safety killed it through its handle and
+/// left it durably `Failed`.
+///
+/// The area is reachable from the handle now: the disk comes out ahead of
+/// the kill and lands where a resume looks for it.
+///
+/// The resume itself does not yet complete, for a reason of its own that
+/// this pause used to hide: the durable record redacts a computer's boot
+/// inputs when it reaches `Ready` (`redact_runtime_inputs`), so an adopted
+/// computer's `spec.kernel` is empty, and every checkpoint it takes records
+/// no kernel path for the staging that follows to bring in. That is a gap
+/// in adoption, not in pause — a *Checkpoint* of an adopted computer is
+/// unrestorable for the same reason, with no pause involved — and it is
+/// asserted here as it behaves: the resume fails, the computer is left back
+/// at `Paused`, and its retained disk is where the pause put it, so nothing
+/// is lost and a retry has something to succeed with.
 #[tokio::test]
-async fn an_adopted_computer_on_a_copied_rootfs_refuses_to_pause() {
+async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
     let mut fixture = Fixture::jailed().await;
     let id = fixture.ready("handed-over").await;
 
@@ -1127,23 +1135,27 @@ async fn an_adopted_computer_on_a_copied_rootfs_refuses_to_pause() {
     fixture = fixture.restart().await;
     fixture.await_state(&id, SandboxState::Ready).await;
 
-    let error = fixture.manager.pause_sandbox(&id).await.unwrap_err();
-    assert!(matches!(error, VmmError::Unavailable(_)), "{error}");
+    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.await_state(&id, SandboxState::Paused).await;
+    // The frozen on-disk name a resume reattaches from.
+    let parked = fixture.vm_dir(&id).join("paused-rootfs.ext4");
     assert!(
-        error.to_string().contains("cannot be taken out"),
-        "the refusal names the route it does not have: {error}"
+        parked.exists(),
+        "the copy-mode disk came out of the adopted vm's area"
     );
 
-    // Refused, and then torn down anyway.
-    fixture.await_released(&id).await;
-    assert_eq!(
-        fixture
-            .driver()
-            .shutdowns(&arcbox_vm_driver::VmId::new(&id).unwrap()),
-        vec![arcbox_vm_driver::ShutdownMode::Kill],
-        "the guest the refusal was protecting is killed by the failure path"
+    fixture.settle_network_cleanups().await;
+    let error = fixture
+        .manager
+        .resume_sandbox(&id, pause_reason::RESUME)
+        .await
+        .expect_err("an adopted computer's checkpoint records no kernel to stage");
+    assert!(
+        matches!(&error, VmmError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "the kernel path the checkpoint recorded is empty, so staging it is ENOENT: {error}"
     );
-    assert_eq!(fixture.settle_network_cleanups().await, vec![id]);
+    fixture.await_state(&id, SandboxState::Paused).await;
+    assert!(parked.exists(), "a failed resume leaves the disk parked");
 }
 
 /// A computer whose VMM did not survive the gap comes back `Failed`, not

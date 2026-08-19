@@ -77,7 +77,9 @@ pub trait PreparedVm: Send + Sync {
     }
 
     /// Bring the files this VM boots from into the area its VMM can reach.
-    /// `Some` iff [`crate::DriverCapabilities::staging`].
+    /// `Some` iff [`crate::DriverCapabilities::staging`]. The handle of the
+    /// VM booted on this process reaches the same area through
+    /// [`VmHandle::staging`].
     fn staging(&self) -> Option<&dyn Staging> {
         None
     }
@@ -112,7 +114,12 @@ pub trait PreparedVm: Send + Sync {
 /// the caller says what a file is, and gets back the path its spec must
 /// name for it. It never learns whether a confinement exists.
 ///
-/// Present iff [`crate::DriverCapabilities::staging`]. A driver whose VMs
+/// Present iff [`crate::DriverCapabilities::staging`], and reachable from
+/// both grips on a VM — the prepared VM the driver spawned
+/// ([`PreparedVm::staging`]) and the handle to the VM running on it
+/// ([`VmHandle::staging`]) — naming the same area either way. That is what
+/// lets a VM this driver *adopted*, whose prepared half died with the
+/// process that made it, still take a disk back out. A driver whose VMs
 /// read host paths as they are still offers it, as the identity: staging
 /// such a file is a no-op that answers with the path it was given. That is
 /// what lets an orchestrator stage unconditionally instead of branching on
@@ -308,7 +315,8 @@ impl AsRef<str> for CheckpointFormat {
     }
 }
 
-/// Find a VM that outlived the process which booted it.
+/// Find a VM that outlived the process which booted it — or clear away what
+/// it left when it did not.
 ///
 /// Present on external-process VMMs only: an in-process VM dies with its
 /// process, so "adopt" has no meaning there and the accessor is `None`.
@@ -319,6 +327,28 @@ pub trait Adopt: Send + Sync {
     /// `Ok(None)` means nothing survived — a stale record, a dead pid — which
     /// is an outcome, not an absence of the capability.
     async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>>;
+
+    /// Removes the host area of the VM `record` names, which is gone.
+    ///
+    /// A VM's area belongs to whichever grip owns its VMM: the
+    /// [`PreparedVm`] that made it, or the handle of a VM this driver
+    /// adopted. A VM that died with the process which booted it leaves
+    /// neither, and leaves its area — which, where a driver confines its
+    /// VMMs, holds everything [`Staging`] brought in. This is the only
+    /// route left to it, and only the driver knows where "it" is.
+    ///
+    /// `isolation` is what the VM was configured to run under, because
+    /// nothing can be read back off a process that is gone. A driver that
+    /// confines nothing has no area to remove and succeeds.
+    ///
+    /// Already removed is success: a startup sweep runs this on every
+    /// journal it does not keep, and may find what an earlier sweep
+    /// cleared.
+    ///
+    /// Never called on a VM that is still running — [`adopt`](Self::adopt)
+    /// answers that case with a handle, and the handle's stop takes the
+    /// area.
+    async fn discard_area(&self, record: &VmRecord, isolation: &IsolationSpec) -> Result<()>;
 }
 
 /// Give up ownership of a running VM without stopping it.

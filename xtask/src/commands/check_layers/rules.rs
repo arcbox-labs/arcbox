@@ -107,10 +107,10 @@ pub const EXCEPTIONS: &[Exception] = &[
     Exception {
         from: "arcbox-computer-runtime",
         to: "arcbox-fc-driver",
-        reason: "the runtime no longer builds the Firecracker adapter, but its \
-                 config still speaks FcDriverConfig, its checkpoints the \
-                 driver's format, and its startup sweep the jailer's chroot \
-                 layout, until a config split moves those to the port",
+        reason: "the runtime no longer builds the Firecracker adapter, nor \
+                 reads its jailer layout, but its config still speaks \
+                 FcDriverConfig and its checkpoints the driver's format, \
+                 until a config split moves those to the port",
         until: "vm-stack-redesign R3 (the config split after PR-G)",
     },
     Exception {

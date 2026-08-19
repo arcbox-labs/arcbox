@@ -9,17 +9,24 @@
 //! kill, and detach, all served by the process guard. Nothing that needs
 //! the API is offered — no vsock, no listener, no checkpoint — and a
 //! `Graceful` shutdown, whose ctrl-alt-del is an API call, kills at once.
+//!
+//! Staging is offered, though: where a VM's files live is a property of
+//! how its VMM was launched, which the adopt read off the process itself,
+//! so an unreachable API costs this handle the VM's devices and never the
+//! disks staged into its area.
 
 use std::sync::Arc;
 
 use arcbox_vm_driver::{
-    Detach, ExitStatus, Result, ShutdownMode, VmEvent, VmHandle, VmId, VmRecord, VmState,
+    Detach, ExitStatus, Result, ShutdownMode, Staging, VmEvent, VmHandle, VmId, VmRecord, VmState,
 };
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::jail::Jail;
 use crate::process::FcProcess;
+use crate::render::VmLayout;
+use crate::staging::JailStaging;
 
 /// A VMM process this driver verified but cannot talk to.
 ///
@@ -28,20 +35,26 @@ use crate::process::FcProcess;
 pub struct FcProcessHandle {
     process: Arc<FcProcess>,
     record: VmRecord,
-    /// The area this VM runs in, when it has one. Reachable without the
-    /// API: it is a property of how the VMM was launched, which the adopt
-    /// read off the process itself.
-    jail: Option<Jail>,
+    /// The area this VM runs in, and the layout that names paths in it.
+    /// Reachable without the API: where the VMM was launched is a property
+    /// of the launch, which the adopt read off the process itself.
+    staging: JailStaging,
 }
 
 impl FcProcessHandle {
-    /// A handle over `process`, reporting `record` and running in `jail`.
-    pub fn new(process: Arc<FcProcess>, record: VmRecord, jail: Option<Jail>) -> Self {
+    /// A handle over `process`, reporting `record` and running in the area
+    /// `layout` describes.
+    pub fn new(process: Arc<FcProcess>, record: VmRecord, layout: VmLayout) -> Self {
         Self {
             process,
             record,
-            jail,
+            staging: JailStaging::new(layout),
         }
+    }
+
+    /// The jail this VM runs in, when it has one.
+    fn jail(&self) -> Option<&Jail> {
+        self.staging.layout().jail()
     }
 }
 
@@ -90,7 +103,7 @@ impl VmHandle for FcProcessHandle {
                 "the vmm's api is unreachable: a graceful shutdown cannot ask the guest and kills it");
         }
         let status = self.process.kill().await?;
-        if let Some(jail) = &self.jail
+        if let Some(jail) = self.jail()
             && !self.process.is_detached()
         {
             jail.remove().await?;
@@ -102,6 +115,13 @@ impl VmHandle for FcProcessHandle {
     /// needs only the guard.
     fn detach(&self) -> Option<&dyn Detach> {
         Some(self)
+    }
+
+    /// Present as on every handle of this driver: bringing a file into the
+    /// jail, or taking one back out, is a filesystem operation on a path
+    /// the layout names, and asks the VMM nothing.
+    fn staging(&self) -> Option<&dyn Staging> {
+        Some(&self.staging)
     }
 }
 
@@ -115,39 +135,66 @@ impl Detach for FcProcessHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use arcbox_vm_driver::ProcessRecord;
+    use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
 
     use super::*;
     use crate::NAME;
+    use crate::config::FcDriverConfig;
     use crate::process::UNKNOWN_EXIT;
+
+    /// The Firecracker binary the layouts below are built from; only its
+    /// file name matters, and it names the jail's middle component.
+    const FC_BINARY: &str = "/nonexistent/arcbox-fc-driver/firecracker";
 
     /// A `sleep` child adopted as a VMM, and the child to reap it with.
     fn adopted() -> (FcProcessHandle, tokio::process::Child) {
-        adopted_in(None)
+        adopted_in(
+            &IsolationSpec::None,
+            Path::new("/nonexistent/arcbox-fc-driver"),
+        )
     }
 
-    /// [`adopted`], running in `jail`.
-    fn adopted_in(jail: Option<Jail>) -> (FcProcessHandle, tokio::process::Child) {
+    /// [`adopted`], confined by `isolation` with `runtime_dir` as its
+    /// scratch space — the layout an adopt reads off the process.
+    fn adopted_in(
+        isolation: &IsolationSpec,
+        runtime_dir: &Path,
+    ) -> (FcProcessHandle, tokio::process::Child) {
         let child = tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn test child");
         let pid = child.id().unwrap();
         let socket = PathBuf::from("/nonexistent/arcbox-fc-driver/api.sock");
+        let id = VmId::new("box").unwrap();
         let record = VmRecord {
-            id: VmId::new("box").unwrap(),
+            id: id.clone(),
             driver: NAME.to_owned(),
-            runtime_dir: "/nonexistent/arcbox-fc-driver".into(),
+            runtime_dir: runtime_dir.to_path_buf(),
             process: Some(ProcessRecord {
                 pid,
                 api_socket: Some(socket.clone()),
             }),
         };
+        let layout = VmLayout::new(&id, isolation, &FcDriverConfig::new(FC_BINARY), runtime_dir)
+            .expect("a layout for the adopted vm");
         let process = Arc::new(FcProcess::adopt(pid, socket));
-        (FcProcessHandle::new(process, record, jail), child)
+        (FcProcessHandle::new(process, record, layout), child)
+    }
+
+    /// The jail of a VM adopted into `base`.
+    fn jailed(base: &Path) -> IsolationSpec {
+        IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: base.to_path_buf(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        }
     }
 
     /// An API this handle cannot reach costs it the VM's devices, never
@@ -158,15 +205,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let area = dir.path().join("jail/firecracker/box");
         std::fs::create_dir_all(area.join("root")).unwrap();
-        let (vm, mut child) = adopted_in(Some(Jail {
-            root: area.join("root"),
-            uid: 0,
-            gid: 0,
-        }));
+        let (vm, mut child) = adopted_in(&jailed(&dir.path().join("jail")), dir.path());
+        assert_eq!(
+            vm.jail().map(|jail| jail.root.clone()),
+            Some(area.join("root"))
+        );
         let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
         vm.shutdown(ShutdownMode::Kill).await.unwrap();
         assert!(!area.exists(), "the adopted vm's jail goes with the kill");
         reaper.await.unwrap();
+    }
+
+    /// The disks in that area are reachable too, which is what lets a
+    /// computer running on a staged rootfs be paused after its agent
+    /// restarted: taking the disk out needs the area, not the API.
+    #[tokio::test]
+    async fn a_staged_disk_comes_back_out_without_an_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("jail/firecracker/box/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("rootfs.ext4"), b"the guest's disk").unwrap();
+        let (vm, mut child) = adopted_in(&jailed(&dir.path().join("jail")), dir.path());
+
+        let parked = dir.path().join("paused-rootfs.ext4");
+        let staging = vm.staging().expect("an adopted vm reaches its own area");
+        assert!(staging.unstage_disk("rootfs", &parked).await.unwrap());
+        assert_eq!(std::fs::read(&parked).unwrap(), b"the guest's disk");
+        assert!(
+            !staging.unstage_disk("rootfs", &parked).await.unwrap(),
+            "nothing is left to take out"
+        );
+
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
     }
 
     fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
@@ -185,6 +256,7 @@ mod tests {
         assert!(VmHandle::checkpoint(&vm).is_none());
         assert!(vm.balloon().is_none() && vm.console().is_none() && vm.debug().is_none());
         assert!(VmHandle::detach(&vm).is_some());
+        assert!(vm.staging().is_some());
         let mut events = vm.events();
         // The real parent reaps once the signal lands.
         let reaper = tokio::spawn(async move { child.wait().await.unwrap() });
