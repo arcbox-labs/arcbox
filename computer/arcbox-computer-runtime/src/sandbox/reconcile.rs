@@ -402,12 +402,6 @@ pub(super) struct AdoptedSandbox {
     net_invariant: bool,
 }
 
-/// What one sweep did, in the two pieces its caller needs at different
-/// moments: [`OrphanSweep::take_runtime`] first, for normalization, and the
-/// runtime directories afterwards, for [`finalize_sweep`].
-///
-/// Both halves are private so neither can be read after the first has been
-/// taken out.
 /// The journals one sweep could not read, in the two vocabularies it has
 /// to answer in afterwards.
 ///
@@ -446,6 +440,12 @@ impl SkippedJournals {
     }
 }
 
+/// What one sweep did, in the two pieces its caller needs at different
+/// moments: [`OrphanSweep::take_runtime`] first, for normalization, and the
+/// runtime directories afterwards, for [`finalize_sweep`].
+///
+/// Both halves are private so neither can be read after the first has been
+/// taken out.
 pub(super) struct OrphanSweep {
     /// Ids whose journaled resources were torn down.
     ids: HashSet<String>,
