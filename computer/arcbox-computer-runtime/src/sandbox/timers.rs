@@ -50,7 +50,7 @@ impl SandboxManager {
             .await?;
         let deadlines = computer.snapshot.borrow().deadlines;
         info!(
-            sandbox_id = %id,
+            computer_id = %id,
             ttl_deadline = ?deadlines.ttl,
             idle_timeout_seconds = deadlines.idle_timeout_seconds,
             on_idle = ?deadlines.on_idle,

@@ -66,9 +66,9 @@ pub use pause::reason as pause_reason;
 pub(crate) use spec::ROOTFS_DISK_ID;
 pub(crate) use types::NetworkAttachment;
 pub use types::{
-    CheckpointInfo, CheckpointSummary, ComputerId, ComputerMountSpec, ComputerNetworkInfo,
-    ComputerNetworkSpec, ComputerSpec, IdleAction, LifecycleUpdate, RestoreComputerSpec,
-    SandboxEvent, SandboxInfo, SandboxState, SandboxSummary, TemplateWarmRef,
+    CheckpointInfo, CheckpointSummary, ComputerEvent, ComputerId, ComputerInfo, ComputerMountSpec,
+    ComputerNetworkInfo, ComputerNetworkSpec, ComputerSpec, ComputerState, ComputerSummary,
+    IdleAction, LifecycleUpdate, RestoreComputerSpec, TemplateWarmRef,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -103,7 +103,7 @@ pub struct SandboxManager {
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
     config: Arc<RuntimeConfig>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    events_tx: broadcast::Sender<ComputerEvent>,
     cow_manager: Arc<CowManager>,
     /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
     pool: Arc<pool::SlotPool>,
@@ -767,7 +767,7 @@ pub(crate) fn reserve_actor(
     let runtime = Arc::new(Mutex::new(runtime));
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(ComputerSnapshot::project(
         &runtime.lock().unwrap(),
-        SandboxState::Starting,
+        ComputerState::Starting,
         Deadlines::default(),
     ));
     map.insert(

@@ -21,7 +21,7 @@ use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::boot::{StageError, create_rootfs_symlink, stage_rootfs_cow_or_copy};
 use crate::sandbox::spec::build_vm_spec;
-use crate::sandbox::{self, ComputerSpec, NetworkAttachment, SandboxState};
+use crate::sandbox::{self, ComputerSpec, ComputerState, NetworkAttachment};
 use crate::snapshot_cow::{CowHandle, CowManager};
 
 pub type BootOutput = (Arc<dyn VmHandle>, Box<dyn ReadyGate>);
@@ -105,15 +105,15 @@ pub async fn wait_for_agent(
                 Ok(Ok(ClockSync::Synced)) => {}
                 Ok(Ok(ClockSync::AgentError(code))) => {
                     warn!(
-                        sandbox_id = %id, code,
+                        computer_id = %id, code,
                         "agent could not set the clock; continuing with a possibly skewed clock"
                     );
                 }
                 Ok(Err(error)) => {
-                    warn!(sandbox_id = %id, %error, "cold-boot clock sync failed; continuing");
+                    warn!(computer_id = %id, %error, "cold-boot clock sync failed; continuing");
                 }
                 Err(_) => {
-                    warn!(sandbox_id = %id, "cold-boot clock sync timed out; continuing");
+                    warn!(computer_id = %id, "cold-boot clock sync timed out; continuing");
                 }
             }
         });
@@ -203,7 +203,7 @@ pub async fn do_boot(
         computer.state
     };
 
-    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+    if matches!(state, ComputerState::Stopping | ComputerState::Stopped) {
         complete_resource_handoff(&mut resource_handoff);
         return Err(BootFailure {
             error: ComputerError::WrongState {
@@ -302,7 +302,7 @@ pub async fn do_boot(
                         return Err(e.into());
                     }
                     debug!(
-                        sandbox_id = %id,
+                        computer_id = %id,
                         error = %e,
                         "dm-snapshot unavailable, using rootfs directly"
                     );
@@ -331,7 +331,7 @@ pub async fn do_boot(
         prepared: None,
         cow_handle: None,
     })?;
-    if matches!(state, SandboxState::Stopping | SandboxState::Stopped) {
+    if matches!(state, ComputerState::Stopping | ComputerState::Stopped) {
         return Err(BootFailure {
             error: ComputerError::WrongState {
                 id: id.to_owned(),

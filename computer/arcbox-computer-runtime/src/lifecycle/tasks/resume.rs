@@ -182,10 +182,10 @@ pub async fn restore_paused(
                 {
                     Ok(Ok(ClockSync::Synced)) => {}
                     Ok(Ok(ClockSync::AgentError(code))) => {
-                        warn!(sandbox_id = %id, code, "agent could not set the clock after resume");
+                        warn!(computer_id = %id, code, "agent could not set the clock after resume");
                     }
-                    Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after resume failed: {e}"),
-                    Err(_) => warn!(sandbox_id = %id, "clock sync after resume timed out"),
+                    Ok(Err(e)) => warn!(computer_id = %id, "clock sync after resume failed: {e}"),
+                    Err(_) => warn!(computer_id = %id, "clock sync after resume timed out"),
                 }
             });
         }
@@ -275,7 +275,7 @@ async fn park_copy_mode_rootfs(
     {
         Ok(_) => true,
         Err(error) => {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: parking rootfs failed");
+            warn!(computer_id = %id, error = %error, "resume unwind: parking rootfs failed");
             false
         }
     }
@@ -304,7 +304,7 @@ async fn unwind_resume(
     if let Some(prepared) = prepared {
         // SIGKILL plus the driver's bounded wait for the reaper.
         if let Err(error) = prepared.discard().await {
-            warn!(sandbox_id = %id, error = %error, "resume unwind: the vmm did not exit");
+            warn!(computer_id = %id, error = %error, "resume unwind: the vmm did not exit");
             clean = false;
         }
     }
@@ -312,19 +312,19 @@ async fn unwind_resume(
     if let Some(handle) = cow_handle
         && let Err(error) = cow_manager.detach_keep_cow(&handle).await
     {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: overlay detach failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: overlay detach failed");
         clean = false;
     }
 
     if let Some(lease) = net_lease
         && let Err(error) = network.quarantine(lease).await
     {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: network quarantine failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: network quarantine failed");
         clean = false;
     }
 
     if clean && let Err(error) = sandbox::reconcile::clear_state_record(vm_dir) {
-        warn!(sandbox_id = %id, error = %error, "resume unwind: journal removal failed");
+        warn!(computer_id = %id, error = %error, "resume unwind: journal removal failed");
         clean = false;
     }
     clean

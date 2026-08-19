@@ -22,8 +22,8 @@ use arcbox_computer_runtime::config::{JailerConfig, RuntimeConfig};
 use arcbox_computer_runtime::testkit::agent::FakeAgentFactory;
 use arcbox_computer_runtime::testkit::fake_environment;
 use arcbox_computer_runtime::{
-    ComputerId, ComputerSpec, NodeEnvironment, OutputChunk, SandboxEvent, SandboxManager,
-    SandboxState,
+    ComputerEvent, ComputerId, ComputerSpec, ComputerState, NodeEnvironment, OutputChunk,
+    SandboxManager,
 };
 use arcbox_vm_driver::testkit::{FakeDriver, FakeNetwork};
 use tokio::sync::broadcast;
@@ -267,7 +267,7 @@ impl Fixture {
                 ..ComputerSpec::default()
             })
             .await;
-        self.await_state(&id, SandboxState::Ready).await;
+        self.await_state(&id, ComputerState::Ready).await;
         id
     }
 
@@ -292,7 +292,7 @@ impl Fixture {
     /// Every verb answers from the computer's actor and several of them
     /// leave work running behind the answer, so a read taken right after
     /// one can still see the state it started from.
-    pub async fn await_state(&self, id: &ComputerId, state: SandboxState) {
+    pub async fn await_state(&self, id: &ComputerId, state: ComputerState) {
         let deadline = tokio::time::Instant::now() + DEADLINE;
         loop {
             let seen = self.manager.inspect_sandbox(id);
@@ -338,7 +338,7 @@ impl Fixture {
     /// is the last thing a release does and therefore the one observation
     /// that covers the whole of it.
     pub async fn await_released(&self, id: &ComputerId) {
-        self.await_state(id, SandboxState::Failed).await;
+        self.await_state(id, ComputerState::Failed).await;
         let journal = self.vm_dir(id).join("state.json");
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while journal.exists() {
@@ -393,7 +393,7 @@ pub async fn settle_network_cleanups(manager: &SandboxManager) -> Vec<String> {
     pending.into_iter().map(|(id, _)| id).collect()
 }
 
-/// The `action` values [`SandboxEvent`] carries, as the wire spells them.
+/// The `action` values [`ComputerEvent`] carries, as the wire spells them.
 ///
 /// Spelled out rather than imported: the constants they mirror are
 /// crate-private, and it is the *strings* an out-of-crate consumer matches
@@ -414,21 +414,21 @@ pub mod action {
 /// Wait for `action` on `id`, or fail the test — reporting a failure on
 /// the same computer immediately rather than waiting out the deadline.
 pub async fn await_action(
-    events: &mut broadcast::Receiver<SandboxEvent>,
+    events: &mut broadcast::Receiver<ComputerEvent>,
     id: &str,
     action: &str,
-) -> SandboxEvent {
+) -> ComputerEvent {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv())
             .await
             .unwrap_or_else(|_| panic!("no {action} for {id} within the deadline"))
             .expect("the event stream stays open");
-        if event.sandbox_id == id && event.action == action {
+        if event.computer_id == id && event.action == action {
             return event;
         }
         assert_ne!(
-            (event.action.as_str(), event.sandbox_id.as_str()),
+            (event.action.as_str(), event.computer_id.as_str()),
             (self::action::FAILED, id),
             "{id} failed instead of reaching {action}: {:?}",
             event.attributes
@@ -437,10 +437,10 @@ pub async fn await_action(
 }
 
 /// Every `action` seen for `id` so far, in order.
-pub fn drain_actions(events: &mut broadcast::Receiver<SandboxEvent>, id: &str) -> Vec<String> {
+pub fn drain_actions(events: &mut broadcast::Receiver<ComputerEvent>, id: &str) -> Vec<String> {
     let mut actions = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if event.sandbox_id == id {
+        if event.computer_id == id {
             actions.push(event.action);
         }
     }

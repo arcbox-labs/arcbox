@@ -53,7 +53,7 @@ use tracing::{info, warn};
 
 use super::policy::recovery::{self, JournalEvidence, RecoveryAction, SweepAction};
 use super::record::{PersistPhase, SandboxRecord, SandboxRecordStore, SandboxTransition};
-use super::{LeaseExt, SandboxState};
+use super::{ComputerState, LeaseExt};
 use crate::config::RuntimeConfig;
 use crate::error::{ComputerError, Result};
 use crate::lifecycle::actor::{Deadlines, Seeded};
@@ -648,7 +648,7 @@ pub(super) async fn sweep_orphans(
             .and_then(|_| VmId::new(record.resource_owner()).map_err(ComputerError::from));
         if let Err(error) = usable {
             warn!(
-                sandbox_id = %record.id,
+                computer_id = %record.id,
                 path = %dir.display(),
                 %error,
                 "skipping an unusable crash journal: its VM is left alone and every \
@@ -795,11 +795,11 @@ async fn reap_orphans(
             continue;
         }
         if recovery::sweep_action(&record.id, retained) == SweepAction::DropStaleJournal {
-            info!(sandbox_id = %record.id, "dropping stale pause journal, keeping retained state");
+            info!(computer_id = %record.id, "dropping stale pause journal, keeping retained state");
             clear_state_record(dir)?;
             continue;
         }
-        info!(sandbox_id = %record.id, "reconciling orphaned sandbox");
+        info!(computer_id = %record.id, "reconciling orphaned sandbox");
 
         if let Some(cow) = &record.cow {
             cow_manager.teardown_checked(&cow.to_handle()).await?;
@@ -927,7 +927,7 @@ pub(super) fn normalize_durable_records(
                     .confirmed("sandbox restart normalization")?;
                 inactive.push(RecoveredComputer::reinstated(inactive_instance(
                     record,
-                    SandboxState::Failed,
+                    ComputerState::Failed,
                     data_dir,
                 )));
             }
@@ -1055,7 +1055,7 @@ async fn kill_or_hand_over(id: &str, handle: &Arc<dyn VmHandle>) -> Result<()> {
     if let Some(detach) = handle.detach()
         && let Err(error) = detach.detach().await
     {
-        warn!(sandbox_id = %id, %error, "handing the vmm over failed; dropping it kills it");
+        warn!(computer_id = %id, %error, "handing the vmm over failed; dropping it kills it");
     }
     Err(error.into())
 }
@@ -1078,10 +1078,10 @@ async fn release_one(
     network: &dyn GuestNetwork,
     cow_manager: &CowManager,
 ) {
-    warn!(sandbox_id = %id, "releasing a reclaimed sandbox that recovery did not take");
+    warn!(computer_id = %id, "releasing a reclaimed sandbox that recovery did not take");
     if let Err(error) = kill_or_hand_over(id, handle).await {
         warn!(
-            sandbox_id = %id, %error,
+            computer_id = %id, %error,
             "killing the reclaimed vmm failed; leaving it, its disk and its address for the next sweep"
         );
         return;
@@ -1089,12 +1089,12 @@ async fn release_one(
     if let Some(cow_handle) = cow_handle
         && let Err(error) = cow_manager.teardown_checked(cow_handle).await
     {
-        warn!(sandbox_id = %id, %error, "releasing the reclaimed disk overlay failed");
+        warn!(computer_id = %id, %error, "releasing the reclaimed disk overlay failed");
     }
     if let Some(lease) = lease
         && let Err(error) = network.quarantine(lease).await
     {
-        warn!(sandbox_id = %id, %error, "quarantining the reclaimed lease failed");
+        warn!(computer_id = %id, %error, "quarantining the reclaimed lease failed");
     }
 }
 
@@ -1119,10 +1119,10 @@ impl RecoveredComputer {
 /// what it left rather than a decision: `plan` only ever reinstates the three
 /// inactive phases, and the `Fail` verdict writes `Failed` before it gets
 /// here.
-const fn phase_of(state: SandboxState) -> PersistPhase {
+const fn phase_of(state: ComputerState) -> PersistPhase {
     match state {
-        SandboxState::Paused | SandboxState::Pausing => PersistPhase::Paused,
-        SandboxState::Stopped | SandboxState::Stopping => PersistPhase::Stopped,
+        ComputerState::Paused | ComputerState::Pausing => PersistPhase::Paused,
+        ComputerState::Stopped | ComputerState::Stopping => PersistPhase::Stopped,
         _ => PersistPhase::Failed,
     }
 }
@@ -1160,7 +1160,7 @@ pub(super) fn seed_computers(
             // Unreachable: the sweep runs before any create can claim an id,
             // and every record it reads is distinct.
             Err(error) => {
-                warn!(sandbox_id = %id, %error, "a recovered computer's id was already claimed");
+                warn!(computer_id = %id, %error, "a recovered computer's id was already claimed");
             }
         }
     }
@@ -1168,7 +1168,7 @@ pub(super) fn seed_computers(
 
 fn inactive_instance(
     record: SandboxRecord,
-    state: SandboxState,
+    state: ComputerState,
     data_dir: &Path,
 ) -> ComputerRuntime {
     let vm_dir = data_dir.join("sandboxes").join(&record.id);
@@ -1185,7 +1185,7 @@ fn inactive_instance(
     // The TTL cap survives restarts: a reloaded paused sandbox still
     // expires (the lifecycle monitor re-arms the timer after reconcile).
     instance.ttl_deadline = record.ttl_deadline;
-    if state == SandboxState::Paused {
+    if state == ComputerState::Paused {
         instance.pause_snapshot_id = record.pause_snapshot_id;
         instance.paused_at = record.paused_at;
     }
@@ -1204,7 +1204,7 @@ fn inactive_instance(
 /// restart's clock.
 fn adopted_instance(
     record: SandboxRecord,
-    state: SandboxState,
+    state: ComputerState,
     data_dir: &Path,
     adopted: AdoptedSandbox,
 ) -> ComputerRuntime {
@@ -1269,12 +1269,12 @@ async fn adopt_or_kill(
 
     match reclaim(network, cow_manager, record, phase, &handle).await {
         Ok(reclaimed) => {
-            info!(sandbox_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
+            info!(computer_id = %record.id, vm = %vm_record.id, "reclaimed a sandbox whose vm outlived its agent");
             Ok(Some(reclaimed))
         }
         Err(reason) => {
             info!(
-                sandbox_id = %record.id, vm = %vm_record.id, %reason,
+                computer_id = %record.id, vm = %vm_record.id, %reason,
                 "killing the orphaned vmm"
             );
             // A kill that fails leaves the VM alive and still pinning its dm
@@ -1863,7 +1863,7 @@ mod tests {
             assert_eq!(record.error.as_deref(), Some(AGENT_RESTART_ERROR));
 
             let instance = &inactive[id];
-            assert_eq!(instance.runtime.state, SandboxState::Failed);
+            assert_eq!(instance.runtime.state, ComputerState::Failed);
             assert_eq!(instance.runtime.error.as_deref(), Some(AGENT_RESTART_ERROR));
             assert_eq!(instance.runtime.record_generation, Some(record.generation));
             assert!(instance.runtime.prepared.is_none());
@@ -1871,8 +1871,8 @@ mod tests {
             assert!(instance.runtime.network.is_none());
         }
 
-        assert_eq!(inactive["stopped"].runtime.state, SandboxState::Stopped);
-        assert_eq!(inactive["failed"].runtime.state, SandboxState::Failed);
+        assert_eq!(inactive["stopped"].runtime.state, ComputerState::Stopped);
+        assert_eq!(inactive["failed"].runtime.state, ComputerState::Failed);
         assert_eq!(
             inactive["failed"].runtime.error.as_deref(),
             Some("original failure")
@@ -1907,7 +1907,7 @@ mod tests {
             .collect();
 
         let clean = &inactive["clean"].runtime;
-        assert_eq!(clean.state, SandboxState::Paused);
+        assert_eq!(clean.state, ComputerState::Paused);
         assert_eq!(clean.pause_snapshot_id.as_deref(), Some("snap"));
         assert!(clean.paused_at.is_some());
         assert_eq!(
@@ -1918,7 +1918,7 @@ mod tests {
         // An interrupted pause/resume never reached a durable Paused commit;
         // its resources were swept, so it degrades honestly.
         for id in ["mid-pause", "mid-resume"] {
-            assert_eq!(inactive[id].runtime.state, SandboxState::Failed, "{id}");
+            assert_eq!(inactive[id].runtime.state, ComputerState::Failed, "{id}");
             assert_eq!(
                 store.load(id).unwrap().unwrap().phase,
                 PersistPhase::Failed,
@@ -1957,7 +1957,7 @@ mod tests {
         assert!(parked_rootfs.exists());
         assert!(cow_file.exists());
         let napper = manager.snapshot(&"napper".to_owned()).unwrap();
-        assert_eq!(napper.state, SandboxState::Paused);
+        assert_eq!(napper.state, ComputerState::Paused);
         assert_eq!(napper.pause_snapshot_id.as_deref(), Some("snap"));
     }
 
@@ -2228,7 +2228,7 @@ mod tests {
         let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
         // `Ready`, not `Running`: the workload the previous process was
         // streaming did not survive it, and `Running` refuses the next `Run`.
-        assert_eq!(keeper.state, SandboxState::Ready);
+        assert_eq!(keeper.state, ComputerState::Ready);
         assert!(keeper.handle.is_some(), "the VM's handle came back");
         assert_eq!(
             keeper.lease.as_ref().map(|lease| lease.ip.to_string()),
@@ -2289,13 +2289,13 @@ mod tests {
         );
         assert_eq!(
             manager.snapshot(&"keeper".to_owned()).unwrap().state,
-            SandboxState::Ready
+            ComputerState::Ready
         );
         // Inspectable rather than fatal. `Unjournaled` would have refused a
         // live phase here, which is the abort the skip exists to avoid.
         assert_eq!(
             manager.snapshot(&"broken".to_owned()).unwrap().state,
-            SandboxState::Failed,
+            ComputerState::Failed,
             "the unreadable one is reported, not reconciled"
         );
         assert!(
@@ -2341,7 +2341,7 @@ mod tests {
         );
         assert_eq!(
             manager.snapshot(&legacy.to_owned()).unwrap().state,
-            SandboxState::Failed,
+            ComputerState::Failed,
             "the one it could not is reported, not reconciled"
         );
         assert!(
@@ -2774,7 +2774,7 @@ mod tests {
                 "{what}: the journal is cleared"
             );
             let keeper = manager.snapshot(&"keeper".to_owned()).unwrap();
-            assert_eq!(keeper.state, SandboxState::Failed, "{what}");
+            assert_eq!(keeper.state, ComputerState::Failed, "{what}");
             assert!(keeper.handle.is_none(), "{what}");
         }
     }

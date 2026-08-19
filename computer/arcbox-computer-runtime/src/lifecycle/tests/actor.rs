@@ -29,7 +29,7 @@ use crate::sandbox::reconcile::{SandboxStateRecord, write_state_record};
 use crate::sandbox::record::{SandboxProvisionOutcome, SandboxRecordStore};
 use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{
-    CheckpointInfo, ComputerSpec, IdleAction, LifecycleUpdate, SandboxEvent, SandboxState,
+    CheckpointInfo, ComputerEvent, ComputerSpec, ComputerState, IdleAction, LifecycleUpdate,
 };
 use crate::testkit::agent::FakeAgentFactory;
 
@@ -223,7 +223,7 @@ struct Harness {
     registered: Arc<AtomicBool>,
     runtime: crate::lifecycle::runtime::Runtime,
     snapshot: watch::Receiver<ComputerSnapshot>,
-    events: broadcast::Receiver<SandboxEvent>,
+    events: broadcast::Receiver<ComputerEvent>,
     script: Arc<Script>,
     actor: tokio::task::JoinHandle<()>,
     _timers: watch::Sender<bool>,
@@ -260,7 +260,7 @@ impl Harness {
         )));
         let (snapshot_tx, snapshot) = watch::channel(ComputerSnapshot::project(
             &runtime.lock().unwrap(),
-            SandboxState::Starting,
+            ComputerState::Starting,
             deadlines,
         ));
         let (timers, timers_enabled) = watch::channel(true);
@@ -335,11 +335,11 @@ impl Harness {
         })
         .ok()
         .await;
-        self.settled(SandboxState::Ready).await;
+        self.settled(ComputerState::Ready).await;
     }
 
     /// Waits for the snapshot to reach `state`.
-    async fn settled(&mut self, state: SandboxState) {
+    async fn settled(&mut self, state: ComputerState) {
         self.snapshot
             .wait_for(|snapshot| snapshot.state == state)
             .await
@@ -365,7 +365,7 @@ impl Harness {
     }
 
     /// The next event carrying `action`.
-    async fn next_event(&mut self, action: &str) -> SandboxEvent {
+    async fn next_event(&mut self, action: &str) -> ComputerEvent {
         loop {
             let event = self.events.recv().await.expect("the event bus stays open");
             if event.action == action {
@@ -592,7 +592,7 @@ async fn a_failure_keeps_its_crash_journal_when_the_release_fails() {
     harness.script.release_fails.store(true, Ordering::SeqCst);
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     harness.awaited("release").await;
     tokio::task::yield_now().await;
     assert!(
@@ -608,7 +608,7 @@ async fn a_failure_drops_its_crash_journal_once_the_release_is_done() {
     assert!(harness.has_journal());
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     while harness.has_journal() {
         tokio::task::yield_now().await;
     }
@@ -749,7 +749,7 @@ async fn a_stop_during_the_gates_own_cmd_is_still_deferred() {
         })
         .ok()
         .await;
-    harness.settled(SandboxState::Running).await;
+    harness.settled(ComputerState::Running).await;
     let stopped = harness.send(|reply| Command::Stop {
         budget: Duration::from_secs(30),
         reply,
@@ -855,7 +855,7 @@ async fn a_paused_computer_records_what_it_retained() {
     // is the very next thing a client does, and the effects that write those
     // fields run after the transition published the snapshot.
     let snapshot = harness.snapshot.borrow();
-    assert_eq!(snapshot.state, SandboxState::Paused);
+    assert_eq!(snapshot.state, ComputerState::Paused);
     assert_eq!(snapshot.pause_snapshot_id.as_deref(), Some("snap"));
     assert!(snapshot.paused_at.is_some());
 }
@@ -1146,7 +1146,7 @@ async fn a_refused_failure_write_still_releases_and_keeps_the_journal() {
     std::fs::create_dir(&record_path).unwrap();
 
     harness.commands.send(Command::VmExited).unwrap();
-    harness.settled(SandboxState::Failed).await;
+    harness.settled(ComputerState::Failed).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(

@@ -9,7 +9,7 @@ use crate::lifecycle::event::{Event, PauseReason, Provision, RestoreOrigin};
 use crate::lifecycle::machine::State;
 use crate::sandbox::record::PersistPhase;
 use crate::sandbox::workload::WorkloadClaim;
-use crate::sandbox::{IdleAction, SandboxState};
+use crate::sandbox::{ComputerState, IdleAction};
 
 #[test]
 fn a_cold_create_stages_boots_gates_and_only_then_announces_ready() {
@@ -21,7 +21,7 @@ fn a_cold_create_stages_boots_gates_and_only_then_announces_ready() {
         &mut context,
         &Event::Provision(Provision::Boot { warm: true }),
     );
-    assert_eq!(state.to_public(), SandboxState::Starting);
+    assert_eq!(state.to_public(), ComputerState::Starting);
     assert_eq!(
         effects,
         vec![
@@ -43,7 +43,7 @@ fn a_cold_create_stages_boots_gates_and_only_then_announces_ready() {
     // READY is withheld until the gate (warm publish, initial cmd, probe) is
     // through, and its durable commit refuses on an unconfirmed write.
     let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![
@@ -77,7 +77,7 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
     );
 
     let (state, effects) = step(&mut sm, &mut context, &Event::Restored);
-    assert_eq!(state.to_public(), SandboxState::Starting);
+    assert_eq!(state.to_public(), ComputerState::Starting);
     assert!(matches!(
         state,
         State::Gating {
@@ -104,7 +104,7 @@ fn a_restore_commits_ready_in_one_hop_before_its_gate() {
     // second write would put an fsync on the restore's hot path and could
     // refuse a computer that is already durably `Ready`.
     let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![
@@ -144,7 +144,7 @@ fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
     // A cmd-carrying boot reads `Running` from here on, exactly as the
     // instance does today — an Inspect during the gate cannot see `Ready`
     // and steal the slot.
-    assert_eq!(state.to_public(), SandboxState::Running);
+    assert_eq!(state.to_public(), ComputerState::Running);
     assert_eq!(effects, vec![Effect::Publish(Notify::Running)]);
 
     // A second initial claim is the same workload twice: refused, for the
@@ -175,7 +175,7 @@ fn the_boots_own_cmd_claims_the_slot_the_gate_reserved_for_it() {
     );
 
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadExited);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
@@ -207,7 +207,7 @@ fn a_workload_round_trip_cancels_and_re_arms_the_idle_timer() {
             claim: WorkloadClaim::Api,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Running);
+    assert_eq!(state.to_public(), ComputerState::Running);
     assert_eq!(
         effects,
         vec![
@@ -217,7 +217,7 @@ fn a_workload_round_trip_cancels_and_re_arms_the_idle_timer() {
     );
 
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadExited);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
@@ -234,7 +234,7 @@ fn a_pause_captures_releases_and_parks_at_paused() {
             reason: PauseReason::Requested,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Pausing);
+    assert_eq!(state.to_public(), ComputerState::Pausing);
     assert_eq!(
         effects,
         vec![
@@ -252,13 +252,13 @@ fn a_pause_captures_releases_and_parks_at_paused() {
             snapshot_id: "snap".to_owned(),
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Pausing);
+    assert_eq!(state.to_public(), ComputerState::Pausing);
     assert_eq!(effects, vec![release(ReleaseScope::KeepDisk)]);
 
     // Paused commits only once every runtime resource is gone, and the crash
     // journal is cleared only behind that confirmed write.
     let (state, effects) = step(&mut sm, &mut context, &Event::ReleasedForPause);
-    assert_eq!(state.to_public(), SandboxState::Paused);
+    assert_eq!(state.to_public(), ComputerState::Paused);
     assert_eq!(
         effects,
         vec![
@@ -281,7 +281,7 @@ fn a_recoverable_capture_failure_leaves_a_usable_computer() {
         },
     );
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![
@@ -305,7 +305,7 @@ fn a_frozen_guest_fails_the_computer_from_either_capture_path() {
         };
         step(&mut sm, &mut context, &event);
         let (state, effects) = step(&mut sm, &mut context, &Event::Frozen);
-        assert_eq!(state.to_public(), SandboxState::Failed, "pause={pause}");
+        assert_eq!(state.to_public(), ComputerState::Failed, "pause={pause}");
         assert_eq!(
             effects,
             vec![
@@ -324,7 +324,7 @@ fn a_frozen_guest_fails_the_computer_from_either_capture_path() {
 fn a_user_checkpoint_holds_ready_and_writes_no_record() {
     let (mut sm, mut context) = ready_machine();
     let (state, effects) = step(&mut sm, &mut context, &Event::Checkpoint);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![
@@ -355,7 +355,7 @@ fn a_user_checkpoint_holds_ready_and_writes_no_record() {
     // as `checkpoint_sandbox` does today — with the idle window restarted,
     // since the expiry swallowed above consumed a one-shot timer.
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(effects, vec![Effect::ArmTimer(Timer::Idle)]);
 }
 
@@ -365,7 +365,7 @@ fn resume_reverts_to_paused_when_the_restore_unwinds() {
         phase: PersistPhase::Paused,
     }]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Resume);
-    assert_eq!(state.to_public(), SandboxState::Starting);
+    assert_eq!(state.to_public(), ComputerState::Starting);
     assert_eq!(
         effects,
         vec![
@@ -378,7 +378,7 @@ fn resume_reverts_to_paused_when_the_restore_unwinds() {
     );
 
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
-    assert_eq!(state.to_public(), SandboxState::Paused);
+    assert_eq!(state.to_public(), ComputerState::Paused);
     assert_eq!(
         effects,
         vec![
@@ -390,7 +390,7 @@ fn resume_reverts_to_paused_when_the_restore_unwinds() {
     // ...and a second attempt still resumes to Ready.
     step(&mut sm, &mut context, &Event::Resume);
     let (state, effects) = step(&mut sm, &mut context, &Event::Restored);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![
@@ -415,7 +415,7 @@ fn a_resume_that_could_not_unwind_fails_instead_of_parking_at_paused() {
         Event::Resume,
     ]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Stranded);
-    assert_eq!(state.to_public(), SandboxState::Failed);
+    assert_eq!(state.to_public(), ComputerState::Failed);
     assert_eq!(
         effects,
         vec![
@@ -439,7 +439,7 @@ fn a_stop_drains_through_stopping_and_clears_the_journal() {
             budget_ms: BUDGET_MS,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert_eq!(state.to_public(), ComputerState::Stopping);
     assert_eq!(
         effects,
         vec![
@@ -455,11 +455,11 @@ fn a_stop_drains_through_stopping_and_clears_the_journal() {
 
     // The VM exiting is what we asked for, not a failure.
     let (state, effects) = step(&mut sm, &mut context, &Event::VmExited);
-    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert_eq!(state.to_public(), ComputerState::Stopping);
     assert!(effects.is_empty());
 
     let (state, effects) = step(&mut sm, &mut context, &Event::StopDone);
-    assert_eq!(state.to_public(), SandboxState::Stopped);
+    assert_eq!(state.to_public(), ComputerState::Stopped);
     assert_eq!(
         effects,
         vec![
@@ -535,10 +535,10 @@ fn a_released_claim_reopens_the_computer_and_balances_its_running() {
             claim: WorkloadClaim::Api,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Running);
+    assert_eq!(state.to_public(), ComputerState::Running);
 
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert_eq!(
         effects,
         vec![Effect::Publish(Notify::Idle), Effect::ArmTimer(Timer::Idle)]
@@ -554,12 +554,12 @@ fn a_released_claim_reopens_the_computer_and_balances_its_running() {
             claim: WorkloadClaim::Initial,
         },
     ]);
-    assert_eq!(sm.state().to_public(), SandboxState::Running);
+    assert_eq!(sm.state().to_public(), ComputerState::Running);
     let (state, effects) = step(&mut sm, &mut context, &Event::WorkloadReleased);
-    assert_eq!(state.to_public(), SandboxState::Starting);
+    assert_eq!(state.to_public(), ComputerState::Starting);
     assert_eq!(effects, vec![Effect::Publish(Notify::Idle)]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Gated);
-    assert_eq!(state.to_public(), SandboxState::Ready);
+    assert_eq!(state.to_public(), ComputerState::Ready);
     assert!(effects.contains(&Effect::ArmTimer(Timer::Idle)));
 }
 
@@ -598,7 +598,7 @@ fn only_a_running_computer_drains_before_its_guest_is_shut_down() {
             budget_ms: BUDGET_MS,
         },
     );
-    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert_eq!(state.to_public(), ComputerState::Stopping);
     assert!(effects.contains(&Effect::SpawnStop {
         budget_ms: BUDGET_MS,
         drain: true,
@@ -618,7 +618,7 @@ fn a_gate_failure_unwinds_the_way_its_own_half_of_the_transaction_can() {
         Event::AgentReady,
     ]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
-    assert_eq!(state.to_public(), SandboxState::Failed);
+    assert_eq!(state.to_public(), ComputerState::Failed);
     assert!(effects.contains(&persist(PersistPhase::Failed, Durability::GateJournal)));
 
     let (mut sm, mut context) = reach(&[
@@ -628,7 +628,7 @@ fn a_gate_failure_unwinds_the_way_its_own_half_of_the_transaction_can() {
         Event::Restored,
     ]);
     let (state, effects) = step(&mut sm, &mut context, &Event::Failure);
-    assert_eq!(state.to_public(), SandboxState::Stopping);
+    assert_eq!(state.to_public(), ComputerState::Stopping);
     assert!(matches!(state, State::Removing {}));
     assert!(effects.contains(&persist(PersistPhase::Removing, Durability::Warn)));
     assert!(effects.contains(&release(ReleaseScope::Full)));

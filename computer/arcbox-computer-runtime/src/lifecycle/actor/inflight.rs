@@ -96,7 +96,7 @@ impl ComputerActor {
             // finishes the job. Carrying on would delete both while whatever
             // the panicking task never transferred was still out there.
             Ok(Err(error)) if !error.is_cancelled() => {
-                error!(sandbox_id = %self.id, %error, "a computer sub-task panicked");
+                error!(computer_id = %self.id, %error, "a computer sub-task panicked");
                 self.fail_every_waiter(ComputerError::Process(format!(
                     "computer {} sub-task panicked: {error}",
                     self.id
@@ -116,7 +116,7 @@ impl ComputerActor {
     /// the teardown waits on.
     fn stall(&mut self, task: Preemptible) -> Flow {
         warn!(
-            sandbox_id = %self.id,
+            computer_id = %self.id,
             retry_millis = self.retry_backoff.as_millis(),
             "the computer's in-flight work still owns resources; retrying the teardown"
         );
@@ -196,7 +196,7 @@ impl ComputerActor {
     pub(super) async fn on_completion(&mut self, machine: &mut Machine, completion: Completion) {
         if completion.epoch != self.epoch {
             debug!(
-                sandbox_id = %self.id,
+                computer_id = %self.id,
                 stale = completion.epoch,
                 current = self.epoch,
                 "dropping a superseded sub-task's completion"
@@ -253,7 +253,7 @@ impl ComputerActor {
             Report::Released(ReleaseScope::Runtime) => None,
             Report::Stopped => Some(Event::StopDone),
             Report::Failed(failure) => {
-                error!(sandbox_id = %self.id, error = failure.message(), "computer sub-task failed");
+                error!(computer_id = %self.id, error = failure.message(), "computer sub-task failed");
                 self.error = Some(failure.message());
                 let event = failure.event();
                 let error = failure.into_error();
@@ -330,7 +330,7 @@ impl ComputerActor {
         }
         self.pending_stop = None;
         match self.public() {
-            SandboxState::Ready | SandboxState::Running => {
+            ComputerState::Ready | ComputerState::Running => {
                 let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
                 self.dispatch(machine, Event::Stop { budget_ms }).await;
             }

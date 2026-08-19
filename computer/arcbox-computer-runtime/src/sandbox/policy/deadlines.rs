@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::sandbox::SandboxState;
+use crate::sandbox::ComputerState;
 
 /// The TTL deadline to arm for a sandbox in `state`, or `None` when its
 /// timer belongs cancelled.
@@ -22,9 +22,9 @@ use crate::sandbox::SandboxState;
 /// resync would re-arm one — recovery restores `ttl_deadline` for every
 /// record regardless of state — so whether a stopped sandbox's record gets
 /// reaped would depend on whether the agent happened to bounce.
-pub fn ttl_due(state: SandboxState, deadline: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+pub fn ttl_due(state: ComputerState, deadline: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match state {
-        SandboxState::Stopped | SandboxState::Failed => None,
+        ComputerState::Stopped | ComputerState::Failed => None,
         _ => deadline,
     }
 }
@@ -34,8 +34,8 @@ pub fn ttl_due(state: SandboxState, deadline: Option<DateTime<Utc>>) -> Option<D
 ///
 /// Idle detection only makes sense while a sandbox is `Ready`: every other
 /// state either has a workload running or is on its way out.
-pub fn idle_due(state: SandboxState, timeout_seconds: u32) -> Option<Duration> {
-    (state == SandboxState::Ready && timeout_seconds != 0)
+pub fn idle_due(state: ComputerState, timeout_seconds: u32) -> Option<Duration> {
+    (state == ComputerState::Ready && timeout_seconds != 0)
         .then(|| Duration::from_secs(u64::from(timeout_seconds)))
 }
 
@@ -48,15 +48,15 @@ pub fn remaining(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
 mod tests {
     use super::*;
 
-    const ALL_STATES: [SandboxState; 8] = [
-        SandboxState::Starting,
-        SandboxState::Ready,
-        SandboxState::Running,
-        SandboxState::Stopping,
-        SandboxState::Stopped,
-        SandboxState::Failed,
-        SandboxState::Pausing,
-        SandboxState::Paused,
+    const ALL_STATES: [ComputerState; 8] = [
+        ComputerState::Starting,
+        ComputerState::Ready,
+        ComputerState::Running,
+        ComputerState::Stopping,
+        ComputerState::Stopped,
+        ComputerState::Failed,
+        ComputerState::Pausing,
+        ComputerState::Paused,
     ];
 
     fn at(seconds: i64) -> DateTime<Utc> {
@@ -67,7 +67,7 @@ mod tests {
     fn only_a_terminal_sandbox_drops_its_ttl() {
         let deadline = at(1_700_000_000);
         for state in ALL_STATES {
-            let terminal = matches!(state, SandboxState::Stopped | SandboxState::Failed);
+            let terminal = matches!(state, ComputerState::Stopped | ComputerState::Failed);
             // A paused sandbox still expires: the TTL caps total lifetime
             // regardless of activity.
             assert_eq!(
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn only_a_ready_sandbox_with_a_timeout_goes_idle() {
         for state in ALL_STATES {
-            let ready = state == SandboxState::Ready;
+            let ready = state == ComputerState::Ready;
             assert_eq!(
                 idle_due(state, 30),
                 ready.then(|| Duration::from_secs(30)),

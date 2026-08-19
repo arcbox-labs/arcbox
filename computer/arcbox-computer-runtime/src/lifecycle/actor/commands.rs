@@ -45,7 +45,7 @@ impl ComputerActor {
                 } else {
                     // Pausing a paused computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        SandboxState::Paused => Ok(()),
+                        ComputerState::Paused => Ok(()),
                         _ => Err(self.wrong_state("Ready")),
                     });
                 }
@@ -57,7 +57,7 @@ impl ComputerActor {
                 } else {
                     // Resuming a live computer is a no-op.
                     let _ = reply.send(match self.public() {
-                        SandboxState::Ready | SandboxState::Running => Ok(()),
+                        ComputerState::Ready | ComputerState::Running => Ok(()),
                         _ => Err(self.wrong_state("Paused")),
                     });
                 }
@@ -78,13 +78,13 @@ impl ComputerActor {
                     return;
                 }
                 match self.public() {
-                    SandboxState::Stopping => self.park(Answer::Stopped, reply),
+                    ComputerState::Stopping => self.park(Answer::Stopped, reply),
                     // `stop_sandbox`'s retry. A `Stopped` write that was
                     // visible but not confirmed kept the crash journal, and
                     // a second stop is the only thing that finishes it —
                     // answering `Ok` would leave a journal naming resources
                     // that are already gone for the next startup sweep.
-                    SandboxState::Stopped => {
+                    ComputerState::Stopped => {
                         let _ = reply.send(self.finish_stop());
                     }
                     _ => {
@@ -165,7 +165,7 @@ impl ComputerActor {
                 // it would persist to is about to be a tombstone.
                 if matches!(
                     self.public(),
-                    SandboxState::Stopping | SandboxState::Stopped | SandboxState::Failed
+                    ComputerState::Stopping | ComputerState::Stopped | ComputerState::Failed
                 ) {
                     let _ = reply.send(Err(
                         self.wrong_state("a live computer (not stopping, stopped, or failed)")

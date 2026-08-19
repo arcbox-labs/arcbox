@@ -38,7 +38,7 @@ pub enum SandboxPhase {
 }
 
 /// The durable phase under the name R3's lifecycle HSM uses for it: what a
-/// crash-restart reads back, as opposed to the in-memory `SandboxState` a
+/// crash-restart reads back, as opposed to the in-memory `ComputerState` a
 /// caller sees.
 ///
 /// The module boundary is where the two names meet: inside `record` the

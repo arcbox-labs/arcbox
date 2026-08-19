@@ -164,7 +164,7 @@ impl SandboxRecordStore {
         let record = SandboxRecord::new(id, request_key, effective_spec);
         if let Some(error) = self.save_unlocked(&record)? {
             warn!(
-                sandbox_id = id,
+                computer_id = id,
                 error, "provision intent is visible but directory fsync failed"
             );
         }

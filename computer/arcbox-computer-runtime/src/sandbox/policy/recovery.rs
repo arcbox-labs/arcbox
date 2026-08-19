@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use crate::sandbox::SandboxState;
+use crate::sandbox::ComputerState;
 use crate::sandbox::record::PersistPhase;
 
 /// What the orphan sweep established about one sandbox's runtime resources
@@ -38,7 +38,7 @@ pub enum RecoveryAction {
     Fail,
     /// Already inactive before the restart: reconstructed in this state,
     /// without runtime handles.
-    Reinstate(SandboxState),
+    Reinstate(ComputerState),
     /// An interrupted removal: finished as a durable tombstone.
     FinishRemove,
     /// A live phase whose runtime resources were never journaled. The sweep
@@ -74,7 +74,7 @@ pub fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
         // workload the previous process was streaming did not survive it,
         // and `Running` is what refuses the next `Run`.
         (PersistPhase::Ready, JournalEvidence::Adopted) => {
-            RecoveryAction::Reinstate(SandboxState::Ready)
+            RecoveryAction::Reinstate(ComputerState::Ready)
         }
         // The sweep adopts a durably `Ready` sandbox and nothing else
         // (`reconcile::adopt_or_kill`), so this pairing is unreachable by
@@ -103,9 +103,9 @@ pub fn plan(phase: PersistPhase, evidence: JournalEvidence) -> RecoveryAction {
         // the sweep preserves durably Paused retained state (clearing any
         // stale journal), so a paused sandbox always survives a restart
         // resumable.
-        (PersistPhase::Paused, _) => RecoveryAction::Reinstate(SandboxState::Paused),
-        (PersistPhase::Stopped, _) => RecoveryAction::Reinstate(SandboxState::Stopped),
-        (PersistPhase::Failed, _) => RecoveryAction::Reinstate(SandboxState::Failed),
+        (PersistPhase::Paused, _) => RecoveryAction::Reinstate(ComputerState::Paused),
+        (PersistPhase::Stopped, _) => RecoveryAction::Reinstate(ComputerState::Stopped),
+        (PersistPhase::Failed, _) => RecoveryAction::Reinstate(ComputerState::Failed),
         (PersistPhase::Removing, _) => RecoveryAction::FinishRemove,
     }
 }
@@ -167,7 +167,7 @@ mod tests {
                 PersistPhase::Ready,
                 RecoveryAction::Fail,
                 RecoveryAction::RefuseUnjournaled,
-                RecoveryAction::Reinstate(SandboxState::Ready),
+                RecoveryAction::Reinstate(ComputerState::Ready),
             ),
             (
                 PersistPhase::Stopping,
@@ -177,14 +177,14 @@ mod tests {
             ),
             (
                 PersistPhase::Stopped,
-                RecoveryAction::Reinstate(SandboxState::Stopped),
-                RecoveryAction::Reinstate(SandboxState::Stopped),
+                RecoveryAction::Reinstate(ComputerState::Stopped),
+                RecoveryAction::Reinstate(ComputerState::Stopped),
                 RecoveryAction::RefuseAdopted,
             ),
             (
                 PersistPhase::Failed,
-                RecoveryAction::Reinstate(SandboxState::Failed),
-                RecoveryAction::Reinstate(SandboxState::Failed),
+                RecoveryAction::Reinstate(ComputerState::Failed),
+                RecoveryAction::Reinstate(ComputerState::Failed),
                 RecoveryAction::RefuseAdopted,
             ),
             (
@@ -201,8 +201,8 @@ mod tests {
             ),
             (
                 PersistPhase::Paused,
-                RecoveryAction::Reinstate(SandboxState::Paused),
-                RecoveryAction::Reinstate(SandboxState::Paused),
+                RecoveryAction::Reinstate(ComputerState::Paused),
+                RecoveryAction::Reinstate(ComputerState::Paused),
                 RecoveryAction::RefuseAdopted,
             ),
             (

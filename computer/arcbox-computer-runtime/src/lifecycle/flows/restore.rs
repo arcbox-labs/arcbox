@@ -106,7 +106,7 @@ impl ComputerFlows {
                 .map(|record| record.with_pool_slot(pool_slot_id.as_deref()))
                 .and_then(|record| write_state_record(&vm_dir, &record));
                 if let Err(error) = journal {
-                    warn!(sandbox_id = %self.id, %error, "the failed restore's journal was not written");
+                    warn!(computer_id = %self.id, %error, "the failed restore's journal was not written");
                 }
                 let mut computer = self.computer.lock().unwrap();
                 computer.prepared = failure.prepared;
@@ -142,7 +142,7 @@ impl ComputerFlows {
         // is not restore latency.
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         info!(
-            sandbox_id = %self.id,
+            computer_id = %self.id,
             snapshot_id = %snapshot_id,
             pool_hit,
             warm_create = warm_create(origin),
@@ -241,14 +241,14 @@ impl ComputerFlows {
         // frees the memory-sized image.
         if let Err(error) = services.snapshots.delete_by_id(&snapshot_id) {
             warn!(
-                sandbox_id = %self.id,
+                computer_id = %self.id,
                 snapshot_id = %snapshot_id,
                 %error,
                 "resumed, but deleting the pause checkpoint failed"
             );
         }
         info!(
-            sandbox_id = %self.id,
+            computer_id = %self.id,
             total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "computer resumed from pause checkpoint"
         );

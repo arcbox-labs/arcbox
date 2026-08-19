@@ -64,7 +64,7 @@ use crate::sandbox::record::{
 use crate::sandbox::types::action;
 use crate::sandbox::workload::WorkloadClaim;
 use crate::sandbox::{
-    CheckpointInfo, ComputerId, IdleAction, LifecycleUpdate, SandboxEvent, SandboxState,
+    CheckpointInfo, ComputerEvent, ComputerId, ComputerState, IdleAction, LifecycleUpdate,
 };
 
 mod commands;
@@ -227,7 +227,7 @@ pub struct Deadlines {
 /// for it.
 #[derive(Clone)]
 pub struct ComputerSnapshot {
-    pub state: SandboxState,
+    pub state: ComputerState,
     pub agent: Option<Arc<dyn GuestAgent>>,
     /// The running VM, for the graceful hand-over a process exit does.
     pub handle: Option<Arc<dyn VmHandle>>,
@@ -251,7 +251,7 @@ impl ComputerSnapshot {
     ///
     /// Everything but the agent, which the actor publishes and withdraws
     /// with the guest's reachability rather than reading it off the runtime.
-    pub fn project(runtime: &ComputerRuntime, state: SandboxState, deadlines: Deadlines) -> Self {
+    pub fn project(runtime: &ComputerRuntime, state: ComputerState, deadlines: Deadlines) -> Self {
         Self {
             state,
             agent: None,
@@ -370,7 +370,7 @@ pub struct ComputerActor {
     generation: Option<Uuid>,
     vm_dir: PathBuf,
     records: Arc<SandboxRecordStore>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    events_tx: broadcast::Sender<ComputerEvent>,
     tasks: Arc<dyn ComputerTasks>,
     seeded: Seeded,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -460,7 +460,7 @@ pub struct ComputerSeed {
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,
     pub records: Arc<SandboxRecordStore>,
-    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub events_tx: broadcast::Sender<ComputerEvent>,
     pub tasks: Arc<dyn ComputerTasks>,
     pub deadlines: Deadlines,
     pub timers_enabled: watch::Receiver<bool>,
@@ -633,7 +633,7 @@ impl ComputerActor {
 
         if before.to_public() != after.to_public() {
             debug!(
-                sandbox_id = %self.id,
+                computer_id = %self.id,
                 from = %before.to_public(),
                 to = %after.to_public(),
                 "computer lifecycle transition"

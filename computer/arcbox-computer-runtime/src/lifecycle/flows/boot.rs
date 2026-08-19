@@ -20,7 +20,7 @@ use crate::lifecycle::tasks::{TaskFailure, TaskResult};
 use crate::sandbox::boot::run_ready_probe;
 use crate::sandbox::warm::{WarmPublishTicket, publish_after_boot};
 use crate::sandbox::workload::{WorkloadClaim, WorkloadSlot, start_run_workload};
-use crate::sandbox::{ComputerId, ComputerSpec, SandboxState};
+use crate::sandbox::{ComputerId, ComputerSpec, ComputerState};
 
 impl ComputerFlows {
     pub(super) async fn boot_vm(
@@ -115,7 +115,7 @@ impl ComputerFlows {
                 // reservation the boot's own `cmd` is owed — so the
                 // checkpoint's precondition is what this pipeline set, not
                 // what an API caller would see.
-                SandboxState::Starting,
+                ComputerState::Starting,
             )
             .await
             .map_err(TaskFailure::frozen)?;
@@ -167,20 +167,20 @@ impl ComputerFlows {
         let slot = match self.workload_slot() {
             Ok(slot) => slot,
             Err(error) => {
-                warn!(sandbox_id = %self.id, %error, "the initial cmd found no computer to claim");
+                warn!(computer_id = %self.id, %error, "the initial cmd found no computer to claim");
                 return false;
             }
         };
         match start_run_workload(agent, start, slot, WorkloadClaim::Initial).await {
             Ok(mut rx) => {
-                info!(sandbox_id = %self.id, "initial cmd started");
+                info!(computer_id = %self.id, "initial cmd started");
                 // Nothing consumes an initial cmd's output; drain it so the
                 // exit chunk still reaches the watcher.
                 tokio::spawn(async move { while rx.recv().await.is_some() {} });
                 true
             }
             Err(error) => {
-                warn!(sandbox_id = %self.id, %error, "initial cmd failed to start");
+                warn!(computer_id = %self.id, %error, "initial cmd failed to start");
                 false
             }
         }

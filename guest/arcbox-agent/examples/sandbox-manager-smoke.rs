@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use arcbox_computer_runtime::{
-    ComputerSpec, RestoreComputerSpec, SandboxEvent, SandboxManager, SandboxState,
+    ComputerEvent, ComputerSpec, ComputerState, RestoreComputerSpec, SandboxManager,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -403,13 +403,13 @@ async fn run_cmd(
 async fn wait_for_ready(
     manager: &SandboxManager,
     id: &str,
-    events: &mut broadcast::Receiver<SandboxEvent>,
+    events: &mut broadcast::Receiver<ComputerEvent>,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
     if let Ok(info) = manager.inspect_sandbox(&id.to_string()) {
         match info.state {
-            SandboxState::Ready => return Ok(()),
-            SandboxState::Failed => bail!(
+            ComputerState::Ready => return Ok(()),
+            ComputerState::Failed => bail!(
                 "sandbox {id} failed: {}",
                 info.error.unwrap_or_else(|| "unknown".into())
             ),
@@ -421,8 +421,8 @@ async fn wait_for_ready(
     timeout(std::time::Duration::from_secs(timeout_secs), async {
         loop {
             match events.recv().await {
-                Ok(ev) if ev.sandbox_id == id && ev.action == "ready" => return Ok(()),
-                Ok(ev) if ev.sandbox_id == id && ev.action == "failed" => {
+                Ok(ev) if ev.computer_id == id && ev.action == "ready" => return Ok(()),
+                Ok(ev) if ev.computer_id == id && ev.action == "failed" => {
                     let err = ev
                         .attributes
                         .get("error")

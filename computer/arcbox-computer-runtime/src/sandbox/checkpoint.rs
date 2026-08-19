@@ -48,7 +48,7 @@ impl SandboxManager {
     /// Checkpoint a `Ready` sandbox into the snapshot catalog.
     pub async fn checkpoint_sandbox(
         &self,
-        sandbox_id: &ComputerId,
+        computer_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
@@ -64,7 +64,7 @@ impl SandboxManager {
         // The warm-create cache (CORE-77) trusts its label as the lookup
         // key; a caller must not be able to plant one.
         super::warm::reject_reserved_labels(&labels)?;
-        self.capture_checkpoint(sandbox_id, name, labels).await
+        self.capture_checkpoint(computer_id, name, labels).await
     }
 
     /// [`Self::checkpoint_sandbox`] without the reserved-name and
@@ -76,12 +76,12 @@ impl SandboxManager {
     /// exactly what the label guard refuses.
     pub(super) async fn capture_checkpoint(
         &self,
-        sandbox_id: &ComputerId,
+        computer_id: &ComputerId,
         name: String,
         labels: HashMap<String, String>,
     ) -> Result<CheckpointInfo> {
-        self.mailbox(sandbox_id)?
-            .ask(sandbox_id, |reply| Command::Checkpoint {
+        self.mailbox(computer_id)?
+            .ask(computer_id, |reply| Command::Checkpoint {
                 spec: CaptureSpec { name, labels },
                 reply,
             })
@@ -96,7 +96,7 @@ impl SandboxManager {
     ///
     /// The restored sandbox starts in `Ready` state immediately.
     ///
-    /// Returns `(sandbox_id, ip_address)`.
+    /// Returns `(computer_id, ip_address)`.
     pub async fn restore_sandbox(&self, spec: RestoreComputerSpec) -> Result<(ComputerId, String)> {
         self.restore_sandbox_keyed(spec, &Uuid::new_v4().to_string())
             .await
@@ -374,8 +374,8 @@ impl SandboxManager {
     /// user-owned snapshots, and deleting one would strand a paused sandbox.
     /// Template-owned snapshots (CORE-107) are hidden for the same reason —
     /// they surface via `TemplateService.Get/List`, not as user checkpoints.
-    pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
-        let infos = match sandbox_id {
+    pub fn list_checkpoints(&self, computer_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
+        let infos = match computer_id {
             Some(sid) => self.snapshots.list(sid)?,
             None => self.snapshots.list_all()?,
         };
@@ -388,7 +388,7 @@ impl SandboxManager {
             })
             .map(|s| CheckpointSummary {
                 id: s.id,
-                sandbox_id: s.vm_id,
+                computer_id: s.vm_id,
                 name: s.name.unwrap_or_default(),
                 labels: s.labels,
                 snapshot_dir: s

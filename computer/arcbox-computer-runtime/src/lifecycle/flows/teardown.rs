@@ -12,7 +12,7 @@ use crate::lifecycle::tasks::pause::release_for_pause;
 use crate::lifecycle::tasks::release::{release_everything, release_runtime_resources};
 use crate::lifecycle::tasks::{CaptureSpec, Drain, TaskFailure, TaskResult};
 use crate::sandbox::pause::PAUSE_SNAPSHOT_NAME;
-use crate::sandbox::{CheckpointInfo, SandboxState};
+use crate::sandbox::{CheckpointInfo, ComputerState};
 
 /// How often a stop looks for the workload it is draining to finish.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
@@ -33,13 +33,13 @@ impl ComputerFlows {
             Some(spec) => CheckpointRequest {
                 name: spec.name,
                 labels: spec.labels,
-                expected_state: SandboxState::Ready,
+                expected_state: ComputerState::Ready,
                 resume_after: !hold,
             },
             None => CheckpointRequest {
                 name: PAUSE_SNAPSHOT_NAME.to_owned(),
                 labels: std::collections::HashMap::new(),
-                expected_state: SandboxState::Pausing,
+                expected_state: ComputerState::Pausing,
                 resume_after: !hold,
             },
         };
@@ -99,7 +99,7 @@ impl ComputerFlows {
         // area its files were staged into, then TAP/IP and the CoW device;
         // the record itself stays inspectable until Remove.
         self.release_scope(ReleaseScope::Runtime).await?;
-        info!(sandbox_id = %self.id, "computer stopped");
+        info!(computer_id = %self.id, "computer stopped");
         Ok(())
     }
 

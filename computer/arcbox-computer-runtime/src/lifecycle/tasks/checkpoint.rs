@@ -21,7 +21,7 @@ use tracing::info;
 use crate::error::{ComputerError, Result};
 use crate::lifecycle::runtime::ComputerRuntime;
 use crate::sandbox::policy::settle::{self, Capture, GuestHold, Settlement};
-use crate::sandbox::{CheckpointInfo, ComputerId, SandboxState};
+use crate::sandbox::{CheckpointInfo, ComputerId, ComputerState};
 use crate::snapshot::{SnapshotCatalog, SnapshotDraft};
 
 /// What a single [`checkpoint_impl`] call should capture, and how it should
@@ -34,7 +34,7 @@ pub struct CheckpointRequest {
     /// State the instance must be in. The Checkpoint RPC and the warm-create
     /// publisher require `Ready`; pause has already claimed the instance and
     /// moved it to `Pausing` (CORE-21).
-    pub expected_state: SandboxState,
+    pub expected_state: ComputerState,
     /// Resume the guest once the snapshot files are written.
     ///
     /// False only for pause, whose whole point is that the guest must never
@@ -81,13 +81,13 @@ struct CheckpointSource {
 
 fn checkpoint_source(
     computer: &Arc<Mutex<ComputerRuntime>>,
-    sandbox_id: &ComputerId,
-    expected_state: SandboxState,
+    computer_id: &ComputerId,
+    expected_state: ComputerState,
 ) -> Result<CheckpointSource> {
     let inst = computer.lock().unwrap();
     if inst.state != expected_state {
         return Err(ComputerError::WrongState {
-            id: sandbox_id.clone(),
+            id: computer_id.clone(),
             expected: expected_state.to_string(),
             actual: inst.state.to_string(),
         });
@@ -96,7 +96,7 @@ fn checkpoint_source(
         .handle
         .clone()
         .ok_or_else(|| ComputerError::WrongState {
-            id: sandbox_id.clone(),
+            id: computer_id.clone(),
             expected: format!("{expected_state} (VM handle available)"),
             actual: inst.state.to_string(),
         })?;
@@ -124,14 +124,14 @@ fn checkpoint_source(
 pub async fn checkpoint_impl(
     computer: &Arc<Mutex<ComputerRuntime>>,
     snapshots: &SnapshotCatalog,
-    sandbox_id: &ComputerId,
+    computer_id: &ComputerId,
     request: CheckpointRequest,
 ) -> std::result::Result<CheckpointInfo, CheckpointFailure> {
     let resume_after = request.resume_after;
-    let source = checkpoint_source(computer, sandbox_id, request.expected_state)
+    let source = checkpoint_source(computer, computer_id, request.expected_state)
         .map_err(CheckpointFailure::Recoverable)?;
     let handle = Arc::clone(&source.handle);
-    let outcome = capture(snapshots, sandbox_id, source, request).await;
+    let outcome = capture(snapshots, computer_id, source, request).await;
     let settlement = settle::settlement(
         handle.state(),
         if resume_after {
@@ -149,7 +149,7 @@ pub async fn checkpoint_impl(
         (Ok(info), Settlement::AsRequested) => Ok(info),
         (Ok(info), Settlement::Frozen) => {
             Err(CheckpointFailure::Frozen(ComputerError::Process(format!(
-                "sandbox {sandbox_id} stayed frozen after checkpoint {}: the driver could not \
+                "sandbox {computer_id} stayed frozen after checkpoint {}: the driver could not \
                  resume the guest",
                 info.snapshot_id
             ))))
@@ -163,7 +163,7 @@ pub async fn checkpoint_impl(
 /// commit to the catalog.
 async fn capture(
     snapshots: &SnapshotCatalog,
-    sandbox_id: &ComputerId,
+    computer_id: &ComputerId,
     source: CheckpointSource,
     request: CheckpointRequest,
 ) -> Result<CheckpointInfo> {
@@ -178,7 +178,7 @@ async fn capture(
     // the checkpoint recorded and only a per-VM chroot makes those private.
     let checkpoint = source.handle.checkpoint().ok_or_else(|| {
         ComputerError::FailedPrecondition(format!(
-            "sandbox {sandbox_id} cannot be checkpointed: checkpoints require jailer \
+            "sandbox {computer_id} cannot be checkpointed: checkpoints require jailer \
              isolation, and this VM runs without it"
         ))
     })?;
@@ -186,7 +186,7 @@ async fn capture(
     // Staging directory outside the catalog: the snapshot becomes visible
     // only on commit, and dropping `pending` on any error below takes the
     // directory and whatever partial vmstate/mem it holds with it.
-    let pending = snapshots.begin(sandbox_id)?;
+    let pending = snapshots.begin(computer_id)?;
 
     // The driver owns the freeze: it pauses the guest, writes the capture
     // (into the jail and out to the staging dir), and resumes — or, for
@@ -228,7 +228,7 @@ async fn capture(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    info!(sandbox_id, snapshot_id = %meta.id, "sandbox checkpointed");
+    info!(computer_id, snapshot_id = %meta.id, "sandbox checkpointed");
     Ok(CheckpointInfo {
         snapshot_id: meta.id,
         snapshot_dir: snap_dir_path,

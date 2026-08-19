@@ -46,8 +46,8 @@ use std::time::Duration;
 use arcbox_agent::config::{AdapterConfig, GuestConfig};
 use arcbox_agent::sandbox::{block_tools, node_environment};
 use arcbox_computer_runtime::{
-    ComputerNetworkSpec, ComputerSpec, DefaultVmConfig, FirecrackerConfig, GrpcConfig,
-    NetworkConfig, RuntimeConfig, SandboxEvent, SandboxManager, SandboxState,
+    ComputerEvent, ComputerNetworkSpec, ComputerSpec, ComputerState, DefaultVmConfig,
+    FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxManager,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,14 +136,14 @@ async fn finalize_startup_cleanup(mgr: &SandboxManager) {
 /// or until a `"failed"` event for `id` is received, or a 30-second timeout
 /// expires.  Returns `true` on success.
 async fn wait_for_event(
-    rx: &mut tokio::sync::broadcast::Receiver<SandboxEvent>,
+    rx: &mut tokio::sync::broadcast::Receiver<ComputerEvent>,
     id: &str,
     action: &str,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Ok(ev)) if ev.sandbox_id == id => {
+            Ok(Ok(ev)) if ev.computer_id == id => {
                 if ev.action == action {
                     return true;
                 }
@@ -188,11 +188,11 @@ async fn e2e_sandbox_basic_lifecycle() {
     );
 
     let info = mgr.inspect_sandbox(&id).unwrap();
-    assert_eq!(info.state, SandboxState::Ready);
+    assert_eq!(info.state, ComputerState::Ready);
 
     mgr.stop_sandbox(&id, 5).await.unwrap();
     let info = mgr.inspect_sandbox(&id).unwrap();
-    assert_eq!(info.state, SandboxState::Stopped);
+    assert_eq!(info.state, ComputerState::Stopped);
 
     mgr.remove_sandbox(&id, true).await.unwrap();
     assert!(
@@ -490,7 +490,7 @@ async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
     let info = mgr.inspect_sandbox(&id).unwrap();
     assert_eq!(
         info.state,
-        SandboxState::Ready,
+        ComputerState::Ready,
         "the sandbox is usable again, not failed"
     );
     assert_eq!(

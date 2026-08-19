@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::agent::ExitStatus;
-use crate::sandbox::{ComputerId, ComputerSpec, SandboxState};
+use crate::sandbox::{ComputerId, ComputerSpec, ComputerState};
 use crate::snapshot_cow::CowHandle;
 
 /// A computer's runtime state as its actor and its sub-tasks share it.
@@ -42,7 +42,7 @@ pub struct ComputerRuntime {
     /// every transition. A sub-task reads it to see a teardown that started
     /// while it was running — the cooperative half of preemption, which an
     /// abort alone cannot cover before the resource handoff has landed.
-    pub state: SandboxState,
+    pub state: ComputerState,
     /// The VMM process this sandbox's VM runs on, as the driver prepared
     /// it (`arcbox_vm_driver::PreparedVm`): pid and API socket known,
     /// shared with the boot task, taken by cleanup to kill and reap it.
@@ -136,7 +136,7 @@ impl ComputerRuntime {
             record_generation,
             labels: spec.labels.clone(),
             spec,
-            state: SandboxState::Starting,
+            state: ComputerState::Starting,
             prepared: None,
             handle: None,
             net_identity: None,

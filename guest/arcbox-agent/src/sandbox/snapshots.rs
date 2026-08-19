@@ -1,6 +1,6 @@
 //! Sandbox checkpoint / restore handlers.
 
-use arcbox_computer_runtime::{RestoreComputerSpec, SandboxState};
+use arcbox_computer_runtime::{ComputerState, RestoreComputerSpec};
 use arcbox_connect::sandbox_v1;
 use buffa::Message;
 
@@ -56,7 +56,7 @@ impl SandboxService {
         let live = self.manager.inspect_sandbox(&id).is_ok_and(|info| {
             matches!(
                 info.state,
-                SandboxState::Starting | SandboxState::Ready | SandboxState::Running
+                ComputerState::Starting | ComputerState::Ready | ComputerState::Running
             ) && info
                 .network
                 .is_some_and(|network| network.ip_address == ip_address)

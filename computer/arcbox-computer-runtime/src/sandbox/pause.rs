@@ -53,16 +53,16 @@ pub mod reason {
     pub const AUTO_RESUME: &str = "auto_resume";
 }
 
-/// Delete every internal pause checkpoint of `sandbox_id`.
+/// Delete every internal pause checkpoint of `computer_id`.
 ///
 /// Scans by the reserved name rather than the recorded snapshot id so a
 /// checkpoint leaked by an interrupted pause (committed to the catalog but
 /// never recorded durably) is cleaned up too.
 pub fn delete_pause_snapshots(
     snapshots: &crate::snapshot::SnapshotCatalog,
-    sandbox_id: &str,
+    computer_id: &str,
 ) -> Result<()> {
-    for info in snapshots.list(sandbox_id)? {
+    for info in snapshots.list(computer_id)? {
         if info.name.as_deref() == Some(PAUSE_SNAPSHOT_NAME) {
             snapshots.delete_by_id(&info.id)?;
         }
@@ -118,7 +118,7 @@ impl SandboxManager {
         // off the snapshot rather than left to the flow, because it is a
         // refusal the caller gets *instead* of the claim: only a computer
         // that would otherwise be paused hears it, exactly as today.
-        if computer.snapshot.borrow().state == SandboxState::Ready
+        if computer.snapshot.borrow().state == ComputerState::Ready
             && self.config.firecracker.jailer.is_none()
         {
             return Err(ComputerError::Config(

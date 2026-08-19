@@ -202,7 +202,7 @@ impl ComputerActor {
             // crash journal — which is exactly what `GateJournal` means.
             Err(error) if matches!(durability, Durability::GateJournal) => {
                 error!(
-                    sandbox_id = %self.id,
+                    computer_id = %self.id,
                     %error,
                     phase = phase.as_str(),
                     "durable write was refused; keeping the crash journal"
@@ -220,14 +220,14 @@ impl ComputerActor {
         let phase = phase.as_str();
         match durability {
             Durability::Warn => {
-                warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; continuing");
+                warn!(computer_id = %self.id, error, phase, "durable write is unconfirmed; continuing");
                 Flow::Continue
             }
             Durability::GateJournal => {
                 // The gate *is* the handling: an unconfirmed write keeps the
                 // crash journal, so a restart still finds the resources it
                 // records.
-                warn!(sandbox_id = %self.id, error, phase, "durable write is unconfirmed; keeping the crash journal");
+                warn!(computer_id = %self.id, error, phase, "durable write is unconfirmed; keeping the crash journal");
                 self.journal_blocked = true;
                 Flow::Continue
             }
@@ -326,7 +326,7 @@ impl ComputerActor {
             }
             Err(error) => {
                 error!(
-                    sandbox_id = %self.id,
+                    computer_id = %self.id,
                     %error,
                     retry_millis = self.retry_backoff.as_millis(),
                     "the computer's record would not delete; retrying the teardown"
@@ -373,11 +373,11 @@ impl ComputerActor {
             return;
         }
         if let Err(error) = crate::sandbox::reconcile::clear_state_record(&self.vm_dir) {
-            error!(sandbox_id = %self.id, %error, "crash journal cleanup is not durable");
+            error!(computer_id = %self.id, %error, "crash journal cleanup is not durable");
         }
     }
 
-    pub(super) fn public(&self) -> SandboxState {
+    pub(super) fn public(&self) -> ComputerState {
         self.snapshot_tx.borrow().state
     }
 
@@ -415,7 +415,7 @@ impl ComputerActor {
     }
 
     fn publish(&mut self, notify: Notify) {
-        let event = SandboxEvent::new(&self.id, notify_action(notify));
+        let event = ComputerEvent::new(&self.id, notify_action(notify));
         let event = match notify {
             Notify::Failed => {
                 let error = self.error.clone().unwrap_or_default();

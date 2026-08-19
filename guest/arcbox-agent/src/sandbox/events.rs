@@ -66,7 +66,7 @@ impl SandboxService {
                     // waiting for the 1 s rescan below.
                     Ok(event) if event.is_terminal() || event.action == "paused" => {
                         if let Some(ticket) = self
-                            .pending_cleanup_ticket(&event.sandbox_id)
+                            .pending_cleanup_ticket(&event.computer_id)
                             .await
                             .map_err(|error| anyhow::anyhow!(error.to_string()))?
                         {
@@ -152,7 +152,7 @@ impl SandboxService {
                 match bcast_rx.recv().await {
                     Ok(event) => {
                         // Apply filters.
-                        if !filter_id.is_empty() && event.sandbox_id != filter_id {
+                        if !filter_id.is_empty() && event.computer_id != filter_id {
                             continue;
                         }
                         if filter_kind != sandbox_v1::SandboxEventKind::Unspecified

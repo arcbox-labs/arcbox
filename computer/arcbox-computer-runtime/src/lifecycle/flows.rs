@@ -34,7 +34,7 @@ use crate::sandbox::pool::SlotPool;
 use crate::sandbox::record::SandboxProvisionOutcome;
 use crate::sandbox::record::SandboxRecordStore;
 use crate::sandbox::warm::WarmPublishTicket;
-use crate::sandbox::{CheckpointInfo, ComputerId, NetworkAttachment, SandboxEvent};
+use crate::sandbox::{CheckpointInfo, ComputerEvent, ComputerId, NetworkAttachment};
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::CowManager;
 
@@ -55,7 +55,7 @@ pub struct ComputerServices {
     pub cow_manager: Arc<CowManager>,
     pub records: Arc<SandboxRecordStore>,
     pub snapshots: Arc<SnapshotCatalog>,
-    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub events_tx: broadcast::Sender<ComputerEvent>,
     pub pool: Arc<SlotPool>,
 }
 

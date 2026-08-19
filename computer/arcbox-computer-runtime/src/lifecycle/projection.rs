@@ -3,34 +3,34 @@
 //!
 //! They are deliberately different. `running` is the workload hot path and
 //! writes no record, so it is durably `Ready`; `gating` and `removing` have no
-//! `SandboxState` of their own.
+//! `ComputerState` of their own.
 
 use super::machine::State;
-use crate::sandbox::SandboxState;
+use crate::sandbox::ComputerState;
 use crate::sandbox::record::PersistPhase;
 
 impl State {
     /// What a caller sees. Today a gated computer reads `Starting` (a boot
     /// owing its initial `cmd` holds it there) and a removal writes `Stopping`.
-    pub(super) fn to_public(self) -> SandboxState {
+    pub(super) fn to_public(self) -> ComputerState {
         match self {
             Self::Provisioning {}
             | Self::Staging {}
             | Self::Booting {}
             | Self::Restoring { .. }
-            | Self::Resuming {} => SandboxState::Starting,
+            | Self::Resuming {} => ComputerState::Starting,
             // A gate whose reservation the boot's own `cmd` has taken is
             // already running that workload, which is what a caller sees.
-            Self::Gating { claimed: false, .. } => SandboxState::Starting,
-            Self::Gating { claimed: true, .. } => SandboxState::Running,
-            Self::Ready {} | Self::Checkpointing {} => SandboxState::Ready,
-            Self::Running {} => SandboxState::Running,
-            Self::Capturing {} | Self::Releasing {} => SandboxState::Pausing,
-            Self::Paused {} => SandboxState::Paused,
-            Self::Stopping {} | Self::Removing {} => SandboxState::Stopping,
+            Self::Gating { claimed: false, .. } => ComputerState::Starting,
+            Self::Gating { claimed: true, .. } => ComputerState::Running,
+            Self::Ready {} | Self::Checkpointing {} => ComputerState::Ready,
+            Self::Running {} => ComputerState::Running,
+            Self::Capturing {} | Self::Releasing {} => ComputerState::Pausing,
+            Self::Paused {} => ComputerState::Paused,
+            Self::Stopping {} | Self::Removing {} => ComputerState::Stopping,
             // A removed computer is gone from the map; nothing reads `gone`.
-            Self::Stopped {} | Self::Gone {} => SandboxState::Stopped,
-            Self::Failed {} => SandboxState::Failed,
+            Self::Stopped {} | Self::Gone {} => ComputerState::Stopped,
+            Self::Failed {} => ComputerState::Failed,
         }
     }
 

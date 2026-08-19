@@ -177,7 +177,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                     // chroot, and CoW invisible to reconciliation.
                     if let Err(error) = sandbox::reconcile::clear_state_record(&slot_vm_dir) {
                         warn!(
-                            sandbox_id = %new_id,
+                            computer_id = %new_id,
                             slot_id = %slot_id,
                             error = %error,
                             "claimed slot journal not cleared; the startup sweep will reconcile it"
@@ -186,7 +186,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                         && error.kind() != std::io::ErrorKind::NotFound
                     {
                         warn!(
-                            sandbox_id = %new_id,
+                            computer_id = %new_id,
                             slot_id = %slot_id,
                             error = %error,
                             "claimed slot runtime dir not removed"
@@ -384,10 +384,10 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             {
                 Ok(Ok(ClockSync::Synced)) => {}
                 Ok(Ok(ClockSync::AgentError(code))) => {
-                    warn!(sandbox_id = %id, code, "agent could not set the clock after restore");
+                    warn!(computer_id = %id, code, "agent could not set the clock after restore");
                 }
-                Ok(Err(e)) => warn!(sandbox_id = %id, "clock sync after restore failed: {e}"),
-                Err(_) => warn!(sandbox_id = %id, "clock sync after restore timed out"),
+                Ok(Err(e)) => warn!(computer_id = %id, "clock sync after restore failed: {e}"),
+                Err(_) => warn!(computer_id = %id, "clock sync after restore timed out"),
             }
         });
     }
