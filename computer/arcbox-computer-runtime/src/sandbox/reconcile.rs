@@ -58,7 +58,6 @@ use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::lifecycle::actor::{Deadlines, Seeded};
 use crate::lifecycle::runtime::ComputerRuntime;
-use crate::network::NetworkAllocation;
 use crate::snapshot_cow::{
     COW_FILE_PREFIX, COW_FILE_SUFFIX, CowHandle, CowManager, DM_NAME_PREFIX,
 };
@@ -140,22 +139,21 @@ pub struct SandboxStateRecord {
     /// The VMM's PID at boot time.
     #[serde(default)]
     pub pid: Option<i32>,
-    /// The lease to hand back, in the shape `arcbox-tap-net`'s
-    /// [`NetworkAllocation`] has written since before the guest-network
-    /// port existed.
+    /// The lease to hand back, in the shape this journal has written since
+    /// before the guest-network port existed ([`JournaledAllocation`]).
     ///
     /// The lease is what the sweep actually needs, but the on-disk shape
     /// is a contract in both directions (see the type doc above), and
-    /// `NetworkAllocation`'s `tap_name` and `dns_servers` are not
-    /// `#[serde(default)]`: dropping either would turn one skipped
-    /// sandbox into a sweep that fails to parse and leaks every journaled
-    /// resource on an agent that predates the port. Both are therefore
-    /// reconstructed on write — the TAP name by [`tap_name_for`], the
-    /// same rule [`validate_state_record`] enforces, and the resolvers
-    /// from the network config the pool was built with — and neither is
-    /// read back: [`SandboxStateRecord::lease`] is what the sweep uses.
+    /// `tap_name` and `dns_servers` carry no `#[serde(default)]`: dropping
+    /// either would turn one skipped sandbox into a sweep that fails to
+    /// parse and leaks every journaled resource on an agent that predates
+    /// the port. Both are therefore reconstructed on write — the TAP name
+    /// by [`tap_name_for`], the same rule [`validate_state_record`]
+    /// enforces, and the resolvers from the network config the pool was
+    /// built with — and neither is read back:
+    /// [`SandboxStateRecord::lease`] is what the sweep uses.
     #[serde(default)]
-    pub network: Option<NetworkAllocation>,
+    pub network: Option<JournaledAllocation>,
     /// dm-snapshot CoW resources to tear down.
     #[serde(default)]
     cow: Option<CowRecord>,
@@ -285,6 +283,46 @@ fn tap_name_for(ip: std::net::Ipv4Addr) -> String {
     format!("vmtap{}-{}", octets[2], octets[3])
 }
 
+/// The `network` object inside [`STATE_FILE`], field for field.
+///
+/// Field-identical to `arcbox_tap_net::NetworkAllocation`, and
+/// deliberately so rather than by reuse: that type is the TAP adapter's own
+/// allocation record, which its quarantine ledger persists to a different
+/// file under a different owner. The two files happen to share a shape
+/// because this journal was written when that adapter was the only network
+/// there was. Sharing the type would tie this journal's on-disk contract —
+/// which `RECORD_VERSION` 1 has no migration story for
+/// (`computer/AGENTS.md`) — to an adapter's freedom to evolve its own.
+///
+/// So the encoding is frozen here: every key name, and the two `serde`
+/// defaults that let a record predating them load
+/// (`a_journal_without_a_prefix_len_or_cleanup_token_loads` pins both).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournaledAllocation {
+    /// TAP interface name (e.g. `vmtap0-7`).
+    pub tap_name: String,
+    /// IP address assigned to the guest.
+    pub ip_address: std::net::Ipv4Addr,
+    /// Network prefix length (e.g. 16 for /16).
+    #[serde(default = "default_prefix_len")]
+    pub prefix_len: u8,
+    /// Gateway IP.
+    pub gateway: std::net::Ipv4Addr,
+    /// MAC address (deterministic from the sandbox id).
+    pub mac_address: String,
+    /// DNS servers.
+    pub dns_servers: Vec<String>,
+    /// Opaque generation token carried through host cleanup finalization.
+    #[serde(default)]
+    pub cleanup_token: String,
+}
+
+/// What a record written before `prefix_len` existed meant: the /16 the
+/// sandbox pool has always been.
+const fn default_prefix_len() -> u8 {
+    16
+}
+
 impl SandboxStateRecord {
     /// Assemble a record from boot/restore results.
     pub fn new(
@@ -348,9 +386,9 @@ impl SandboxStateRecord {
 ///
 /// `tap_name` and `dns_servers` are the two fields a lease does not carry;
 /// see [`SandboxStateRecord::network`] for why they are written anyway.
-fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<NetworkAllocation> {
+fn legacy_allocation(lease: &NetworkLease, dns: &[String]) -> Result<JournaledAllocation> {
     let ip = lease.ipv4()?;
-    Ok(NetworkAllocation {
+    Ok(JournaledAllocation {
         tap_name: tap_name_for(ip),
         ip_address: ip,
         prefix_len: lease.prefix_len,
@@ -1436,8 +1474,8 @@ mod tests {
     /// `state.json` written before the guest-network port existed, verbatim.
     /// The sweep replays leases out of records like this one, so the shape
     /// is a contract in both directions: this agent must read it, and an
-    /// agent that predates the port must read what this one writes (its
-    /// `NetworkAllocation` has no `#[serde(default)]` on `tap_name` or
+    /// agent that predates the port must read what this one writes (that
+    /// agent's decoder has no `#[serde(default)]` on `tap_name` or
     /// `dns_servers`, and a record missing either fails its whole sweep).
     const LEGACY_RECORD: &str = r#"{
       "id": "box",
@@ -1511,6 +1549,35 @@ mod tests {
             value,
             serde_json::from_str::<serde_json::Value>(LEGACY_RECORD).unwrap()
         );
+    }
+
+    /// The two `serde` defaults inside the `network` object are the whole
+    /// reason [`JournaledAllocation`] spells its encoding out: a journal
+    /// written before either field existed must still yield a lease, with
+    /// the /16 the pool has always been and no cleanup generation to
+    /// finalize. Losing a default here turns one such record into a sweep
+    /// that fails to parse and leaks every resource it names.
+    #[test]
+    fn a_journal_without_a_prefix_len_or_cleanup_token_loads() {
+        const OLDEST_RECORD: &str = r#"{
+          "id": "box",
+          "pid": 4242,
+          "network": {
+            "tap_name": "vmtap0-7",
+            "ip_address": "172.20.0.7",
+            "gateway": "172.20.0.1",
+            "mac_address": "02:fc:00:00:00:07",
+            "dns_servers": ["1.1.1.1"]
+          },
+          "jailer": true
+        }"#;
+        let record: SandboxStateRecord = serde_json::from_str(OLDEST_RECORD).unwrap();
+        let network = record.network.as_ref().expect("the record holds a network");
+        assert_eq!(network.prefix_len, 16);
+        assert_eq!(network.cleanup_token, "");
+        let lease = record.lease().unwrap().expect("the record holds a lease");
+        assert_eq!(lease.prefix_len, 16);
+        assert_eq!(lease.cleanup_token, "");
     }
 
     /// The two fields adoption added default the way the record's
