@@ -589,14 +589,17 @@ pub(crate) fn prepare_capability(driver: &dyn VmDriver) -> &dyn Prepare {
         .expect("SandboxManager::new requires the driver's Prepare capability")
 }
 
-/// The prepared VM's `Staging` capability, which [`SandboxManager::new`]
-/// requires — every flow that puts a guest on a VMM first brings that
-/// guest's files into the area the VMM can reach, and pause takes its disk
-/// back out of it.
-pub(crate) fn staging_capability(prepared: &dyn PreparedVm) -> &dyn Staging {
-    prepared
-        .staging()
-        .expect("SandboxManager::new requires the driver's Staging capability")
+/// A grip's `Staging` capability, which [`SandboxManager::new`] requires —
+/// every flow that puts a guest on a VMM first brings that guest's files
+/// into the area the VMM can reach, and pause takes its disk back out of
+/// it.
+///
+/// Takes the accessor's answer rather than the grip it came from: both
+/// grips on a VM have one and they name the same area, so a computer
+/// booted here asks its [`PreparedVm`] and one this process adopted asks
+/// its [`VmHandle`](arcbox_vm_driver::VmHandle).
+pub(crate) fn staging_capability(staging: Option<&dyn Staging>) -> &dyn Staging {
+    staging.expect("SandboxManager::new requires the driver's Staging capability")
 }
 
 /// The VMM's pid as the crash journal records it: what a restart sweep

@@ -251,7 +251,7 @@ pub async fn do_boot(
             };
             let staged = stage_rootfs_cow_or_copy(
                 cow_manager,
-                sandbox::staging_capability(&*prepared),
+                sandbox::staging_capability(prepared.staging()),
                 id,
                 &spec.rootfs,
                 &journal,

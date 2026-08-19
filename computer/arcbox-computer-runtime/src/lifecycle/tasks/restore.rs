@@ -262,7 +262,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             // paths: everything it loads is brought into the area it can
             // reach first, and named by where staging put it.
             let setup_result: Result<(PathBuf, CheckpointImage)> = async {
-                let staging = sandbox::staging_capability(&*spawned_prepared);
+                let staging = sandbox::staging_capability(spawned_prepared.staging());
 
                 // The kernel. A snapshot load names only the vmstate and
                 // the mem file, so this stage may well be vestigial — but
