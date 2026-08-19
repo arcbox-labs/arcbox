@@ -698,10 +698,17 @@ pub(crate) fn catalogued_checkpoint(meta: &SnapshotMeta) -> Result<CheckpointIma
 ///
 /// Deliberately NO length cap here: this also runs against persisted
 /// records (reconcile, record loads) — where rejecting one legacy
-/// over-long id would abort a whole sweep — and against snapshot /
-/// execution ids that never become a VM identity at all. Both limits the
-/// driver imposes are enforced only where a sandbox id enters the system:
+/// over-long id costs that record its reconciliation, so it is skipped
+/// rather than acted on and every resource it names is held (see
+/// `reconcile::sweep_orphans`) — and against snapshot / execution ids
+/// that never become a VM identity at all. Both limits the driver imposes
+/// are enforced only where a sandbox id enters the system:
 /// [`validate_new_sandbox_id`].
+///
+/// The gap between this alphabet and [`VmId`]'s is not academic: `_` is
+/// legal here and is not a `VmId`, so every record a pre-#680 process
+/// wrote for an `inst_…` sandbox is one this process cannot name — which
+/// is exactly what the sweep and the quarantine ledger read back.
 pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty() {
         return Err(VmmError::Config(format!("{kind} must not be empty")));

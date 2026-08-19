@@ -2164,6 +2164,52 @@ mod tests {
         );
     }
 
+    /// The motivating shape, end to end: a journal `validate_state_record`
+    /// accepts and the *port* cannot name. `_` is legal to
+    /// [`super::validate_id`] and is not a [`VmId`] (#680), so every record
+    /// a previous process wrote for an `inst_…` sandbox arrives here.
+    ///
+    /// The parse belongs at this boundary rather than downstream: without
+    /// it the record reaches `adopt_or_kill`, whose `VmId::new` propagates
+    /// and fails the whole sweep — which is what this PR removes.
+    #[tokio::test]
+    async fn a_journal_the_port_cannot_name_is_skipped_at_the_boundary() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = VmmConfig::default();
+        config.firecracker.data_dir = data_dir.path().to_string_lossy().into_owned();
+
+        // Directory and id agree, and both are what a pre-#680 process
+        // could legitimately have created.
+        let legacy = "inst_7f3a";
+        let legacy_dir = data_dir.path().join("sandboxes").join(legacy);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let record = SandboxStateRecord::new(legacy, None, None, None, &config, None).unwrap();
+        write_state_record(&legacy_dir, &record).unwrap();
+
+        let store = SandboxRecordStore::new(data_dir.path()).unwrap();
+        record_in_phase(&store, legacy, PersistPhase::Ready);
+        drop(store);
+
+        let (vm, manager, _network, reconciled) =
+            sweep_one(data_dir.path(), &AdoptionCase::live(), &[]).await;
+
+        reconciled.expect("a journal the port cannot name does not fail the reconciliation");
+        assert_eq!(
+            vm.state(),
+            VmState::Running,
+            "the sandbox the sweep could name was still reclaimed"
+        );
+        assert_eq!(
+            manager.snapshot(&legacy.to_owned()).unwrap().state,
+            SandboxState::Failed,
+            "the one it could not is reported, not reconciled"
+        );
+        assert!(
+            legacy_dir.join(STATE_FILE).exists(),
+            "its journal stays on disk for a version that can name it"
+        );
+    }
+
     /// Skipping means acting on nothing the record names, which is more
     /// than leaving it out of the sweep's records. Left out alone, its
     /// overlay falls out of the global keep sets and the CoW pass deletes
