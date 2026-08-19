@@ -11,6 +11,22 @@ use super::*;
 
 impl ComputerActor {
     pub(super) async fn on_command(&mut self, machine: &mut Machine, command: Command) {
+        // A handed-over computer answers nothing but another handover.
+        //
+        // One rule here rather than a guard per command, because the thing
+        // that makes this state easy to miss is systematic: `detached`
+        // projects `Ready` — the wire has no variant for "the successor's" —
+        // so every gate below that reads `self.public()` is blind to it. The
+        // ones that refuse it today do so by luck of their match arms, and
+        // `Resume` did not: it read `Ready` and answered `Ok` for a computer
+        // this process no longer owned. A rule at the door cannot be
+        // forgotten by whatever command is added next.
+        if matches!(machine.state(), State::Detached {})
+            && !matches!(command, Command::Detach { .. })
+        {
+            self.refuse_handed_over(command);
+            return;
+        }
         match command {
             Command::Provision {
                 provision,
@@ -199,18 +215,6 @@ impl ComputerActor {
                 self.dispatch(machine, Event::WorkloadReleased).await;
             }
             Command::SetLifecycle { update, reply } => {
-                // A handed-over computer refuses too, and the state is what
-                // says so — it projects `Ready`, so the public gate below lets
-                // it through. What that would reach is not a timer but the
-                // record: `persist_lifecycle` fsyncs into the record the
-                // successor has already adopted, under the generation it
-                // adopted with, so the write is accepted rather than fenced.
-                // The same class as the VM race this whole transition exists
-                // to close, moved from the guest to its record.
-                if matches!(machine.state(), State::Detached {}) {
-                    let _ = reply.send(Err(self.wrong_state("a computer this process still owns")));
-                    return;
-                }
                 // `set_sandbox_lifecycle` refuses a computer on its way out:
                 // nothing is left for a deadline to fire on, and the record
                 // it would persist to is about to be a tombstone.
@@ -258,6 +262,40 @@ impl ComputerActor {
                     .get_or_insert_with(|| format!("computer {} exited unexpectedly", self.id));
                 self.dispatch(machine, Event::VmExited).await;
             }
+        }
+    }
+
+    /// Answers every caller of a computer this process has handed over.
+    ///
+    /// What it protects is not one command. `SetLifecycle` was the loud case —
+    /// `persist_lifecycle` fsyncs into the record the successor has already
+    /// adopted, under the generation it adopted with, so the write is accepted
+    /// rather than fenced, which is the VM race this transition closes moved
+    /// onto the record. But `Resume` answered `Ok` for the same reason, and
+    /// the next command would have too.
+    ///
+    /// The match stays exhaustive so that adding one forces a decision here.
+    /// `Detach` cannot reach this — the caller lets it through, because a
+    /// second handover is an idempotent no-op rather than a refusal — and the
+    /// tells have nobody to answer: `detached` swallows them anyway.
+    fn refuse_handed_over(&self, command: Command) {
+        let refused = || self.wrong_state("a computer this process still owns");
+        match command {
+            Command::Provision { reply, .. }
+            | Command::Pause { reply, .. }
+            | Command::Resume { reply, .. }
+            | Command::Stop { reply, .. }
+            | Command::Remove { reply, .. }
+            | Command::ClaimWorkload { reply, .. }
+            | Command::SetLifecycle { reply, .. }
+            | Command::Detach { reply } => {
+                let _ = reply.send(Err(refused()));
+            }
+            // Its own reply type, so it cannot join the arm above.
+            Command::Checkpoint { reply, .. } => {
+                let _ = reply.send(Err(refused()));
+            }
+            Command::WorkloadExited { .. } | Command::ReleaseWorkload | Command::VmExited => {}
         }
     }
 

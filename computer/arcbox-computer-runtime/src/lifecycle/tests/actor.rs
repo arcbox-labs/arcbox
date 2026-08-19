@@ -1446,3 +1446,101 @@ async fn the_agent_is_gone_before_the_handover_reaches_the_driver() {
     tokio::time::sleep(Duration::from_secs(30)).await;
     detaching.ok().await;
 }
+
+/// A handed-over computer answers nothing but another handover.
+///
+/// The per-command version of this guard only ever covered the command whose
+/// bug was noticed. `detached` projects `Ready` — the wire has no variant for
+/// "the successor's" — so every gate reading the public state is blind to it:
+/// `Resume` read `Ready`, matched its live-computer arm, and answered `Ok` for
+/// a computer this process no longer owned. This walks the reply-bearing
+/// surface so a command added later cannot quietly inherit that.
+#[tokio::test(start_paused = true)]
+async fn a_handed_over_computer_answers_nothing_but_another_handover() {
+    async fn refused(waiter: Waiter, verb: &str) {
+        let error = waiter.error().await;
+        assert!(
+            matches!(error, VmmError::WrongState { .. }),
+            "{verb} was accepted by a handed-over computer: {error}"
+        );
+    }
+
+    let mut harness = Harness::recorded(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+
+    refused(
+        harness.send(|reply| Command::Resume {
+            reason: "test".to_owned(),
+            reply,
+        }),
+        "resume",
+    )
+    .await;
+    refused(
+        harness.send(|reply| Command::Pause {
+            reason: PauseReason::Requested,
+            reply,
+        }),
+        "pause",
+    )
+    .await;
+    refused(
+        harness.send(|reply| Command::ClaimWorkload {
+            claim: WorkloadClaim::Api,
+            reply,
+        }),
+        "claim",
+    )
+    .await;
+    refused(
+        harness.send(|reply| Command::SetLifecycle {
+            update: LifecycleUpdate {
+                ttl_seconds: Some(60),
+                ..LifecycleUpdate::default()
+            },
+            reply,
+        }),
+        "set-lifecycle",
+    )
+    .await;
+    refused(
+        harness.send(|reply| Command::Stop {
+            budget: Duration::from_secs(1),
+            reply,
+        }),
+        "stop",
+    )
+    .await;
+    refused(
+        harness.send(|reply| Command::Remove { force: true, reply }),
+        "remove",
+    )
+    .await;
+
+    // The capture surface too, which carries its own reply type.
+    let (reply, capture) = oneshot::channel();
+    harness
+        .commands
+        .send(Command::Checkpoint {
+            spec: CaptureSpec {
+                name: "snap".to_owned(),
+                labels: std::collections::HashMap::new(),
+            },
+            reply,
+        })
+        .unwrap();
+    assert!(matches!(
+        capture.await.unwrap().unwrap_err(),
+        VmmError::WrongState { .. }
+    ));
+
+    // Nothing reached the guest, and a second handover is still the idempotent
+    // no-op `detach_all` needs it to be.
+    let calls = harness.script.calls();
+    assert!(
+        !calls.contains(&"stop") && !calls.contains(&"release") && !calls.contains(&"checkpoint"),
+        "a handed-over vm was driven anyway: {calls:?}"
+    );
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+}
