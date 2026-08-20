@@ -44,7 +44,7 @@ pub fn find(config: &FcDriverConfig, record: &VmRecord) -> Option<Found> {
     let jail_root = jail_root_of(pid);
     let api_socket = recorded_socket
         .or_else(|| cmdline_api_socket(pid, jail_root.as_deref()))
-        .unwrap_or_else(|| record.runtime_dir.join("firecracker.sock"));
+        .unwrap_or_else(|| default_api_socket(jail_root.as_deref(), &record.runtime_dir));
     let isolation = match jail_root {
         Some(root) => {
             let (uid, gid) = process_ids(pid).unwrap_or((0, 0));
@@ -106,6 +106,24 @@ fn jail_root_of(pid: u32) -> Option<PathBuf> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// Where a VMM that named no socket must be listening: the jailer's fixed
+/// in-jail location when the process is chrooted, else where a direct spawn
+/// for this record would have put it.
+///
+/// The jailer execs Firecracker without `--api-sock`, so a jailed VMM binds
+/// its own default (`/run/firecracker.socket`) and says so nowhere a reader
+/// of `/proc` can see it. Its host path is the jail's — the same path
+/// [`VmLayout::api_socket`](crate::render::VmLayout::api_socket) hands the
+/// spawn, through the same [`jail::api_socket_path`]. Falling through to the
+/// direct-mode path instead dials a socket nobody bound, and an adopt that
+/// cannot reach the API settles for a process it can only kill.
+fn default_api_socket(jail_root: Option<&Path>, runtime_dir: &Path) -> PathBuf {
+    match jail_root {
+        Some(root) => crate::jail::api_socket_path(root),
+        None => runtime_dir.join("firecracker.sock"),
     }
 }
 
@@ -277,6 +295,38 @@ mod tests {
             Some(&b"/run/firecracker.socket"[..])
         );
         assert_eq!(cmdline_arg(b"firecracker\0--id\0", b"--id"), None);
+    }
+
+    /// A jailed VMM names its socket nowhere — not in the record the sweep
+    /// rebuilds from its journal, not on its command line — so the fallback
+    /// is the only thing that finds it, and it has to land where the spawn
+    /// put it.
+    #[test]
+    fn a_jailed_vmm_falls_back_to_the_socket_in_its_jail() {
+        let config = FcDriverConfig::new("/opt/fc/firecracker");
+        let id = arcbox_vm_driver::VmId::new("box").unwrap();
+        let runtime_dir = Path::new("/var/tmp/sandboxes/box");
+        let isolation = IsolationSpec::Jailer {
+            uid: 0,
+            gid: 0,
+            chroot_base: "/srv/jailer".into(),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        };
+        let layout = crate::render::VmLayout::new(&id, &isolation, &config, runtime_dir).unwrap();
+        let jail_root = layout.jail().unwrap().root.clone();
+
+        assert_eq!(
+            default_api_socket(Some(&jail_root), runtime_dir),
+            layout.api_socket(),
+            "adoption must derive the socket the spawn bound"
+        );
+        assert_eq!(
+            default_api_socket(None, runtime_dir),
+            runtime_dir.join("firecracker.sock"),
+            "an unjailed vmm still answers in its runtime dir"
+        );
     }
 
     #[test]
