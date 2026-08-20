@@ -12,6 +12,18 @@ pub(super) enum WarmPolicy {
     Disabled,
 }
 
+/// How long a handover pass waits for the startup sweep before going ahead
+/// without it.
+///
+/// The sweep bounds only its adoptions (`reconcile::ADOPT_TIMEOUT`); the kill
+/// and the CoW teardown it may run instead are unbounded. Every other verb
+/// waits for it indefinitely because a slow sweep only delays them, whereas
+/// this is the process's last chance to save the guests it holds — a pass that
+/// waits out an unbounded sweep loses all of them, including the computers the
+/// sweep has nothing to do with. Ten seconds mirrors the sweep's own
+/// per-computer bound: past that it is not about to finish.
+const SWEEP_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
 impl SandboxManager {
     /// Replay a durable Create outcome without resolving its template again.
     pub async fn replay_sandbox_create(
@@ -556,33 +568,85 @@ impl SandboxManager {
     pub async fn detach_all(&self) -> Result<()> {
         // The sweep adopts and kills VMs by the same deterministic names, so
         // racing it is the same class of bug; `stop_sandbox` and
-        // `remove_sandbox` wait it out for exactly this reason. Its *failure*
-        // is not propagated the way theirs is: this is the process's last
-        // chance to save every guest it holds, and refusing the whole handover
-        // because the sweep failed would kill all of them to report a fault in
-        // something that has already finished.
-        if let Err(error) = self.await_reconcile().await {
-            warn!(%error, "the startup sweep failed; handing over anyway");
+        // `remove_sandbox` wait it out for exactly this reason. Neither its
+        // failure nor its slowness is propagated the way theirs is — see
+        // `SWEEP_WAIT_BUDGET`.
+        match tokio::time::timeout(SWEEP_WAIT_BUDGET, self.await_reconcile()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "the startup sweep failed; handing over anyway"),
+            Err(_) => warn!(
+                seconds = SWEEP_WAIT_BUDGET.as_secs(),
+                "the startup sweep is still running; handing over anyway"
+            ),
         }
-        let computers: Vec<(SandboxId, Mailbox)> = self
+        // The incarnation rides along for the one answer the mailbox cannot
+        // tell apart on its own; see the `NotFound` arms below.
+        let computers: Vec<(SandboxId, Mailbox, Uuid)> = self
             .computers
             .read()
             .unwrap()
             .iter()
-            .map(|(id, computer)| (id.clone(), computer.mailbox.clone()))
+            .map(|(id, computer)| (id.clone(), computer.mailbox.clone(), computer.incarnation))
             .collect();
 
+        // Concurrently, because the actor is already the serializer: per
+        // computer these asks are ordered by its mailbox, and between
+        // computers there is nothing to order. Sequentially, one actor that
+        // cannot reach its command loop — a teardown waiting out an in-flight
+        // boot's resource handoff parks the actor for up to two
+        // `HANDOFF_TIMEOUT`s, and a create holds its mailbox unserved until it
+        // spawns — would spend the composer's remaining deadline on behalf of
+        // every computer behind it, and those guests die unasked.
+        let mut asks = tokio::task::JoinSet::new();
+        for (id, mailbox, incarnation) in computers {
+            asks.spawn(async move {
+                let answer = mailbox.ask(&id, |reply| Command::Detach { reply }).await;
+                (id, incarnation, answer)
+            });
+        }
+
+        let mut asked = 0_usize;
         let mut failures = Vec::new();
-        for (id, mailbox) in computers {
-            match mailbox.ask(&id, |reply| Command::Detach { reply }).await {
-                Ok(()) => info!(sandbox_id = %id, "handed the sandbox's vm to the next process"),
-                // The actor finished between the snapshot and the ask, so its
-                // computer is already gone — there is nothing left to hand
-                // over and nothing was lost.
-                Err(VmmError::NotFound(_)) => {}
+        while let Some(joined) = asks.join_next().await {
+            asked += 1;
+            let (id, incarnation, answer) = match joined {
+                Ok(answered) => answered,
+                // The ask itself reports everything the actor can do to it, so
+                // a join error is this runtime coming down mid-pass — there is
+                // no computer id left to attribute it to.
+                Err(error) => {
+                    failures.push(format!("a handover could not be asked for: {error}"));
+                    continue;
+                }
+            };
+            match answer {
+                Ok(()) => {}
+                // The mailbox closed, or the reply was dropped. Both arrive as
+                // `NotFound`, and whether either cost a guest is answered by
+                // the registry rather than by the error: every clean ending
+                // unregisters — the actor's own loop tail, the record it
+                // forgets, and the reservation of a create that unwound before
+                // spawning one — so an incarnation still registered is one
+                // whose actor died without finishing. Its VM is live,
+                // unhanded, and dies with this process, which is the one thing
+                // this pass exists to report.
+                Err(VmmError::NotFound(_))
+                    if !super::still_registered(&self.computers, &id, incarnation) => {}
+                Err(VmmError::NotFound(_)) => failures.push(format!(
+                    "{id}: its actor stopped without answering, so the vm was not handed over"
+                )),
                 Err(error) => failures.push(format!("{id}: {error}")),
             }
         }
+        // Deliberately a count of what was *asked*, not of guests saved: an
+        // `Ok` also comes back from a paused, stopped or still-provisioning
+        // computer that had no VM to give up. Only `detach_vm` knows a handle
+        // really changed hands, and that is where each one is logged.
+        info!(
+            computers = asked,
+            failures = failures.len(),
+            "asked every computer to hand its vm to the next process"
+        );
         if failures.is_empty() {
             return Ok(());
         }

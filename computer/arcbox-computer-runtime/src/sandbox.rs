@@ -930,6 +930,27 @@ fn forget_computer(computers: &Computers, id: &SandboxId, incarnation: Uuid) {
     }
 }
 
+/// Whether `id`'s entry is still this exact incarnation's — the inverse of
+/// [`forget_computer`], and the question an unanswerable mailbox raises.
+///
+/// Every ending unregisters: the actor's own loop tail whatever stopped it, the
+/// record it forgets on a removal, and [`ActorReservation::drop`] for a create
+/// that unwound before spawning one. A re-created id installs a fresh
+/// incarnation over the departed one, so this is `false` there too. What is
+/// left is an incarnation *still here* whose mailbox no longer answers: an
+/// actor whose task died without finishing, and the one case where a
+/// computer's resources outlive the thing that was managing them.
+///
+/// Reads nothing the actor owns, so it stays answerable for a computer whose
+/// runtime mutex a panic has poisoned.
+fn still_registered(computers: &Computers, id: &SandboxId, incarnation: Uuid) -> bool {
+    computers
+        .read()
+        .unwrap()
+        .get(id)
+        .is_some_and(|current| current.incarnation == incarnation)
+}
+
 #[cfg(test)]
 mod tests {
     use arcbox_constants::paths::{ARCBOX_RUNTIME_BIN_DIR, JAILER_CHROOT_BASE};
@@ -1178,5 +1199,37 @@ mod tests {
         );
         drop(replacement);
         assert!(!computers.read().unwrap().contains_key("same"));
+    }
+
+    /// Registration is per incarnation, which is what lets a handover pass
+    /// tell an actor that finished from one that died.
+    ///
+    /// `detach_all` reads this after an unanswerable mailbox: `false` means
+    /// the actor ended and unregistered (or its id was re-created since), so
+    /// nothing was lost, while `true` means its task went away without
+    /// finishing and its guest is still out there.
+    #[test]
+    fn registration_is_per_incarnation() {
+        let computers: Computers = Arc::new(RwLock::new(HashMap::new()));
+        let id = "box".to_owned();
+        let departing = reserve_actor(&computers, &id, placeholder("box")).unwrap();
+        let incarnation = departing.incarnation;
+        assert!(still_registered(&computers, &id, incarnation));
+
+        // A different incarnation of a live id is not this one.
+        assert!(!still_registered(&computers, &id, Uuid::new_v4()));
+
+        // An actor still holding its claim while unable to answer: the case
+        // worth reporting.
+        std::mem::forget(departing);
+        assert!(still_registered(&computers, &id, incarnation));
+
+        // And once it has let go — its own exit, or a replacement taking the
+        // id — that incarnation is no longer registered.
+        forget_computer(&computers, &id, incarnation);
+        assert!(!still_registered(&computers, &id, incarnation));
+        let replacement = reserve_actor(&computers, &id, placeholder("box")).unwrap();
+        assert!(!still_registered(&computers, &id, incarnation));
+        assert!(still_registered(&computers, &id, replacement.incarnation));
     }
 }
