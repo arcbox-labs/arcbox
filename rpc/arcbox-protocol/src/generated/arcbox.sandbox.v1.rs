@@ -324,8 +324,10 @@ pub struct SandboxInfo {
     /// the reason).
     #[prost(message, optional, tag = "16")]
     pub failed_at: ::core::option::Option<::pbjson_types::Timestamp>,
-    /// On-disk footprint of the sandbox's retained state (checkpoint +
-    /// disk overlay). Paused sandboxes keep paying this until removed.
+    /// On-disk footprint of the sandbox's retained state, reported in
+    /// every lifecycle state: the COW disk overlay its writes grow while
+    /// running, plus the pause checkpoint while paused. Meterable —
+    /// paused sandboxes keep paying it until resumed or removed.
     #[prost(uint64, tag = "17")]
     pub storage_bytes: u64,
 }
@@ -396,7 +398,9 @@ pub struct SandboxSummary {
     /// When the sandbox reached FAILED (unset otherwise).
     #[prost(message, optional, tag = "8")]
     pub failed_at: ::core::option::Option<::pbjson_types::Timestamp>,
-    /// On-disk footprint of retained state; nonzero for paused sandboxes.
+    /// On-disk footprint of retained state, in every lifecycle state:
+    /// the COW disk overlay while running, plus the pause checkpoint
+    /// while paused. Agrees with Inspect for the same sandbox.
     #[prost(uint64, tag = "9")]
     pub storage_bytes: u64,
 }
@@ -669,8 +673,8 @@ pub enum IdleAction {
     /// Destroy the sandbox and release all resources (Remove semantics).
     Kill = 1,
     /// Pause: checkpoint to disk under the same ID and release the VM.
-    /// Trades RAM for disk — the sandbox reports `storage_bytes` until
-    /// resumed or removed.
+    /// Trades RAM for disk — the checkpoint joins the disk overlay in
+    /// `storage_bytes` until the sandbox is resumed or removed.
     Pause = 2,
 }
 impl IdleAction {

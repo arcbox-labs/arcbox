@@ -50,8 +50,8 @@ service SandboxService {
     // relocation constraint documented in `snapshot.proto` (CORE-21).
     // Returns once the sandbox reaches PAUSED; requires READY (no active
     // execution — see the state machine below for why RUNNING cannot
-    // pause). Trades RAM for disk: a paused sandbox keeps paying
-    // `storage_bytes` until removed.
+    // pause). Trades RAM for disk: the checkpoint joins the disk overlay
+    // in `storage_bytes`, paid until the sandbox is resumed or removed.
     rpc Pause(PauseSandboxRequest) returns (google.protobuf.Empty);
 
     // Resume a PAUSED sandbox in place under the same ID; returns once
@@ -189,8 +189,8 @@ enum IdleAction {
     // Destroy the sandbox and release all resources (Remove semantics).
     IDLE_ACTION_KILL = 1;
     // Pause: checkpoint to disk under the same ID and release the VM.
-    // Trades RAM for disk — the sandbox reports `storage_bytes` until
-    // resumed or removed.
+    // Trades RAM for disk — the checkpoint joins the disk overlay in
+    // `storage_bytes` until the sandbox is resumed or removed.
     IDLE_ACTION_PAUSE = 2;
 }
 
@@ -508,8 +508,10 @@ message SandboxInfo {
     // When the sandbox reached FAILED (unset otherwise; `error` carries
     // the reason).
     google.protobuf.Timestamp failed_at = 16;
-    // On-disk footprint of the sandbox's retained state (checkpoint +
-    // disk overlay). Paused sandboxes keep paying this until removed.
+    // On-disk footprint of the sandbox's retained state, reported in
+    // every lifecycle state: the COW disk overlay its writes grow while
+    // running, plus the pause checkpoint while paused. Meterable —
+    // paused sandboxes keep paying it until resumed or removed.
     uint64 storage_bytes = 17;
 }
 
@@ -564,7 +566,9 @@ message SandboxSummary {
     google.protobuf.Timestamp paused_at = 7;
     // When the sandbox reached FAILED (unset otherwise).
     google.protobuf.Timestamp failed_at = 8;
-    // On-disk footprint of retained state; nonzero for paused sandboxes.
+    // On-disk footprint of retained state, in every lifecycle state:
+    // the COW disk overlay while running, plus the pause checkpoint
+    // while paused. Agrees with Inspect for the same sandbox.
     uint64 storage_bytes = 9;
 }
 
