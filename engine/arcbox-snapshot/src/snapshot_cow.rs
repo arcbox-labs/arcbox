@@ -81,8 +81,8 @@ const TEMPLATE_MARKER_TEMP_PREFIX: &str = ".tmp-";
 
 /// Whether device-mapper holds a device by this name.
 ///
-/// Asked of the kernel rather than of `/dev/mapper`, for the same reason
-/// [`dm_device_path`] does not trust that directory: a teardown that reads a
+/// Asked of the kernel rather than of `/dev/mapper`, because that directory
+/// is only as good as the udev rules that populate it: a teardown reading a
 /// missing symlink as a missing device skips the removal and reports success,
 /// leaving the device and everything under it attached for good.
 fn dm_present(dm_name: &str) -> bool {
@@ -782,9 +782,11 @@ async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
 /// has to be there: without it the guest's disk is staged as a full rootfs
 /// copy instead of an overlay, and teardown reads a live device as gone.
 ///
-/// A no-op where udev already made the node, and not fatal if it fails —
-/// the caller's first use of the path reports a missing node far more
-/// specifically than a failed `mknodes` could.
+/// A no-op where udev already made the node. If the node is still missing
+/// afterwards this fails rather than returning a handle whose device path
+/// resolves to nothing: the caller's next step stats that path, reads ENOENT
+/// as "no dm-snapshot here", and stages a full copy of the rootfs instead —
+/// so a setup that returned `Ok` would have quietly cost a Computer 32 GB.
 async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(["create", name, "--table", table]);
@@ -800,14 +802,21 @@ async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
 
     let mut mknodes = Command::new(bin);
     mknodes.args(["mknodes", name]);
-    match run_cmd(mknodes).await {
-        Ok(output) if !output.status.success() => debug!(
+    let mknodes = run_cmd(mknodes).await?;
+    if !mknodes.status.success() {
+        warn!(
             name,
-            stderr = %String::from_utf8_lossy(&output.stderr),
-            "dmsetup mknodes reported a failure"
-        ),
-        Err(error) => debug!(name, %error, "could not run dmsetup mknodes"),
-        Ok(_) => {}
+            stderr = %String::from_utf8_lossy(&mknodes.stderr),
+            "dmsetup mknodes failed"
+        );
+    }
+    let node = format!("/dev/mapper/{name}");
+    if !Path::new(&node).exists() {
+        return Err(SnapshotError::DeviceMapper(format!(
+            "dm device {name} exists but has no node at {node}, and dmsetup mknodes did not \
+             create one; a sandbox would silently copy its whole rootfs instead of using this \
+             overlay"
+        )));
     }
     Ok(())
 }
