@@ -202,6 +202,20 @@ pub struct SandboxStateRecord {
     /// there.
     #[serde(default)]
     pub net_invariant: bool,
+    /// The VMM's API socket, as this host reaches it.
+    ///
+    /// Written because a jailed VMM's socket cannot be re-derived by the
+    /// process that adopts it. The jailer unshares a mount namespace and
+    /// pivots into the chroot, so `/proc/<pid>/root` reads back as `/` from
+    /// outside and nothing there names the jail; it also execs Firecracker
+    /// without `--api-sock`, so the command line does not carry the path
+    /// either. An adopt that cannot reach the API settles for a handle it can
+    /// only kill, and the sweep then takes down a live guest.
+    ///
+    /// `None` for a record with no VMM of its own, and in every record
+    /// written before this field existed — those adopt exactly as before.
+    #[serde(default)]
+    pub api_socket: Option<PathBuf>,
 }
 
 /// How a lease's host side was attached, in the journal's own vocabulary.
@@ -346,7 +360,18 @@ impl SandboxStateRecord {
             pool_slot_id: None,
             attach_mode: network.map(|net| net.mode.into()),
             net_invariant: network.is_some_and(|net| net.invariant_identity),
+            api_socket: None,
         })
+    }
+
+    /// Record where the VMM's API socket is, for the process that adopts it.
+    ///
+    /// Separate from [`Self::new`] because only the paths that hold a VMM can
+    /// answer it: a cleanup record written after teardown has none. See
+    /// [`Self::api_socket`] for why it cannot be re-derived later.
+    pub fn with_api_socket(mut self, socket: Option<PathBuf>) -> Self {
+        self.api_socket = socket;
+        self
     }
 
     /// The lease this record's network field stands for, for a sweep that
@@ -1306,7 +1331,7 @@ fn vm_record(
             .and_then(|pid| u32::try_from(pid).ok())
             .map(|pid| ProcessRecord {
                 pid,
-                api_socket: None,
+                api_socket: record.api_socket.clone(),
             }),
     })
 }
@@ -1543,6 +1568,10 @@ mod tests {
             fields.remove("net_invariant"),
             Some(serde_json::json!(true))
         );
+        // Null here rather than absent, and null for exactly the reason a
+        // cleanup record has no socket: the constructor never knows one, only
+        // the boot and restore paths that hold the VMM do.
+        assert_eq!(fields.remove("api_socket"), Some(serde_json::Value::Null));
         assert_eq!(
             value,
             serde_json::from_str::<serde_json::Value>(LEGACY_RECORD).unwrap()
@@ -1746,16 +1775,54 @@ mod tests {
             pool_slot_id: Some("pool-1".into()),
             attach_mode: Some(JournaledAttachMode::Invariant),
             net_invariant: true,
+            api_socket: Some("/srv/jailer/firecracker/sb-1/root/run/firecracker.socket".into()),
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         let parsed: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.id, "sb-1");
         assert_eq!(parsed.pid, Some(42));
+        // The socket has to survive the round trip: an adopt that cannot read
+        // it back kills the VM it was meant to reclaim.
+        assert_eq!(
+            parsed.api_socket.as_deref(),
+            Some(Path::new(
+                "/srv/jailer/firecracker/sb-1/root/run/firecracker.socket"
+            ))
+        );
         assert!(parsed.jailer);
         assert_eq!(parsed.pool_slot_id.as_deref(), Some("pool-1"));
         assert_eq!(parsed.resource_owner(), "pool-1");
         let handle = parsed.cow.unwrap().to_handle();
         assert_eq!(handle.dm_name, "arcbox-snap-sb-1");
+    }
+
+    /// The journal is the only place a jailed VMM's socket survives, so the
+    /// record the sweep hands `Adopt` has to carry it: without it the driver
+    /// re-derives one from `/proc/<pid>/root`, which reads `/` for a jailed
+    /// VMM, dials a path nothing bound, and settles for a kill-only handle.
+    #[test]
+    fn the_adopt_record_carries_the_journaled_api_socket() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+
+        let socket = Path::new("/srv/jailer/firecracker/box/root/run/firecracker.socket");
+        let journaled = SandboxStateRecord {
+            id: "box".into(),
+            pid: Some(4242),
+            network: None,
+            cow: None,
+            jailer: true,
+            restore_origin_dir: None,
+            pool_slot_id: None,
+            attach_mode: None,
+            net_invariant: false,
+            api_socket: Some(socket.to_path_buf()),
+        };
+
+        let record = vm_record(&FakeDriver::new(), Path::new("/data/box"), &journaled).unwrap();
+
+        let process = record.process.expect("a journaled pid is a process");
+        assert_eq!(process.pid, 4242);
+        assert_eq!(process.api_socket.as_deref(), Some(socket));
     }
 
     #[test]
@@ -1782,6 +1849,7 @@ mod tests {
             pool_slot_id: slot.map(str::to_owned),
             attach_mode: None,
             net_invariant: false,
+            api_socket: None,
         };
 
         // Slot-keyed resources validate against the slot id, not the sandbox id.
