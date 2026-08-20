@@ -727,8 +727,31 @@ impl SandboxManager {
     }
 
     /// Subscribe to sandbox lifecycle events.
+    ///
+    /// **Delivery is best-effort — treat the stream as a latency
+    /// optimization over polling, never as an authoritative log.** Events
+    /// published before this call are gone (with no subscriber at all they
+    /// are discarded outright), and a subscriber that falls more than the
+    /// channel capacity behind gets
+    /// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged)
+    /// with the overwritten events lost.
+    ///
+    /// What makes the loss *detectable* is [`SandboxEvent::sequence`]
+    /// (CORE-147): 1-based, global across all sandboxes of this manager,
+    /// and contiguous in the order received — so a subscriber that sees
+    /// `sequence` jump by more than one has missed events (including any
+    /// history from before it subscribed) and should fall back to
+    /// [`Self::inspect_sandbox`] / [`Self::list_sandboxes`] to re-derive
+    /// state instead of carrying what it has. That test is conclusive
+    /// precisely because this subscription is unfiltered; a downstream
+    /// view that filters it (the wire API's per-sandbox subscription)
+    /// sees legitimate gaps and must not read them as loss. The counter is not
+    /// persisted: a new manager numbers from 1 again, and events emitted
+    /// while no manager ran were never numbered at all — a consumer that
+    /// outlives the manager must reconcile on reconnect regardless of
+    /// sequence.
     pub fn subscribe_events(&self) -> broadcast::Receiver<SandboxEvent> {
-        self.events_tx.subscribe()
+        self.events.subscribe()
     }
 
     /// Verify the computer is `Ready` and return the agent inside it.

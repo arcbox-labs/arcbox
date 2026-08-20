@@ -261,6 +261,15 @@ class SandboxEvent:
     #: Per-kind context: "exit_code"/"signal" on "idle", "error" on
     #: "failed", "reason" on "pausing"/"resumed".
     attributes: dict[str, str] = field(default_factory=dict[str, str])
+    #: Monotonic sequence number: 1-based, global across all sandboxes of
+    #: the emitting daemon, and stamped before the per-sandbox filter
+    #: ``sandbox.events()`` subscribes with. On that stream a gap is
+    #: therefore inconclusive — other sandboxes' events consumed numbers
+    #: too — while contiguous sequences prove nothing for this sandbox
+    #: was missed, and a sequence running backwards reveals a daemon
+    #: restart. When in doubt, re-derive state from ``info()``. 0 means
+    #: the daemon predates sequencing.
+    sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -545,6 +554,7 @@ def sandbox_event_from_proto(event: sandbox_pb2.SandboxEvent) -> SandboxEvent:
         kind=_EVENT_KIND_NAMES.get(event.kind, "unknown"),
         time=_optional_time(event.time, event.HasField("time")),
         attributes=dict(event.attributes),
+        sequence=int(event.sequence),
     )
 
 

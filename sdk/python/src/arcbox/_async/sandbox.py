@@ -790,7 +790,15 @@ class AsyncSandbox:
         stream; closing the stream (or its context) cancels the
         subscription. A transport drop mid-stream is surfaced as
         :class:`arcbox.errors.ConnectionLostError` — re-subscribing is
-        the caller's decision, since missed events cannot be replayed."""
+        the caller's decision, since missed events cannot be replayed.
+
+        Delivery is best-effort: a slow consumer can lose events, and
+        history from before the subscription is gone. This stream is
+        filtered to one sandbox while :attr:`SandboxEvent.sequence` is
+        stamped globally before that filter — so a sequence gap is
+        inconclusive, while contiguous sequences prove nothing was
+        missed and a sequence running backwards reveals a daemon
+        restart. When in doubt, re-derive state from :meth:`info`."""
         return AsyncEventStream(self._stream_events())
 
     async def _stream_events(self) -> AsyncGenerator[SandboxEvent]:

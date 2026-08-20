@@ -378,7 +378,7 @@ class WatchEventsResponse(_message.Message):
     def __init__(self, event: _Optional[_Union[SandboxEvent, _Mapping]] = ..., keep_alive: _Optional[_Union[KeepAlive, _Mapping]] = ...) -> None: ...
 
 class SandboxEvent(_message.Message):
-    __slots__ = ("sandbox_id", "kind", "time", "attributes")
+    __slots__ = ("sandbox_id", "kind", "time", "attributes", "sequence")
     class AttributesEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -390,11 +390,13 @@ class SandboxEvent(_message.Message):
     KIND_FIELD_NUMBER: _ClassVar[int]
     TIME_FIELD_NUMBER: _ClassVar[int]
     ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     sandbox_id: str
     kind: SandboxEventKind
     time: _timestamp_pb2.Timestamp
     attributes: _containers.ScalarMap[str, str]
-    def __init__(self, sandbox_id: _Optional[str] = ..., kind: _Optional[_Union[SandboxEventKind, str]] = ..., time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., attributes: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    sequence: int
+    def __init__(self, sandbox_id: _Optional[str] = ..., kind: _Optional[_Union[SandboxEventKind, str]] = ..., time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., attributes: _Optional[_Mapping[str, str]] = ..., sequence: _Optional[int] = ...) -> None: ...
 
 class ExposePortRequest(_message.Message):
     __slots__ = ("id", "sandbox_port", "host_port", "protocol")

@@ -193,6 +193,7 @@ pub(super) fn vm_event_to_proto(e: VmSandboxEvent) -> sandbox_v1::SandboxEvent {
         kind: event_kind(&e.action).into(),
         time: timestamp_from_unix_nanos(e.timestamp_ns).into(),
         attributes: e.attributes.into_iter().collect(),
+        sequence: e.sequence,
         ..Default::default()
     }
 }

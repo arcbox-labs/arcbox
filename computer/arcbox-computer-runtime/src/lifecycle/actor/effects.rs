@@ -446,7 +446,7 @@ impl ComputerActor {
             },
             _ => event,
         };
-        let _ = self.events_tx.send(event);
+        self.events.publish(event);
     }
 
     fn arm(&mut self, timer: Timer, state: State) {

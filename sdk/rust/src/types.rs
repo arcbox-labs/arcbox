@@ -152,6 +152,15 @@ pub struct SandboxEvent {
     /// Per-kind context: `exit_code`/`signal` on `Idle`, `error` on
     /// `Failed`, `reason` on `Pausing`/`Resumed`.
     pub attributes: BTreeMap<String, String>,
+    /// Monotonic sequence number: 1-based, global across all sandboxes
+    /// of the emitting daemon, and stamped before the per-sandbox filter
+    /// `Sandbox::events` subscribes with. On that stream a gap is
+    /// therefore inconclusive — other sandboxes' events consumed numbers
+    /// too — while contiguous sequences prove nothing for this sandbox
+    /// was missed, and a sequence running backwards reveals a daemon
+    /// restart. When in doubt, re-derive state from `Sandbox::info`.
+    /// `0` means the daemon predates sequencing.
+    pub sequence: u64,
 }
 
 /// One knob of a lifecycle update: leave it, clear it to the daemon
@@ -343,6 +352,7 @@ impl From<pb::SandboxEvent> for SandboxEvent {
             kind,
             time: time_from_wire(event.time.as_option()),
             attributes: event.attributes.into_iter().collect(),
+            sequence: event.sequence,
         }
     }
 }

@@ -325,6 +325,41 @@ async fn a_create_that_fails_before_activation_hands_the_address_back() {
     );
 }
 
+/// Every event carries a 1-based sequence, contiguous in the order a
+/// subscriber receives them and global across sandboxes (CORE-147) — so a
+/// subscriber that lost nothing sees no gap, and any gap it does see means
+/// loss, never reordering.
+#[tokio::test]
+async fn events_are_sequenced_contiguously_across_sandboxes() {
+    let fixture = Fixture::jailed().await;
+    let mut events = fixture.manager.subscribe_events();
+    let first = fixture.ready("one").await;
+    fixture.ready("two").await;
+    fixture.manager.stop_sandbox(&first, 1).await.unwrap();
+
+    let mut expected = 1;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("the stopped event arrives within the deadline")
+            .expect("the event stream stays open");
+        assert_eq!(
+            event.sequence, expected,
+            "a subscriber that lost nothing sees contiguous sequences \
+             (got {} at {:?} for {})",
+            event.sequence, event.action, event.sandbox_id
+        );
+        expected += 1;
+        if event.sandbox_id == first && event.action == action::STOPPED {
+            break;
+        }
+    }
+    assert!(
+        expected > 5,
+        "two boots and a stop produced several sequenced events"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Deadlines
 // ---------------------------------------------------------------------

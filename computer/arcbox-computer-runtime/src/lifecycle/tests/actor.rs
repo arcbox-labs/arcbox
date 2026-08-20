@@ -250,7 +250,8 @@ impl Harness {
     async fn started(boot: Boot, deadlines: Deadlines, journal: bool, record: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let script = Script::new(boot, agent().await);
-        let (events_tx, events) = broadcast::channel(64);
+        let events_tx = Arc::new(crate::sandbox::events::EventBus::new(64));
+        let events = events_tx.subscribe();
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let runtime = Arc::new(Mutex::new(ComputerRuntime::new(
             "box".to_owned(),
@@ -299,7 +300,7 @@ impl Harness {
             generation,
             vm_dir: dir.path().to_path_buf(),
             records,
-            events_tx,
+            events: events_tx,
             tasks: Arc::clone(&script) as Arc<dyn ComputerTasks>,
             deadlines,
             timers_enabled,

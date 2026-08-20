@@ -806,6 +806,14 @@ export class Sandbox {
    * loop cancels the subscription. A transport drop mid-stream is
    * surfaced as {@link ConnectionLostError} — re-subscribing is the
    * caller's decision, since missed events cannot be replayed.
+   *
+   * Delivery is best-effort: a slow consumer can lose events, and
+   * history from before the subscription is gone. This stream is
+   * filtered to one sandbox while {@link SandboxEvent.sequence} is
+   * stamped globally before that filter — so a sequence gap is
+   * inconclusive, while contiguous sequences prove nothing was missed
+   * and a sequence running backwards reveals a daemon restart. When in
+   * doubt, re-derive state from {@link Sandbox.info}.
    */
   events(): AsyncIterable<SandboxEvent> {
     return this.#streamEvents();
