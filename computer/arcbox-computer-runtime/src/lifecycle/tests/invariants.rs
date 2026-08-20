@@ -305,6 +305,39 @@ fn a_handover_only_acts_where_a_live_handle_is_settled() {
     }
 }
 
+/// A handover *completion* lands only where the handover was asked for.
+///
+/// The companion to the rule above, and the one that would otherwise go
+/// unstated: `Event::Detached` is in the alphabet, so `explore` drives it into
+/// every state and would record a Checkpointing→Detached edge as legitimate.
+/// It is unreachable only because `Effect::Detach` is awaited inline — spawn it
+/// like every sibling flow and a completion could land on a state that refused
+/// the handover, detaching a guest whose capture sub-task is still driving it.
+#[test]
+fn a_handover_completion_only_lands_where_the_handover_was_asked_for() {
+    for node in explore() {
+        let (mut sm, mut context) = reach(&node.path);
+        let (after, effects) = step(&mut sm, &mut context, &Event::Detached);
+        let asked = matches!(node.state, State::Ready {} | State::Running {});
+        assert_eq!(
+            effects.is_empty(),
+            !asked,
+            "a handover completion in {:?} emitted {effects:?}",
+            node.state
+        );
+        if asked {
+            assert!(matches!(after, State::Detached {}), "{:?}", node.state);
+        } else {
+            assert_eq!(
+                ordinal(after),
+                ordinal(node.state),
+                "a stray handover completion moved {:?}",
+                node.state
+            );
+        }
+    }
+}
+
 /// Nothing this process does may reach a VM it has handed over.
 ///
 /// The failure this pins is the expensive half of CORE-145: a `Stop` landing

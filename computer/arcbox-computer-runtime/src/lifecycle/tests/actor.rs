@@ -1441,7 +1441,9 @@ async fn a_handover_during_a_capture_is_refused() {
 async fn the_agent_is_gone_before_the_handover_reaches_the_driver() {
     let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
     harness.boot_to_ready().await;
-    *harness.script.detach_takes.lock().unwrap() = Some(Duration::from_secs(30));
+    // Slow enough to observe the window, inside `DETACH_TIMEOUT` so the
+    // handover still lands.
+    *harness.script.detach_takes.lock().unwrap() = Some(Duration::from_secs(2));
 
     let detaching = harness.send(|reply| Command::Detach { reply });
     // Far enough in for the effect to have reached the port call and parked
@@ -1457,8 +1459,99 @@ async fn the_agent_is_gone_before_the_handover_reaches_the_driver() {
         "the data plane could still dial a vm that is changing hands"
     );
 
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     detaching.ok().await;
+}
+
+/// A handover answers for itself, not for whatever an earlier flow left behind.
+///
+/// A flow that ends with nobody parked leaves its failure in `answer_error` for
+/// the next caller to hear, and `answer` folds that into whichever reply it
+/// reaches next. Reached by a handover, it reports a guest lost that was in
+/// fact handed over — and unretryably, since the state is terminal by then and
+/// the retry answers `Ok`, contradicting the first answer. A composer told that
+/// logs a loss it did not take, on the one pass whose whole output is the list
+/// of guests it could not save.
+#[tokio::test(start_paused = true)]
+async fn a_handover_is_not_answered_by_an_earlier_flows_failure() {
+    let mut harness = Harness::recorded(
+        Boot::Completes,
+        Deadlines {
+            ttl: None,
+            idle_timeout_seconds: 2,
+            on_idle: IdleAction::Pause,
+        },
+    )
+    .await;
+    harness.boot_to_ready().await;
+
+    // A record at `Starting` refuses `Pausing` (not a durable edge) and admits
+    // the `Ready` the failed pause reverts to — so the idle pause below fails
+    // its write with no caller parked to hear it, and the computer comes back
+    // usable with that failure still owed to someone.
+    let record_path = harness.dir.path().join("sandbox-records").join("box.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    assert_eq!(record["phase"], "ready");
+    record["phase"] = serde_json::Value::String("starting".to_owned());
+    std::fs::write(&record_path, serde_json::to_string(&record).unwrap()).unwrap();
+
+    // Past the idle window: the pause fires, its `Pausing` write is refused,
+    // and the computer reverts to a usable `Ready`.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !harness.script.calls().contains(&"checkpoint"),
+        "the pause the refused write was recording must not have run"
+    );
+    assert_eq!(harness.snapshot.borrow().state, SandboxState::Ready);
+
+    harness.send(|reply| Command::Detach { reply }).ok().await;
+    assert!(
+        harness.script.calls().contains(&"detach"),
+        "the handover did not reach the driver"
+    );
+    assert_eq!(harness.snapshot.borrow().state, SandboxState::Ready);
+}
+
+/// A port call that does not return is a failed handover, not a wedged actor.
+///
+/// This is the only port call awaited on the actor task itself, so the bound is
+/// what keeps the "releasing ownership has no wait in it" premise inside this
+/// crate: a driver that hung here would otherwise hold the command loop
+/// unpreemptibly, and with it every computer queued behind this one in a
+/// handover pass. The outcome is the refusal's — the computer stays ours,
+/// dialable, and stoppable.
+#[tokio::test(start_paused = true)]
+async fn a_handover_that_does_not_return_fails_the_handover_alone() {
+    let mut harness = Harness::start(Boot::Completes, no_deadlines()).await;
+    harness.boot_to_ready().await;
+    *harness.script.detach_takes.lock().unwrap() = Some(Duration::from_secs(600));
+
+    let error = harness
+        .send(|reply| Command::Detach { reply })
+        .error()
+        .await;
+    assert!(error.to_string().contains("did not finish"), "{error}");
+    assert_eq!(
+        harness.snapshot.borrow().state,
+        SandboxState::Ready,
+        "a handover that timed out moved the computer"
+    );
+    assert!(
+        harness.snapshot.borrow().agent.is_some(),
+        "a handover that timed out left the computer undialable"
+    );
+
+    // And the actor is still serving: the stall cost this computer its
+    // handover, not the mailbox.
+    harness
+        .send(|reply| Command::Stop {
+            budget: Duration::from_secs(1),
+            reply,
+        })
+        .ok()
+        .await;
+    assert!(harness.script.calls().contains(&"stop"));
 }
 
 /// A handed-over computer answers nothing but another handover.
