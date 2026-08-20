@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use super::ComputerFlows;
 use crate::error::VmmError;
@@ -109,15 +109,22 @@ impl ComputerFlows {
     /// describes the guest it names, and after the driver has released it a
     /// drop no longer kills. Nothing durable is written — the record already
     /// says `Ready`, which is what the successor's sweep adopts from.
+    ///
+    /// This is also the only place that can tell a real handover from an `Ok`
+    /// there was nothing behind, so it is where each one is logged: the answer
+    /// the actor gives its caller carries no payload, and `detach_all` would
+    /// otherwise report a saved guest per paused or resting computer it asked.
     pub(super) async fn detach_vm(&self) -> TaskResult {
         let handle = self.computer.lock().unwrap().handle.clone();
         // No VM to hand over, or a driver that runs its VMs in-process and
         // never produced a handle a successor could pick up — the same
         // reasoning the startup sweep applies to `Adopt`.
         let Some(handle) = handle else {
+            debug!(sandbox_id = %self.id, "no vm to hand to the next process");
             return Ok(());
         };
         let Some(detach) = handle.detach() else {
+            debug!(sandbox_id = %self.id, "the driver holds its vms in-process; nothing to hand over");
             return Ok(());
         };
         detach.detach().await.map_err(|error| {
@@ -126,6 +133,7 @@ impl ComputerFlows {
                 self.id
             )))
         })?;
+        info!(sandbox_id = %self.id, "handed the computer's vm to the next process");
         Ok(())
     }
 
