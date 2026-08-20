@@ -2325,6 +2325,15 @@ async fn next_event(
         let Some(watch_events_response::Payload::Event(event)) = message.payload else {
             continue; // keepalive
         };
+        // CORE-147: every event this daemon emits carries a sequence; 0
+        // would mean the stamp was lost on its way through the guest agent.
+        if event.sequence == 0 {
+            bail!(
+                "{:?} event for {} carries no sequence",
+                event.kind(),
+                event.sandbox_id
+            );
+        }
         if event.kind() != kind {
             continue;
         }

@@ -595,6 +595,11 @@ message WatchEventsResponse {
 }
 
 // A sandbox lifecycle event.
+//
+// Delivery is best-effort: a subscriber that lags loses events, and events
+// emitted with no subscriber attached are discarded. `sequence` is what
+// makes that loss detectable — treat the stream as a latency optimization
+// over polling Inspect/List, and reconcile when a gap shows.
 message SandboxEvent {
     // Sandbox ID.
     string sandbox_id = 1;
@@ -605,6 +610,13 @@ message SandboxEvent {
     // Additional context (e.g. "exit_code" / "signal" on IDLE,
     // "error" on FAILED).
     map<string, string> attributes = 4;
+    // Monotonic sequence number: 1-based, global across all sandboxes of
+    // the emitting daemon, contiguous in the order events are delivered.
+    // A jump of more than one means events were missed (lag, or history
+    // from before the subscription) — fall back to Inspect/List instead
+    // of carrying stale state. Not persisted: a restarted daemon numbers
+    // from 1 again, and 0 means the daemon predates sequencing.
+    uint64 sequence = 5;
 }
 
 // ---------------------------------------------------------------------------

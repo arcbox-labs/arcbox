@@ -433,6 +433,11 @@ pub mod watch_events_response {
     }
 }
 /// A sandbox lifecycle event.
+///
+/// Delivery is best-effort: a subscriber that lags loses events, and events
+/// emitted with no subscriber attached are discarded. `sequence` is what
+/// makes that loss detectable — treat the stream as a latency optimization
+/// over polling Inspect/List, and reconcile when a gap shows.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SandboxEvent {
     /// Sandbox ID.
@@ -449,6 +454,14 @@ pub struct SandboxEvent {
     #[prost(map = "string, string", tag = "4")]
     pub attributes:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Monotonic sequence number: 1-based, global across all sandboxes of
+    /// the emitting daemon, contiguous in the order events are delivered.
+    /// A jump of more than one means events were missed (lag, or history
+    /// from before the subscription) — fall back to Inspect/List instead
+    /// of carrying stale state. Not persisted: a restarted daemon numbers
+    /// from 1 again, and 0 means the daemon predates sequencing.
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
 }
 /// Request to expose a sandbox port on the host.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
