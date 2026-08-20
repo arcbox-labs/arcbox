@@ -742,7 +742,10 @@ impl SandboxManager {
     /// `sequence` jump by more than one has missed events (including any
     /// history from before it subscribed) and should fall back to
     /// [`Self::inspect_sandbox`] / [`Self::list_sandboxes`] to re-derive
-    /// state instead of carrying what it has. The counter is not
+    /// state instead of carrying what it has. That test is conclusive
+    /// precisely because this subscription is unfiltered; a downstream
+    /// view that filters it (the wire API's per-sandbox subscription)
+    /// sees legitimate gaps and must not read them as loss. The counter is not
     /// persisted: a new manager numbers from 1 again, and events emitted
     /// while no manager ran were never numbered at all — a consumer that
     /// outlives the manager must reconcile on reconnect regardless of

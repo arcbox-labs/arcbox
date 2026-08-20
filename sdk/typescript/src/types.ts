@@ -99,10 +99,13 @@ export interface SandboxEvent {
   attributes: Record<string, string>;
   /**
    * Monotonic sequence number: 1-based, global across all sandboxes of
-   * the emitting daemon, contiguous in delivery order. A jump of more
-   * than one means events were missed — fall back to list/inspect
-   * instead of carrying stale state. Resets when the daemon restarts;
-   * `0` means the daemon predates sequencing.
+   * the emitting daemon, and stamped before the per-sandbox filter
+   * {@link Sandbox.events} subscribes with. On that stream a gap is
+   * therefore inconclusive — other sandboxes' events consumed numbers
+   * too — while contiguous sequences prove nothing for this sandbox was
+   * missed, and a sequence running backwards reveals a daemon restart.
+   * When in doubt, re-derive state from {@link Sandbox.info}. `0` means
+   * the daemon predates sequencing.
    */
   sequence: number;
 }

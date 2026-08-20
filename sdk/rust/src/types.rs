@@ -152,12 +152,14 @@ pub struct SandboxEvent {
     /// Per-kind context: `exit_code`/`signal` on `Idle`, `error` on
     /// `Failed`, `reason` on `Pausing`/`Resumed`.
     pub attributes: BTreeMap<String, String>,
-    /// Monotonic sequence number: 1-based, global across all sandboxes of
-    /// the emitting daemon, contiguous in delivery order. A jump of more
-    /// than one means events were missed — fall back to
-    /// [`crate::ArcBox::list`] / `Sandbox::info` instead of carrying stale
-    /// state. Resets when the daemon restarts; `0` means the daemon
-    /// predates sequencing.
+    /// Monotonic sequence number: 1-based, global across all sandboxes
+    /// of the emitting daemon, and stamped before the per-sandbox filter
+    /// `Sandbox::events` subscribes with. On that stream a gap is
+    /// therefore inconclusive — other sandboxes' events consumed numbers
+    /// too — while contiguous sequences prove nothing for this sandbox
+    /// was missed, and a sequence running backwards reveals a daemon
+    /// restart. When in doubt, re-derive state from `Sandbox::info`.
+    /// `0` means the daemon predates sequencing.
     pub sequence: u64,
 }
 

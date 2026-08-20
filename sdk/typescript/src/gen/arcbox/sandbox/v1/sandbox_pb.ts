@@ -1030,8 +1030,9 @@ export const WatchEventsResponseSchema: GenMessage<WatchEventsResponse> = /*@__P
  *
  * Delivery is best-effort: a subscriber that lags loses events, and events
  * emitted with no subscriber attached are discarded. `sequence` is what
- * makes that loss detectable — treat the stream as a latency optimization
- * over polling Inspect/List, and reconcile when a gap shows.
+ * makes that loss detectable — conclusively on an unfiltered subscription
+ * only; see the field. Treat the stream as a latency optimization over
+ * polling Inspect/List, and reconcile when in doubt.
  *
  * @generated from message arcbox.sandbox.v1.SandboxEvent
  */
@@ -1067,11 +1068,17 @@ export type SandboxEvent = Message<"arcbox.sandbox.v1.SandboxEvent"> & {
 
   /**
    * Monotonic sequence number: 1-based, global across all sandboxes of
-   * the emitting daemon, contiguous in the order events are delivered.
-   * A jump of more than one means events were missed (lag, or history
-   * from before the subscription) — fall back to Inspect/List instead
-   * of carrying stale state. Not persisted: a restarted daemon numbers
-   * from 1 again, and 0 means the daemon predates sequencing.
+   * the emitting daemon, and stamped before any server-side filtering.
+   * On an unfiltered subscription sequences are contiguous in delivery
+   * order, so a jump of more than one means events were missed (lag,
+   * or history from before the subscription) — fall back to
+   * Inspect/List instead of carrying stale state. On a filtered
+   * subscription (sandbox_id or kind set) gaps are expected — events
+   * the filter dropped consumed numbers too — so a gap is
+   * inconclusive; contiguous sequences still prove nothing was
+   * missed, and a sequence running backwards reveals a daemon
+   * restart. Not persisted: a restarted daemon numbers from 1 again,
+   * and 0 means the daemon predates sequencing.
    *
    * @generated from field: uint64 sequence = 5;
    */
