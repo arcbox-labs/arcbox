@@ -244,7 +244,9 @@ class SandboxInfo:
     idle_timeout: float | None = None
     #: Action applied when the idle timeout expires (None = daemon default).
     on_idle: IdlePolicy | None = None
-    #: On-disk footprint of retained state; paused sandboxes keep paying this.
+    #: On-disk footprint of retained state, in every lifecycle state: the
+    #: COW disk overlay while running, plus the pause checkpoint while
+    #: paused. Paused sandboxes keep paying this until resumed or removed.
     storage_bytes: int = 0
 
 

@@ -241,6 +241,14 @@ pub struct ComputerSnapshot {
     pub last_exit_status: Option<ExitStatus>,
     pub paused_at: Option<DateTime<Utc>>,
     pub pause_snapshot_id: Option<String>,
+    /// The live dm-snapshot overlay file, while the computer holds one.
+    ///
+    /// Carried on the snapshot because storage accounting must read it
+    /// lock-free: a computer that adopted a pre-warmed slot (CORE-78) keeps
+    /// its overlay under the slot's name until pause renames it, so the
+    /// path cannot be derived from the sandbox id alone. `None` in copy
+    /// mode and once pause has detached the overlay.
+    pub cow_file: Option<PathBuf>,
     pub deadlines: Deadlines,
 }
 
@@ -266,6 +274,10 @@ impl ComputerSnapshot {
             last_exit_status: runtime.last_exit_status,
             paused_at: runtime.paused_at,
             pause_snapshot_id: runtime.pause_snapshot_id.clone(),
+            cow_file: runtime
+                .cow_handle
+                .as_ref()
+                .map(|handle| handle.cow_file.clone()),
             deadlines,
         }
     }

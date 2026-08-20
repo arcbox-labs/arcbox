@@ -826,9 +826,9 @@ class Sandbox:
         """Checkpoint the sandbox to disk under the same id and release
         its runtime resources. Resume happens on the next ``connect``
         (or transparently, daemon-side, on the next data-plane call).
-        Trades RAM for disk: a paused sandbox keeps paying
-        ``storage_bytes``. Requires a quiescent sandbox (READY — no
-        running command)."""
+        Trades RAM for disk: the checkpoint joins the disk overlay in
+        ``storage_bytes`` until the sandbox is resumed or removed.
+        Requires a quiescent sandbox (READY — no running command)."""
         with wrap_errors("sandbox.pause"):
             # No per-request deadline: checkpointing takes as long as it
             # takes.

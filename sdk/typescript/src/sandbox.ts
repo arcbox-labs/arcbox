@@ -726,7 +726,8 @@ export class Sandbox {
    * Checkpoint the sandbox to disk under the same id and release its
    * runtime resources. Resume happens on the next {@link Sandbox.connect}
    * (or transparently, daemon-side, on the next data-plane call). Trades
-   * RAM for disk: a paused sandbox keeps paying `storageBytes`. Requires
+   * RAM for disk: the checkpoint joins the disk overlay in
+   * `storageBytes` until the sandbox is resumed or removed. Requires
    * a quiescent sandbox (READY — no running command).
    */
   async pause(): Promise<void> {

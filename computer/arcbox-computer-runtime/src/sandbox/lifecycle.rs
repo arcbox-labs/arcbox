@@ -645,12 +645,9 @@ impl SandboxManager {
         // Size the retained artifacts after the read: the sizing stats files
         // and scans the catalog, and the snapshot is a borrow of a `watch`
         // the actor writes.
-        let artifacts = (snapshot.state == SandboxState::Paused)
-            .then(|| super::pause::paused_artifacts(&self.config, id, &snapshot));
+        let artifacts = super::storage::retained_artifacts(&self.config, id, &snapshot);
         let mut info = snapshot_to_info(id, &snapshot);
-        if let Some(artifacts) = artifacts {
-            info.storage_bytes = artifacts.storage_bytes(|id| self.checkpoint_paths(id));
-        }
+        info.storage_bytes = artifacts.storage_bytes(|id| self.checkpoint_paths(id));
         Ok(info)
     }
 
@@ -672,9 +669,11 @@ impl SandboxManager {
             .iter()
             .map(|(id, computer)| (id.clone(), computer.snapshot.borrow().clone()))
             .collect();
-        // The second pass pays one catalog listing for the whole response
-        // instead of one per paused sandbox.
-        let mut summaries: Vec<(SandboxSummary, Option<super::pause::PausedArtifacts>)> = computers
+        // The second pass sizes every row — a couple of `stat` calls each,
+        // which is what keeps List and Inspect agreeing in every state — and
+        // pays one catalog listing for the whole response instead of one per
+        // paused sandbox (only paused rows carry a checkpoint to resolve).
+        let mut summaries: Vec<(SandboxSummary, super::storage::RetainedArtifacts)> = computers
             .iter()
             .filter_map(|(id, snapshot)| {
                 if let Some(sf) = state_filter
@@ -702,25 +701,27 @@ impl SandboxManager {
                     paused_at: snapshot.paused_at,
                     storage_bytes: 0,
                 };
-                let artifacts = (snapshot.state == SandboxState::Paused)
-                    .then(|| super::pause::paused_artifacts(&self.config, id, snapshot));
+                let artifacts = super::storage::retained_artifacts(&self.config, id, snapshot);
                 Some((summary, artifacts))
             })
             .collect();
 
-        if summaries.iter().any(|(_, artifacts)| artifacts.is_some()) {
-            let catalog = self.snapshots.list_all().unwrap_or_default();
-            for (summary, artifacts) in &mut summaries {
-                if let Some(artifacts) = artifacts {
-                    summary.storage_bytes = artifacts.storage_bytes(|id| {
-                        catalog
-                            .iter()
-                            .find(|info| info.id == id)
-                            .map(snapshot_files)
-                            .unwrap_or_default()
-                    });
-                }
-            }
+        let needs_catalog = summaries
+            .iter()
+            .any(|(_, artifacts)| artifacts.has_checkpoint());
+        let catalog = if needs_catalog {
+            self.snapshots.list_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for (summary, artifacts) in &mut summaries {
+            summary.storage_bytes = artifacts.storage_bytes(|id| {
+                catalog
+                    .iter()
+                    .find(|info| info.id == id)
+                    .map(snapshot_files)
+                    .unwrap_or_default()
+            });
         }
         Ok(summaries.into_iter().map(|(summary, _)| summary).collect())
     }
@@ -798,7 +799,7 @@ fn snapshot_to_info(id: &SandboxId, snapshot: &ComputerSnapshot) -> SandboxInfo 
         last_exit_status: snapshot.last_exit_status,
         error: snapshot.error.clone(),
         paused_at: snapshot.paused_at,
-        // Filled by the caller for paused computers (it owns the paths).
+        // Filled by the caller in every state (it owns the paths).
         storage_bytes: 0,
         ttl_deadline: snapshot.deadlines.ttl,
         idle_timeout_seconds: snapshot.deadlines.idle_timeout_seconds,

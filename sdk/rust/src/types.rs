@@ -60,8 +60,9 @@ pub struct SandboxInfo {
     pub idle_timeout: Option<Duration>,
     /// Action applied when the idle timeout expires (unset = daemon default).
     pub on_idle: Option<IdlePolicy>,
-    /// On-disk footprint of retained state; paused sandboxes keep paying
-    /// this.
+    /// On-disk footprint of retained state, in every lifecycle state: the
+    /// COW disk overlay while running, plus the pause checkpoint while
+    /// paused. Paused sandboxes keep paying this until resumed or removed.
     pub storage_bytes: u64,
 }
 
@@ -77,6 +78,8 @@ pub struct SandboxSummary {
     pub ready_at: Option<SystemTime>,
     pub paused_at: Option<SystemTime>,
     pub failed_at: Option<SystemTime>,
+    /// On-disk footprint of retained state; see
+    /// [`SandboxInfo::storage_bytes`], with which a listing agrees.
     pub storage_bytes: u64,
 }
 

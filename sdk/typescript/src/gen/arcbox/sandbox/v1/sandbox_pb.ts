@@ -184,6 +184,11 @@ export type CreateSandboxRequest = Message<"arcbox.sandbox.v1.CreateSandboxReque
    * Caller-supplied unique ID for durable retry idempotency.
    * If empty the daemon generates a fresh UUID for every attempt.
    *
+   * A supplied ID must be 1-64 characters of [A-Za-z0-9-]. The sandbox runs
+   * under this ID as its VMM instance identity, and the VMM refuses any
+   * other character - `_` and `.` included - so the daemon rejects it here
+   * rather than letting the boot fail with nothing naming the request.
+   *
    * @generated from field: string id = 1;
    */
   id: string;
@@ -762,8 +767,10 @@ export type SandboxInfo = Message<"arcbox.sandbox.v1.SandboxInfo"> & {
   failedAt?: Timestamp | undefined;
 
   /**
-   * On-disk footprint of the sandbox's retained state (checkpoint +
-   * disk overlay). Paused sandboxes keep paying this until removed.
+   * On-disk footprint of the sandbox's retained state, reported in
+   * every lifecycle state: the COW disk overlay its writes grow while
+   * running, plus the pause checkpoint while paused. Meterable —
+   * paused sandboxes keep paying it until resumed or removed.
    *
    * @generated from field: uint64 storage_bytes = 17;
    */
@@ -939,7 +946,9 @@ export type SandboxSummary = Message<"arcbox.sandbox.v1.SandboxSummary"> & {
   failedAt?: Timestamp | undefined;
 
   /**
-   * On-disk footprint of retained state; nonzero for paused sandboxes.
+   * On-disk footprint of retained state, in every lifecycle state:
+   * the COW disk overlay while running, plus the pause checkpoint
+   * while paused. Agrees with Inspect for the same sandbox.
    *
    * @generated from field: uint64 storage_bytes = 9;
    */
@@ -1456,8 +1465,8 @@ export enum IdleAction {
 
   /**
    * Pause: checkpoint to disk under the same ID and release the VM.
-   * Trades RAM for disk — the sandbox reports `storage_bytes` until
-   * resumed or removed.
+   * Trades RAM for disk — the checkpoint joins the disk overlay in
+   * `storage_bytes` until the sandbox is resumed or removed.
    *
    * @generated from enum value: IDLE_ACTION_PAUSE = 2;
    */
@@ -1581,8 +1590,8 @@ export const SandboxService: GenService<{
    * relocation constraint documented in `snapshot.proto` (CORE-21).
    * Returns once the sandbox reaches PAUSED; requires READY (no active
    * execution — see the state machine below for why RUNNING cannot
-   * pause). Trades RAM for disk: a paused sandbox keeps paying
-   * `storage_bytes` until removed.
+   * pause). Trades RAM for disk: the checkpoint joins the disk overlay
+   * in `storage_bytes`, paid until the sandbox is resumed or removed.
    *
    * @generated from rpc arcbox.sandbox.v1.SandboxService.Pause
    */

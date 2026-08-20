@@ -53,6 +53,7 @@ const SHORT_TMP_ROOT: &str = "/tmp";
 pub struct Setup {
     jailer: bool,
     warm: bool,
+    cow_probe: bool,
 }
 
 impl Setup {
@@ -68,6 +69,7 @@ impl Setup {
         Self {
             jailer: true,
             warm: false,
+            cow_probe: false,
         }
     }
 
@@ -77,7 +79,18 @@ impl Setup {
         Self {
             jailer: false,
             warm: false,
+            cow_probe: false,
         }
+    }
+
+    /// Run the copy-on-write rootfs on `CowTestProbe` instead of the copy
+    /// fallback, so every computer holds a live overlay handle the way a
+    /// node with device-mapper does. The probe assembles no real device —
+    /// its overlay file exists only if the test writes it.
+    #[must_use]
+    pub const fn with_cow_probe(mut self) -> Self {
+        self.cow_probe = true;
+        self
     }
 
     /// Serve eligible creates from warm snapshots, as a node does by
@@ -131,6 +144,9 @@ impl Setup {
         let ports = Ports {
             driver: FakeDriver::new(),
             agent: FakeAgentFactory::new(),
+            cow_probe: self
+                .cow_probe
+                .then(|| Arc::new(arcbox_computer_runtime::snapshot_cow::CowTestProbe::default())),
         };
         let manager = ports.manager(&config).await;
         Fixture {
@@ -148,10 +164,23 @@ impl Setup {
 struct Ports {
     driver: FakeDriver,
     agent: FakeAgentFactory,
+    cow_probe: Option<Arc<arcbox_computer_runtime::snapshot_cow::CowTestProbe>>,
 }
 
 impl Ports {
     async fn manager(&self, config: &RuntimeConfig) -> Arc<SandboxManager> {
+        let mut environment =
+            fake_environment(config).expect("a copy-on-write manager over the data dir");
+        if let Some(probe) = &self.cow_probe {
+            use arcbox_computer_runtime::snapshot_cow::{CowManager, CowOptions};
+            environment.cow_manager = Arc::new(
+                CowManager::new_with_test_probe(
+                    CowOptions::new(&config.firecracker.data_dir),
+                    Arc::clone(probe),
+                )
+                .expect("a probe-backed cow manager over the data dir"),
+            );
+        }
         let manager = SandboxManager::new(
             config.clone(),
             NodeEnvironment {
@@ -161,7 +190,7 @@ impl Ports {
                 driver: Arc::new(self.driver.clone()),
                 network: Arc::new(FakeNetwork::with_startup_cleanup("test-boot")),
                 agent: Arc::new(self.agent.clone()),
-                ..fake_environment(config).expect("a copy-on-write manager over the data dir")
+                ..environment
             },
         )
         .expect("the fakes offer every capability the manager requires")
@@ -217,6 +246,17 @@ impl Fixture {
     /// A computer's runtime directory.
     pub fn vm_dir(&self, id: &str) -> PathBuf {
         self.dir.path().join("sandboxes").join(id)
+    }
+
+    /// A computer's copy-on-write overlay file, as the probe names it
+    /// ([`Setup::with_cow_probe`] fixtures only — the probe assembles no
+    /// device, so the file exists once the test writes it).
+    pub fn cow_file(&self, id: &str) -> PathBuf {
+        use arcbox_computer_runtime::snapshot_cow::{COW_FILE_PREFIX, COW_FILE_SUFFIX};
+        self.dir
+            .path()
+            .join("cow")
+            .join(format!("{COW_FILE_PREFIX}{id}{COW_FILE_SUFFIX}"))
     }
 
     /// Stand a fresh manager up on the same data directory, the same

@@ -223,7 +223,10 @@ pub struct SandboxSummary {
     pub created_at: DateTime<Utc>,
     /// When the sandbox reached `Paused` (None otherwise).
     pub paused_at: Option<DateTime<Utc>>,
-    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    /// On-disk footprint of retained state, in every lifecycle state: the
+    /// COW disk overlay while running, plus the pause checkpoint while
+    /// paused (CORE-146). Copy-mode sandboxes (no overlay) report 0 until
+    /// paused parks their rootfs copy.
     pub storage_bytes: u64,
 }
 
@@ -242,7 +245,10 @@ pub struct SandboxInfo {
     pub error: Option<String>,
     /// When the sandbox reached `Paused` (None otherwise).
     pub paused_at: Option<DateTime<Utc>>,
-    /// On-disk footprint of retained pause state (checkpoint + overlay).
+    /// On-disk footprint of retained state, in every lifecycle state: the
+    /// COW disk overlay while running, plus the pause checkpoint while
+    /// paused (CORE-146). Copy-mode sandboxes (no overlay) report 0 until
+    /// paused parks their rootfs copy.
     pub storage_bytes: u64,
     /// When the hard maximum lifetime fires (None = no limit).
     pub ttl_deadline: Option<DateTime<Utc>>,

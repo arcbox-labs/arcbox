@@ -53,6 +53,7 @@ pub(crate) mod pool;
 pub(crate) mod reconcile;
 pub(crate) mod record;
 pub(crate) mod spec;
+mod storage;
 mod templates;
 mod timers;
 pub(crate) mod types;
