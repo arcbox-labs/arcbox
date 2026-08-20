@@ -105,7 +105,9 @@ export interface SandboxEvent {
    * too — while contiguous sequences prove nothing for this sandbox was
    * missed, and a sequence running backwards reveals a daemon restart.
    * When in doubt, re-derive state from {@link Sandbox.info}. `0` means
-   * the daemon predates sequencing.
+   * the daemon predates sequencing. Carried as a `number` (the SDK's
+   * convention for `uint64` fields): a single daemon would need ~2^53
+   * lifecycle events to reach the precision limit.
    */
   sequence: number;
 }
