@@ -79,6 +79,29 @@ const TEMPLATE_LOOP_DIR: &str = ".template-loops";
 const TEMPLATE_PENDING_PREFIX: &str = "pending-";
 const TEMPLATE_MARKER_TEMP_PREFIX: &str = ".tmp-";
 
+/// Whether device-mapper holds a device by this name.
+///
+/// Asked of the kernel rather than of `/dev/mapper`, for the same reason
+/// [`dm_device_path`] does not trust that directory: a teardown that reads a
+/// missing symlink as a missing device skips the removal and reports success,
+/// leaving the device and everything under it attached for good.
+fn dm_present(dm_name: &str) -> bool {
+    Path::new(&format!("/dev/mapper/{dm_name}")).exists() || devtmpfs_dm_node(dm_name).is_some()
+}
+
+/// The kernel's own node for `dm_name`, found by matching `dm/name` in sysfs.
+fn devtmpfs_dm_node(dm_name: &str) -> Option<String> {
+    std::fs::read_dir("/sys/block")
+        .ok()?
+        .flatten()
+        .find_map(|entry| -> Option<String> {
+            let name = entry.file_name();
+            let device = name.to_str().filter(|name| name.starts_with("dm-"))?;
+            let mapped = std::fs::read_to_string(entry.path().join("dm/name")).ok()?;
+            (mapped.trim() == dm_name).then(|| format!("/dev/{device}"))
+        })
+}
+
 /// Validate that `sandbox_id` can be used as the suffix of a dm-name.
 ///
 /// Device-mapper allows `[A-Za-z0-9_+.-]` (see kernel `validate_name`).
@@ -597,7 +620,7 @@ impl CowManager {
         let mut failures = Vec::new();
 
         // 1. Remove dm device.
-        let dm_removed = if !Path::new(&handle.dm_device).exists() {
+        let dm_removed = if !dm_present(&handle.dm_name) {
             true
         } else {
             match dmsetup_remove(dmsetup, &handle.dm_name).await {
@@ -680,7 +703,7 @@ impl CowManager {
             .ok_or_else(|| SnapshotError::DeviceMapper("dmsetup binary not found".into()))?;
         let mut failures = Vec::new();
 
-        if Path::new(&handle.dm_device).exists()
+        if dm_present(&handle.dm_name)
             && let Err(error) = dmsetup_remove(dmsetup, &handle.dm_name).await
         {
             failures.push(format!("remove {}: {error}", handle.dm_name));
@@ -748,6 +771,20 @@ async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
 }
 
 /// Create a dm-snapshot device via `dmsetup create`.
+///
+/// Followed by `dmsetup mknodes`, which is what makes `/dev/mapper/<name>`
+/// exist on a host running no udevd. Whether `dmsetup create` creates that
+/// node itself depends on how the binary was built: the System VM's makes it
+/// directly, while a distro's is built against libudev and defers to rules
+/// that never run when there is no daemon — leaving the device live, listed
+/// by `dmsetup ls`, and reachable only through the kernel's own `/dev/dm-N`.
+/// Everything downstream names the device by its `/dev/mapper` path, so it
+/// has to be there: without it the guest's disk is staged as a full rootfs
+/// copy instead of an overlay, and teardown reads a live device as gone.
+///
+/// A no-op where udev already made the node, and not fatal if it fails —
+/// the caller's first use of the path reports a missing node far more
+/// specifically than a failed `mknodes` could.
 async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(["create", name, "--table", table]);
@@ -759,6 +796,18 @@ async fn dmsetup_create(bin: &Path, name: &str, table: &str) -> Result<()> {
         return Err(SnapshotError::DeviceMapper(format!(
             "dmsetup create {name}: {stderr}"
         )));
+    }
+
+    let mut mknodes = Command::new(bin);
+    mknodes.args(["mknodes", name]);
+    match run_cmd(mknodes).await {
+        Ok(output) if !output.status.success() => debug!(
+            name,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "dmsetup mknodes reported a failure"
+        ),
+        Err(error) => debug!(name, %error, "could not run dmsetup mknodes"),
+        Ok(_) => {}
     }
     Ok(())
 }
