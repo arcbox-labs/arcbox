@@ -6,6 +6,7 @@
 //! is also where a caller parks until the effect that answers it lands.
 
 use chrono::Utc;
+use tracing::warn;
 
 use super::*;
 
@@ -149,6 +150,30 @@ impl ComputerActor {
                 }
             }
             Command::Detach { reply } => {
+                // The handover answers on its own outcome and nothing else.
+                //
+                // Answer state that is still set belongs to a flow that ended
+                // with nobody parked to hear it — an idle-driven pause whose
+                // `Pausing` write was refused is the reachable one, since
+                // `Durability::Warn` softens only an unconfirmed write, not a
+                // refused one. `answer` would fold it into this reply and
+                // report a guest lost that was in fact handed over, and
+                // unretryably: the state is terminal by then, so the retry
+                // answers `Ok` and contradicts the first answer. Going through
+                // `park` would report it *instead of* attempting the handover,
+                // which is the same false loss one step earlier. So it is
+                // dropped here, and logged, because nothing else can report it
+                // now. (`Remove` carries the same hazard and predates this;
+                // its answer at least stays consistent under a retry.)
+                let stale_failure = self.answer_error.take();
+                let stale_unconfirmed = self.unconfirmed.take();
+                if let Some(detail) = stale_failure.or(stale_unconfirmed) {
+                    warn!(
+                        sandbox_id = %self.id,
+                        detail,
+                        "dropping an unreported failure from an earlier flow; the handover answers for itself"
+                    );
+                }
                 // Parked *before* the dispatch, like a removal and for a
                 // sharper reason: the handover is awaited inside the effect
                 // rather than spawned, so `Answer::Detached` always lands

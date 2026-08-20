@@ -144,7 +144,19 @@ impl ComputerActor {
                 // already in flight rather than every caller for the duration.
                 let agent = self.snapshot_tx.borrow().agent.clone();
                 self.forget_agent();
-                match self.tasks.detach().await {
+                // Bounded because this one is awaited inline; see
+                // [`DETACH_TIMEOUT`]. A driver that hangs here loses this
+                // computer, not the whole pass.
+                let handover = match tokio::time::timeout(DETACH_TIMEOUT, self.tasks.detach()).await
+                {
+                    Ok(handover) => handover,
+                    Err(_) => Err(TaskFailure::recoverable(VmmError::Process(format!(
+                        "handing computer {} over did not finish within {}s",
+                        self.id,
+                        DETACH_TIMEOUT.as_secs()
+                    )))),
+                };
+                match handover {
                     // The machine has not moved yet: it emitted this effect
                     // and stayed put, so the handover's outcome is what
                     // decides.

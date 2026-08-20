@@ -365,10 +365,18 @@ impl ComputerLifecycle {
             // this process no longer owns. Refusing costs the departing
             // process's capture; accepting would corrupt the successor's
             // guest, and the caller hears which computer it lost.
+            // `Detached` is swallowed for the same reason as the `Detach` that
+            // would have produced it, and not only because none can arrive
+            // today: `Effect::Detach` is awaited inline, so its completion is
+            // drained inside the dispatch that asked for it, and this state
+            // never asks. Were it ever spawned like every sibling flow, a
+            // completion landing here would inherit `active`'s arm and detach
+            // mid-capture — exactly the corruption the refusal above prevents.
             Event::ClaimWorkload { .. }
             | Event::Pause { .. }
             | Event::Checkpoint
             | Event::Detach
+            | Event::Detached
             | Event::IdleExpired { .. } => Handled,
             _ => Super,
         }

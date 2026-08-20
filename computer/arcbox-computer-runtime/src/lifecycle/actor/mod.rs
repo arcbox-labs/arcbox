@@ -75,6 +75,18 @@ mod inflight;
 /// before giving up and retrying. Until that signal the task owns resources
 /// the computer does not, so aborting it would strand them.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the handover's port call may take before it is treated as a failed
+/// handover.
+///
+/// [`Effect::Detach`] is the one port call awaited on the actor task itself, so
+/// this bound is what keeps "releasing ownership has no wait in it" a property
+/// of this crate rather than a promise made about a driver two crates away.
+/// Today's is an atomic store and a oneshot send; one that ever did real work —
+/// an fsync'd adoption record, a remote control plane — would otherwise stall
+/// the command loop unpreemptibly, and every computer behind this one in a
+/// handover pass with it. A timeout leaves the computer exactly where a refused
+/// handover does: ours, usable, and dying with this process.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Backoff bounds for a teardown that could not take the handoff. Mirrors
 /// `cleanup::TTL_REMOVE_RETRY_*`; PR-F2 puts them on the injected `Clock`.
 const RETRY_INITIAL: Duration = Duration::from_millis(250);
