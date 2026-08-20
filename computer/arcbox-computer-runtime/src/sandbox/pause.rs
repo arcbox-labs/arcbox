@@ -29,7 +29,7 @@
 //! reconciliation, and `Remove` all see one naming scheme.
 
 use super::*;
-use crate::lifecycle::actor::{ComputerSnapshot, PauseReason};
+use crate::lifecycle::actor::PauseReason;
 
 /// Reserved catalog name for internal pause checkpoints.
 ///
@@ -159,60 +159,6 @@ impl SandboxManager {
             .as_ref()
             .map(|lease| lease.ip.to_string())
             .unwrap_or_default())
-    }
-}
-
-/// Locate a paused computer's retained artifacts.
-///
-/// Pure field reads — no filesystem access. The sizing itself
-/// ([`PausedArtifacts::storage_bytes`]) stats files and, for the checkpoint,
-/// needs a catalog lookup, which is why the two halves are separate: the read
-/// borrows the actor's `watch` and the sizing must not.
-pub(super) fn paused_artifacts(
-    config: &RuntimeConfig,
-    id: &SandboxId,
-    snapshot: &ComputerSnapshot,
-) -> PausedArtifacts {
-    PausedArtifacts {
-        pause_snapshot_id: snapshot.pause_snapshot_id.clone(),
-        preserved_cow: super::preserved_cow_file(config, id),
-        parked_rootfs: snapshot.vm_dir.join(PAUSED_ROOTFS_FILE),
-    }
-}
-
-/// Where a paused computer's retained state lives on disk.
-pub(super) struct PausedArtifacts {
-    /// Catalog id of the internal pause checkpoint.
-    pause_snapshot_id: Option<String>,
-    /// Retained dm-snapshot overlay (absent in copy-mode).
-    preserved_cow: PathBuf,
-    /// Copy-mode fallback: the staged rootfs parked in `vm_dir`.
-    parked_rootfs: PathBuf,
-}
-
-impl PausedArtifacts {
-    /// On-disk footprint: the checkpoint (vmstate + mem) plus the disk
-    /// overlay — allocated blocks, so a sparse COW is counted at its real
-    /// cost.
-    ///
-    /// `checkpoint_paths` resolves a pause-checkpoint id to its files. A
-    /// caller sizing many sandboxes should close over one catalog listing
-    /// rather than paying a catalog scan per sandbox.
-    pub(super) fn storage_bytes(&self, checkpoint_paths: impl FnOnce(&str) -> Vec<PathBuf>) -> u64 {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let allocated = |path: &Path| {
-            std::fs::metadata(path).map_or(0, |metadata| metadata.blocks().saturating_mul(512))
-        };
-        let checkpoint = self
-            .pause_snapshot_id
-            .as_deref()
-            .map(checkpoint_paths)
-            .unwrap_or_default();
-        checkpoint
-            .iter()
-            .chain([&self.preserved_cow, &self.parked_rootfs])
-            .fold(0u64, |total, path| total.saturating_add(allocated(path)))
     }
 }
 

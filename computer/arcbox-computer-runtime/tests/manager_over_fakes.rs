@@ -566,6 +566,49 @@ async fn a_pause_records_what_it_retained_and_a_resume_uses_it() {
     );
 }
 
+/// `storage_bytes` meters disk in every state, not only `Paused`
+/// (CORE-146): a running computer reports its live COW overlay — the one
+/// file its disk writes grow — List agrees with Inspect on it, and the
+/// pause checkpoint is paid *on top of* the overlay, not instead of it.
+#[tokio::test]
+async fn storage_bytes_meters_the_overlay_while_running_and_list_agrees() {
+    let fixture = Setup::jailed().with_cow_probe().build().await;
+    let id = fixture.ready("meter").await;
+
+    // The probe assembles no device, so the overlay costs what the test
+    // writes into it.
+    let overlay = fixture.cow_file(&id);
+    std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+    std::fs::write(&overlay, vec![0xA5; 256 * 1024]).unwrap();
+
+    let info = fixture.manager.inspect_sandbox(&id).unwrap();
+    assert!(
+        info.storage_bytes >= 256 * 1024,
+        "a running computer's live overlay is metered, got {}",
+        info.storage_bytes
+    );
+    let listed = fixture
+        .manager
+        .list_sandboxes(None, &HashMap::new())
+        .unwrap();
+    let summary = listed.iter().find(|entry| entry.id == id).unwrap();
+    assert_eq!(
+        summary.storage_bytes, info.storage_bytes,
+        "List and Inspect agree on a running computer's footprint"
+    );
+
+    fixture.manager.pause_sandbox(&id).await.unwrap();
+    fixture.await_state(&id, SandboxState::Paused).await;
+    let paused = fixture.manager.inspect_sandbox(&id).unwrap();
+    assert!(
+        paused.storage_bytes > info.storage_bytes,
+        "pausing adds the checkpoint on top of the retained overlay \
+         ({} vs {})",
+        paused.storage_bytes,
+        info.storage_bytes
+    );
+}
+
 /// Pause is idempotent on `Paused` and refuses a busy computer.
 #[tokio::test]
 async fn pause_is_idempotent_and_gates_on_state() {
