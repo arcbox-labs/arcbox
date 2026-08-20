@@ -615,6 +615,19 @@ pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
         .and_then(|process| i32::try_from(process.pid).ok())
 }
 
+/// The VMM's API socket as the crash journal records it: what lets the next
+/// process adopt this VM instead of killing it.
+///
+/// The driver knows the path because it spawned the VMM there. Nothing else
+/// can work it out afterwards — see
+/// [`SandboxStateRecord::api_socket`](crate::sandbox::reconcile::SandboxStateRecord::api_socket).
+pub(crate) fn journaled_api_socket(prepared: &dyn PreparedVm) -> Option<PathBuf> {
+    prepared
+        .record()
+        .process
+        .and_then(|process| process.api_socket)
+}
+
 /// The isolation every sandbox VMM runs under: the jailer's, when one is
 /// configured; none otherwise (direct mode).
 pub(crate) fn isolation_spec(config: &RuntimeConfig) -> Result<IsolationSpec> {
