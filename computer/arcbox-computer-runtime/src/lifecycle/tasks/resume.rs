@@ -70,14 +70,29 @@ pub async fn restore_paused(
                     .await?,
             );
         }
-        let journal = |pid: Option<i32>, cow: Option<&CowHandle>, net: Option<&NetworkLease>| {
+        // The VMM travels as itself rather than as a pid, so its socket cannot
+        // be left behind: a record naming a live VMM without one is not
+        // adoptable under the jailer, and resume is jailer-only.
+        let journal = |vmm: Option<&Arc<dyn PreparedVm>>,
+                       cow: Option<&CowHandle>,
+                       net: Option<&NetworkLease>| {
             // The lease attaches the way the snapshot says, exactly as
             // the `activate` below does — the same expression, so the
             // journal and the datapath cannot disagree.
             let net =
                 net.map(|lease| JournaledLease::from_snapshot(lease, snap_meta.net_invariant));
-            sandbox::reconcile::SandboxStateRecord::new(id, pid, net, cow, config, None)
-                .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
+            sandbox::reconcile::SandboxStateRecord::new(
+                id,
+                vmm.and_then(|vmm| sandbox::journaled_pid(&**vmm)),
+                net,
+                cow,
+                config,
+                None,
+            )
+            .map(|record| {
+                record.with_api_socket(vmm.and_then(|vmm| sandbox::journaled_api_socket(&**vmm)))
+            })
+            .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
         };
         journal(None, None, lease.as_ref())?;
         if let Some(lease) = &lease {
@@ -99,10 +114,9 @@ pub async fn restore_paused(
                 .prepare(&VmId::new(id)?, &IsolationSpec::try_from(jailer)?, vm_dir)
                 .await?,
         );
-        let pid = sandbox::journaled_pid(&*spawned);
         let staging = sandbox::staging_capability(spawned.staging());
         prepared = Some(Arc::clone(&spawned));
-        journal(pid, None, lease.as_ref())?;
+        journal(Some(&spawned), None, lease.as_ref())?;
 
         // Bring the kernel, the retained disk and the checkpoint into the
         // area the fresh VMM reads from.
@@ -117,7 +131,7 @@ pub async fn restore_paused(
                 ))
             })?;
             let handle = cow_manager.reattach(id, template).await?;
-            journal(pid, Some(&handle), lease.as_ref())?;
+            journal(prepared.as_ref(), Some(&handle), lease.as_ref())?;
             let staged = staging
                 .stage_disk(
                     ROOTFS_DISK_ID,
@@ -212,7 +226,7 @@ pub async fn restore_paused(
             .and_then(|r| r)?;
         }
 
-        journal(pid, cow_handle.as_ref(), lease.as_ref())?;
+        journal(prepared.as_ref(), cow_handle.as_ref(), lease.as_ref())?;
         Ok(ResumedRuntime {
             prepared: prepared.take().expect("prepared set above"),
             handle,

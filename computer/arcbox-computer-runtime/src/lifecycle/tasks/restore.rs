@@ -158,7 +158,11 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                 config,
                 None,
             )
-            .map(|record| record.with_pool_slot(Some(&slot.slot_id)))
+            .map(|record| {
+                record
+                    .with_api_socket(sandbox::journaled_api_socket(&*slot.prepared))
+                    .with_pool_slot(Some(&slot.slot_id))
+            })
             .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record));
             let PreparedSlot {
                 slot_id,
@@ -239,6 +243,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
             };
 
             let pid = sandbox::journaled_pid(&*spawned_prepared);
+            let api_socket = sandbox::journaled_api_socket(&*spawned_prepared);
             let journal = |cow: Option<&CowHandle>| {
                 sandbox::reconcile::SandboxStateRecord::new(
                     new_id,
@@ -250,6 +255,7 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
                     config,
                     None,
                 )
+                .map(|record| record.with_api_socket(api_socket.clone()))
                 .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
             };
             if let Err(error) = journal(None) {
@@ -466,7 +472,11 @@ pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm
         config,
         None,
     )
-    .map(|record| record.with_pool_slot(adopted_slot.as_deref()))
+    .map(|record| {
+        record
+            .with_api_socket(sandbox::journaled_api_socket(&*prepared))
+            .with_pool_slot(adopted_slot.as_deref())
+    })
     .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record));
     if let Err(error) = final_journal {
         return Err(RestoreFailure {
