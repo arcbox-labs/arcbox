@@ -117,9 +117,10 @@ fn jail_root_of(pid: u32) -> Option<PathBuf> {
 /// its own default (`/run/firecracker.socket`) and says so nowhere a reader
 /// of `/proc` can see it. Its host path is the jail's — the same path
 /// [`VmLayout::api_socket`](crate::render::VmLayout::api_socket) hands the
-/// spawn, through the same [`jail::api_socket_path`]. Falling through to the
-/// direct-mode path instead dials a socket nobody bound, and an adopt that
-/// cannot reach the API settles for a process it can only kill.
+/// spawn, through the same [`api_socket_path`](crate::jail::api_socket_path).
+/// Falling through to the direct-mode path instead dials a socket nobody
+/// bound, and an adopt that cannot reach the API settles for a process it
+/// can only kill.
 fn default_api_socket(jail_root: Option<&Path>, runtime_dir: &Path) -> PathBuf {
     match jail_root {
         Some(root) => crate::jail::api_socket_path(root),
