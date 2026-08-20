@@ -101,6 +101,10 @@ export type RestoreRequest = Message<"arcbox.sandbox.v1.RestoreRequest"> & {
    * Caller-supplied ID for durable retry idempotency. Empty asks the daemon
    * to generate a fresh UUID for every attempt.
    *
+   * Same rule as CreateSandboxRequest.id: 1-64 characters of [A-Za-z0-9-],
+   * because the restored sandbox runs under this ID as its VMM instance
+   * identity.
+   *
    * @generated from field: string id = 1;
    */
   id: string;

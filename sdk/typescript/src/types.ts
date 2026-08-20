@@ -58,7 +58,11 @@ export interface SandboxInfo {
   idleTimeoutMs?: number;
   /** Action applied when the idle timeout expires (unset = daemon default). */
   onIdle?: IdlePolicy;
-  /** On-disk footprint of retained state; paused sandboxes keep paying this. */
+  /**
+   * On-disk footprint of retained state, in every lifecycle state: the
+   * COW disk overlay while running, plus the pause checkpoint while
+   * paused. Paused sandboxes keep paying this until resumed or removed.
+   */
   storageBytes: number;
 }
 
@@ -125,6 +129,10 @@ export interface SandboxSummary {
   readyAt?: Date;
   pausedAt?: Date;
   failedAt?: Date;
+  /**
+   * On-disk footprint of retained state; see {@link SandboxInfo.storageBytes},
+   * with which a listing agrees.
+   */
   storageBytes: number;
 }
 
