@@ -97,6 +97,14 @@ export interface SandboxEvent {
    * `"failed"`, `reason` on `"pausing"`/`"resumed"`.
    */
   attributes: Record<string, string>;
+  /**
+   * Monotonic sequence number: 1-based, global across all sandboxes of
+   * the emitting daemon, contiguous in delivery order. A jump of more
+   * than one means events were missed — fall back to list/inspect
+   * instead of carrying stale state. Resets when the daemon restarts;
+   * `0` means the daemon predates sequencing.
+   */
+  sequence: number;
 }
 
 /** Nested-virtualization support on this host. */
@@ -288,6 +296,7 @@ export function sandboxEventFromProto(event: SandboxEventProto): SandboxEvent {
     sandboxId: event.sandboxId,
     kind: EVENT_KIND_NAMES[event.kind] ?? "unknown",
     attributes: event.attributes,
+    sequence: Number(event.sequence),
   };
   assignIfSet(out, "time", optionalDate(event.time));
   return out;

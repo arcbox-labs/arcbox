@@ -152,6 +152,13 @@ pub struct SandboxEvent {
     /// Per-kind context: `exit_code`/`signal` on `Idle`, `error` on
     /// `Failed`, `reason` on `Pausing`/`Resumed`.
     pub attributes: BTreeMap<String, String>,
+    /// Monotonic sequence number: 1-based, global across all sandboxes of
+    /// the emitting daemon, contiguous in delivery order. A jump of more
+    /// than one means events were missed — fall back to
+    /// [`crate::ArcBox::list`] / `Sandbox::info` instead of carrying stale
+    /// state. Resets when the daemon restarts; `0` means the daemon
+    /// predates sequencing.
+    pub sequence: u64,
 }
 
 /// One knob of a lifecycle update: leave it, clear it to the daemon
@@ -343,6 +350,7 @@ impl From<pb::SandboxEvent> for SandboxEvent {
             kind,
             time: time_from_wire(event.time.as_option()),
             attributes: event.attributes.into_iter().collect(),
+            sequence: event.sequence,
         }
     }
 }

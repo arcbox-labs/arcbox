@@ -806,6 +806,12 @@ export class Sandbox {
    * loop cancels the subscription. A transport drop mid-stream is
    * surfaced as {@link ConnectionLostError} — re-subscribing is the
    * caller's decision, since missed events cannot be replayed.
+   *
+   * Delivery is best-effort: a slow consumer can lose events, and
+   * history from before the subscription is gone. Loss is detectable
+   * via {@link SandboxEvent.sequence} — a jump of more than one means
+   * events were missed; re-derive state from {@link Sandbox.info}
+   * instead of carrying stale state.
    */
   events(): AsyncIterable<SandboxEvent> {
     return this.#streamEvents();
