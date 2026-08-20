@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use statig::blocking::IntoStateMachineExt;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::debug;
 use uuid::Uuid;
@@ -380,7 +380,7 @@ pub struct ComputerActor {
     generation: Option<Uuid>,
     vm_dir: PathBuf,
     records: Arc<SandboxRecordStore>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    events: Arc<crate::sandbox::events::EventBus>,
     tasks: Arc<dyn ComputerTasks>,
     seeded: Seeded,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -470,7 +470,7 @@ pub struct ComputerSeed {
     pub generation: Option<Uuid>,
     pub vm_dir: PathBuf,
     pub records: Arc<SandboxRecordStore>,
-    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub events: Arc<crate::sandbox::events::EventBus>,
     pub tasks: Arc<dyn ComputerTasks>,
     pub deadlines: Deadlines,
     pub timers_enabled: watch::Receiver<bool>,
@@ -491,7 +491,7 @@ impl ComputerActor {
             generation: seed.generation,
             vm_dir: seed.vm_dir,
             records: seed.records,
-            events_tx: seed.events_tx,
+            events: seed.events,
             tasks: seed.tasks,
             seeded: seed.seeded,
             commands,

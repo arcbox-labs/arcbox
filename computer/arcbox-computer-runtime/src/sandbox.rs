@@ -44,6 +44,7 @@ use crate::template_catalog::TemplateCatalog;
 pub(crate) mod boot;
 mod checkpoint;
 pub(crate) mod cleanup;
+pub(crate) mod events;
 mod execution;
 mod files;
 mod lifecycle;
@@ -104,7 +105,7 @@ pub struct SandboxManager {
     /// Template catalog (CORE-107); see `templates.rs` for the manager surface.
     templates: Arc<TemplateCatalog>,
     config: Arc<RuntimeConfig>,
-    events_tx: broadcast::Sender<SandboxEvent>,
+    events: Arc<events::EventBus>,
     cow_manager: Arc<CowManager>,
     /// Pre-warmed restore slots (CORE-78); see `pool.rs`.
     pool: Arc<pool::SlotPool>,
@@ -196,7 +197,7 @@ impl SandboxManager {
         }
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let templates = Arc::new(TemplateCatalog::new(&config.firecracker.data_dir));
-        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let events = Arc::new(events::EventBus::new(EVENT_CHANNEL_CAPACITY));
         let config = Arc::new(config);
 
         // Sweep leftovers of a previous agent process (crash / respawn):
@@ -218,7 +219,7 @@ impl SandboxManager {
             cow_manager: Arc::clone(&cow_manager),
             records: Arc::clone(&records),
             snapshots: Arc::clone(&snapshots),
-            events_tx: events_tx.clone(),
+            events: Arc::clone(&events),
             pool: Arc::clone(&pool),
         });
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -276,7 +277,7 @@ impl SandboxManager {
             // Executions die with their sandbox; purge on terminal events so
             // every teardown path (stop / remove / TTL / boot failure) is
             // covered without threading the registry through each of them.
-            execution::spawn_teardown_purge(Arc::clone(&executions), events_tx.subscribe());
+            execution::spawn_teardown_purge(Arc::clone(&executions), events.subscribe());
         } else {
             let mut inactive = Vec::new();
             reconcile::normalize_durable_records(
@@ -297,7 +298,7 @@ impl SandboxManager {
             snapshots,
             templates,
             config,
-            events_tx,
+            events,
             cow_manager,
             pool,
             warm: Arc::new(warm::WarmCache::default()),
@@ -843,7 +844,7 @@ impl ActorReservation {
                 generation,
                 vm_dir,
                 records: Arc::clone(&services.records),
-                events_tx: services.events_tx.clone(),
+                events: Arc::clone(&services.events),
                 tasks: flows,
                 deadlines,
                 timers_enabled,

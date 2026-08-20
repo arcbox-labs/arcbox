@@ -18,7 +18,6 @@ use std::time::Duration;
 use arcbox_vm_driver::NicSpec;
 use arcbox_vm_driver::VmDriver;
 use arcbox_vm_driver::net::{GuestNetwork, NetworkLease};
-use tokio::sync::broadcast;
 
 use async_trait::async_trait;
 
@@ -34,7 +33,7 @@ use crate::sandbox::pool::SlotPool;
 use crate::sandbox::record::SandboxProvisionOutcome;
 use crate::sandbox::record::SandboxRecordStore;
 use crate::sandbox::warm::WarmPublishTicket;
-use crate::sandbox::{CheckpointInfo, NetworkAttachment, SandboxEvent, SandboxId};
+use crate::sandbox::{CheckpointInfo, NetworkAttachment, SandboxId};
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::CowManager;
 
@@ -55,7 +54,7 @@ pub struct ComputerServices {
     pub cow_manager: Arc<CowManager>,
     pub records: Arc<SandboxRecordStore>,
     pub snapshots: Arc<SnapshotCatalog>,
-    pub events_tx: broadcast::Sender<SandboxEvent>,
+    pub events: Arc<crate::sandbox::events::EventBus>,
     pub pool: Arc<SlotPool>,
 }
 
