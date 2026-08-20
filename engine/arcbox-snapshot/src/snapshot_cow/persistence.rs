@@ -409,7 +409,11 @@ impl CowManager {
         let mut failures = Vec::new();
         let mut orphan = SetupOrphan::default();
         let dm_removed = match dm_name {
-            Some(dm_name) if Path::new(&format!("/dev/mapper/{dm_name}")).exists() => {
+            // Asked of device-mapper rather than of `/dev/mapper`: a setup
+            // that failed *because* the node was never created still has a
+            // live device to reclaim, and stat-ing the absent node would
+            // strand exactly what this rollback exists to remove.
+            Some(dm_name) if super::dm_present(dm_name) => {
                 let cleanup = match self.dmsetup_bin.as_deref() {
                     Some(dmsetup) => dmsetup_remove(dmsetup, dm_name).await,
                     None => Err(SnapshotError::DeviceMapper(
