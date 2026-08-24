@@ -186,7 +186,7 @@ pub async fn do_boot(
     };
 
     let process_pid = sandbox::journaled_pid(&*prepared);
-    let api_socket = sandbox::journaled_api_socket(&*prepared);
+    let vmm = sandbox::journaled_vmm(&*prepared);
     let journal_error = sandbox::reconcile::SandboxStateRecord::new(
         id,
         process_pid,
@@ -195,7 +195,7 @@ pub async fn do_boot(
         config,
         None,
     )
-    .map(|record| record.with_api_socket(api_socket.clone()))
+    .map(|record| record.with_vmm(vmm.clone()))
     .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
     .err();
 
@@ -253,7 +253,7 @@ pub async fn do_boot(
                     config,
                     None,
                 )
-                .map(|record| record.with_api_socket(api_socket.clone()))
+                .map(|record| record.with_vmm(vmm.clone()))
                 .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
             };
             let staged = stage_rootfs_cow_or_copy(
@@ -299,7 +299,7 @@ pub async fn do_boot(
                         config,
                         None,
                     )?
-                    .with_api_socket(api_socket.clone());
+                    .with_vmm(vmm.clone());
                     sandbox::reconcile::write_state_record(vm_dir, &record)?;
                     create_rootfs_symlink(vm_dir, &cow_handle.as_ref().unwrap().dm_device)?
                 }

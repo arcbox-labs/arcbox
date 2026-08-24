@@ -176,12 +176,11 @@ async fn stage_slot(
             .map_err(VmmError::from)?,
     );
     let pid = super::journaled_pid(&*prepared);
-    let api_socket = super::journaled_api_socket(&*prepared);
+    let vmm = super::journaled_vmm(&*prepared);
     let journal = |cow: Option<&CowHandle>| {
         reconcile::write_state_record(
             vm_dir,
-            &SandboxStateRecord::new(slot_id, pid, None, cow, config, None)?
-                .with_api_socket(api_socket.clone()),
+            &SandboxStateRecord::new(slot_id, pid, None, cow, config, None)?.with_vmm(vmm.clone()),
         )
     };
     let carry = |error: VmmError, prepared, cow_handle| SlotFailure {

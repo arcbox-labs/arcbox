@@ -47,7 +47,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_vm_driver::net::{AttachMode, GuestNetwork, NetworkIdentity, NetworkLease};
-use arcbox_vm_driver::{ProcessRecord, ShutdownMode, VmDriver, VmHandle, VmId, VmRecord, VmState};
+use arcbox_vm_driver::{
+    JailRecord, ProcessRecord, ShutdownMode, VmDriver, VmHandle, VmId, VmRecord, VmState,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -216,6 +218,72 @@ pub struct SandboxStateRecord {
     /// written before this field existed — those adopt exactly as before.
     #[serde(default)]
     pub api_socket: Option<PathBuf>,
+    /// The jail the VMM runs in, when it runs in one.
+    ///
+    /// Unobservable afterwards for the same reason [`Self::api_socket`] is
+    /// — the jailer has pivoted out of view — and so, like it, the sweep's
+    /// only way to hand the driver the truth. An adopt that has to guess
+    /// concludes the VM is unconfined and rebuilds it that way: a Computer
+    /// that can then neither be reached nor checkpointed (CORE-155).
+    ///
+    /// `None` for a VMM that runs unconfined, for a record with no VMM, and
+    /// for one written before this field existed.
+    #[serde(default)]
+    pub jail: Option<JournaledJail>,
+}
+
+/// The jail a VMM runs in, in the journal's own vocabulary.
+///
+/// A journal-local mirror of [`JailRecord`] rather than that type itself,
+/// on the same rule as [`JournaledAllocation`]: this file's encoding is
+/// frozen (`RECORD_VERSION` 1 has no migration story) and the port's type
+/// is free to grow. It is also `#[non_exhaustive]`'s neighbour in a way
+/// that matters here — a variant or shape added upstream would land in
+/// records this agent must keep reading, and a journal that fails to parse
+/// is a sandbox the sweep cannot reclaim at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournaledJail {
+    /// The chroot the VMM is confined to, as the host names it.
+    pub root: PathBuf,
+    /// The uid the VMM runs as.
+    pub uid: u32,
+    /// The gid the VMM runs as.
+    pub gid: u32,
+}
+
+impl From<JailRecord> for JournaledJail {
+    fn from(jail: JailRecord) -> Self {
+        Self {
+            root: jail.root,
+            uid: jail.uid,
+            gid: jail.gid,
+        }
+    }
+}
+
+impl From<JournaledJail> for JailRecord {
+    fn from(jail: JournaledJail) -> Self {
+        Self {
+            root: jail.root,
+            uid: jail.uid,
+            gid: jail.gid,
+        }
+    }
+}
+
+/// What a live VMM is, beyond the pid: where its API answers and what it is
+/// confined to.
+///
+/// One value rather than two `with_*` calls, because a journal site that
+/// records one without the other is the bug both fields exist to prevent —
+/// and because only the paths that hold a VMM can answer either
+/// ([`SandboxStateRecord::with_vmm`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JournaledVmm {
+    /// The API socket, as this host reaches it.
+    pub api_socket: Option<PathBuf>,
+    /// The jail it runs in, when it runs in one.
+    pub jail: Option<JournaledJail>,
 }
 
 /// How a lease's host side was attached, in the journal's own vocabulary.
@@ -361,16 +429,21 @@ impl SandboxStateRecord {
             attach_mode: network.map(|net| net.mode.into()),
             net_invariant: network.is_some_and(|net| net.invariant_identity),
             api_socket: None,
+            jail: None,
         })
     }
 
-    /// Record where the VMM's API socket is, for the process that adopts it.
+    /// Record what the VMM is, for the process that adopts it: where its
+    /// API answers, and what it is confined to.
     ///
     /// Separate from [`Self::new`] because only the paths that hold a VMM can
     /// answer it: a cleanup record written after teardown has none. See
-    /// [`Self::api_socket`] for why it cannot be re-derived later.
-    pub fn with_api_socket(mut self, socket: Option<PathBuf>) -> Self {
-        self.api_socket = socket;
+    /// [`Self::api_socket`] and [`Self::jail`] for why neither can be
+    /// re-derived later.
+    pub fn with_vmm(mut self, vmm: Option<JournaledVmm>) -> Self {
+        let vmm = vmm.unwrap_or_default();
+        self.api_socket = vmm.api_socket;
+        self.jail = vmm.jail;
         self
     }
 
@@ -1332,11 +1405,7 @@ fn vm_record(
             .map(|pid| ProcessRecord {
                 pid,
                 api_socket: record.api_socket.clone(),
-                // Not journaled yet. Adoption reads a missing jail as
-                // unconfined, which is the answer the `/proc` inference it
-                // replaces reached for a jailed VMM anyway: a jailer that
-                // has pivoted shows a root of `/`.
-                jail: None,
+                jail: record.jail.clone().map(JailRecord::from),
             }),
     })
 }
@@ -1574,9 +1643,10 @@ mod tests {
             Some(serde_json::json!(true))
         );
         // Null here rather than absent, and null for exactly the reason a
-        // cleanup record has no socket: the constructor never knows one, only
-        // the boot and restore paths that hold the VMM do.
+        // cleanup record has no socket or jail: the constructor never knows
+        // either, only the boot and restore paths that hold the VMM do.
         assert_eq!(fields.remove("api_socket"), Some(serde_json::Value::Null));
+        assert_eq!(fields.remove("jail"), Some(serde_json::Value::Null));
         assert_eq!(
             value,
             serde_json::from_str::<serde_json::Value>(LEGACY_RECORD).unwrap()
@@ -1781,6 +1851,11 @@ mod tests {
             attach_mode: Some(JournaledAttachMode::Invariant),
             net_invariant: true,
             api_socket: Some("/srv/jailer/firecracker/sb-1/root/run/firecracker.socket".into()),
+            jail: Some(JournaledJail {
+                root: "/srv/jailer/firecracker/sb-1/root".into(),
+                uid: 123,
+                gid: 456,
+            }),
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         let parsed: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
@@ -1794,6 +1869,16 @@ mod tests {
                 "/srv/jailer/firecracker/sb-1/root/run/firecracker.socket"
             ))
         );
+        // As does the jail, for the same reason: a VM adopted back as
+        // unconfined can be neither reached nor checkpointed.
+        assert_eq!(
+            parsed.jail,
+            Some(JournaledJail {
+                root: "/srv/jailer/firecracker/sb-1/root".into(),
+                uid: 123,
+                gid: 456,
+            })
+        );
         assert!(parsed.jailer);
         assert_eq!(parsed.pool_slot_id.as_deref(), Some("pool-1"));
         assert_eq!(parsed.resource_owner(), "pool-1");
@@ -1801,12 +1886,15 @@ mod tests {
         assert_eq!(handle.dm_name, "arcbox-snap-sb-1");
     }
 
-    /// The journal is the only place a jailed VMM's socket survives, so the
-    /// record the sweep hands `Adopt` has to carry it: without it the driver
-    /// re-derives one from `/proc/<pid>/root`, which reads `/` for a jailed
-    /// VMM, dials a path nothing bound, and settles for a kill-only handle.
+    /// The journal is the only place a jailed VMM's socket and jail
+    /// survive, so the record the sweep hands `Adopt` has to carry both:
+    /// without them the driver re-derives from `/proc/<pid>/root`, which
+    /// reads `/` for a jailed VMM. It then dials a path nothing bound and
+    /// settles for a kill-only handle (CORE-149), and concludes the VM runs
+    /// unconfined, which costs the adopted Computer its exec and its
+    /// checkpoints (CORE-155).
     #[test]
-    fn the_adopt_record_carries_the_journaled_api_socket() {
+    fn the_adopt_record_carries_the_journaled_vmm() {
         use arcbox_vm_driver::testkit::FakeDriver;
 
         let socket = Path::new("/srv/jailer/firecracker/box/root/run/firecracker.socket");
@@ -1821,6 +1909,11 @@ mod tests {
             attach_mode: None,
             net_invariant: false,
             api_socket: Some(socket.to_path_buf()),
+            jail: Some(JournaledJail {
+                root: "/srv/jailer/firecracker/box/root".into(),
+                uid: 123,
+                gid: 456,
+            }),
         };
 
         let record = vm_record(&FakeDriver::new(), Path::new("/data/box"), &journaled).unwrap();
@@ -1828,6 +1921,64 @@ mod tests {
         let process = record.process.expect("a journaled pid is a process");
         assert_eq!(process.pid, 4242);
         assert_eq!(process.api_socket.as_deref(), Some(socket));
+        assert_eq!(
+            process.jail,
+            Some(arcbox_vm_driver::JailRecord {
+                root: "/srv/jailer/firecracker/box/root".into(),
+                uid: 123,
+                gid: 456,
+            })
+        );
+    }
+
+    /// The other end of that record: what a journal site actually writes.
+    /// The driver knows the jail because it spawned the VMM there, and the
+    /// whole chain — prepared VM, journal, disk, adopt record — has to
+    /// carry it, since no later process can ask the VMM itself.
+    #[tokio::test]
+    async fn a_jailed_vmms_journal_carries_its_jail_from_the_driver_to_the_adopt() {
+        use arcbox_vm_driver::testkit::FakeDriver;
+        use arcbox_vm_driver::{IsolationSpec, VmId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let driver = FakeDriver::new();
+        let isolation = IsolationSpec::Jailer {
+            uid: 7,
+            gid: 8,
+            chroot_base: dir.path().join("jail"),
+            netns: None,
+            new_pid_ns: false,
+            cgroup: None,
+        };
+        let prepared = driver
+            .prepare()
+            .unwrap()
+            .prepare(&VmId::new("box").unwrap(), &isolation, dir.path())
+            .await
+            .unwrap();
+
+        let journaled = SandboxStateRecord::new(
+            "box",
+            crate::sandbox::journaled_pid(&*prepared),
+            None,
+            None,
+            &RuntimeConfig::default(),
+            None,
+        )
+        .unwrap()
+        .with_vmm(crate::sandbox::journaled_vmm(&*prepared));
+        write_state_record(dir.path(), &journaled).unwrap();
+
+        let bytes = std::fs::read(dir.path().join(STATE_FILE)).unwrap();
+        let reloaded: SandboxStateRecord = serde_json::from_slice(&bytes).unwrap();
+        let process = vm_record(&driver, dir.path(), &reloaded)
+            .unwrap()
+            .process
+            .expect("a journaled pid is a process");
+        assert_eq!(
+            process.jail.map(|jail| jail.root),
+            Some(dir.path().join("jail/box"))
+        );
     }
 
     #[test]
@@ -1855,6 +2006,7 @@ mod tests {
             attach_mode: None,
             net_invariant: false,
             api_socket: None,
+            jail: None,
         };
 
         // Slot-keyed resources validate against the slot id, not the sandbox id.

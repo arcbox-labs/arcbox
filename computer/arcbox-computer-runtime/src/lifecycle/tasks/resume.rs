@@ -89,9 +89,7 @@ pub async fn restore_paused(
                 config,
                 None,
             )
-            .map(|record| {
-                record.with_api_socket(vmm.and_then(|vmm| sandbox::journaled_api_socket(&**vmm)))
-            })
+            .map(|record| record.with_vmm(vmm.and_then(|vmm| sandbox::journaled_vmm(&**vmm))))
             .and_then(|record| sandbox::reconcile::write_state_record(vm_dir, &record))
         };
         journal(None, None, lease.as_ref())?;
