@@ -249,11 +249,13 @@ jobs:
       - name: Run E2E tests (as root, one at a time)
         env:
           FC_BINARY: /tmp/fc-assets/firecracker
+          FC_JAILER: /tmp/fc-assets/jailer
           FC_KERNEL: /tmp/fc-assets/vmlinux
           FC_ROOTFS: /tmp/fc-assets/rootfs.ext4
         run: |
           sudo env PATH="$PATH" HOME="$HOME" \
-            FC_BINARY="$FC_BINARY" FC_KERNEL="$FC_KERNEL" FC_ROOTFS="$FC_ROOTFS" \
+            FC_BINARY="$FC_BINARY" FC_JAILER="$FC_JAILER" \
+            FC_KERNEL="$FC_KERNEL" FC_ROOTFS="$FC_ROOTFS" \
             cargo test --test sandbox_manager_e2e -p arcbox-agent \
             -- --include-ignored --test-threads=1
 
