@@ -1332,6 +1332,11 @@ fn vm_record(
             .map(|pid| ProcessRecord {
                 pid,
                 api_socket: record.api_socket.clone(),
+                // Not journaled yet. Adoption reads a missing jail as
+                // unconfined, which is the answer the `/proc` inference it
+                // replaces reached for a jailed VMM anyway: a jailer that
+                // has pivoted shows a root of `/`.
+                jail: None,
             }),
     })
 }

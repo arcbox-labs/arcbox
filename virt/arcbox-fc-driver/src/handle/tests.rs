@@ -1,6 +1,6 @@
 //! Handle behavior over plain children and an API socket nobody answers on.
 
-use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
+use arcbox_vm_driver::{IsolationSpec, JailRecord, ProcessRecord};
 
 use super::*;
 use crate::api::fake_fc::FakeFc;
@@ -43,6 +43,7 @@ fn with_client(
         process: Some(ProcessRecord {
             pid: process.pid(),
             api_socket: Some(layout.api_socket()),
+            jail: layout.jail().map(JailRecord::from),
         }),
     };
     let vsock = vsock.then(|| VsockEndpoint::new(layout.vsock_host_uds()));
@@ -415,6 +416,7 @@ async fn listen_binds_next_to_the_socket_dial_uses_not_the_layout_path() {
         process: Some(ProcessRecord {
             pid: process.pid(),
             api_socket: Some(layout.api_socket()),
+            jail: layout.jail().map(JailRecord::from),
         }),
     };
     let vm = FcHandle::new(

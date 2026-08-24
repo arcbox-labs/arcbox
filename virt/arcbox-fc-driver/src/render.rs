@@ -84,6 +84,17 @@ impl VmLayout {
         Self::of(id, jail, runtime_dir)
     }
 
+    /// The layout of a VM this process did not spawn: the jail its record
+    /// names, which is the only place that fact survives.
+    ///
+    /// Not [`new`](Self::new): that one *computes* the jail root from a
+    /// `chroot_base` and this process's own Firecracker binary path, and a
+    /// VM booted by an earlier process is under the root that process
+    /// computed — the same one only while neither has moved (CORE-152).
+    pub fn adopted(id: &VmId, jail: Option<Jail>, runtime_dir: &Path) -> Result<Self> {
+        Self::of(id, jail, runtime_dir)
+    }
+
     /// The layout of VM `id` in `jail`, with `runtime_dir` as its scratch
     /// space.
     fn of(id: &VmId, jail: Option<Jail>, runtime_dir: &Path) -> Result<Self> {

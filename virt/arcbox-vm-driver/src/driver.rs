@@ -382,6 +382,37 @@ pub struct ProcessRecord {
     /// The VMM's control socket, when it has one.
     #[serde(default)]
     pub api_socket: Option<PathBuf>,
+    /// The jail the VMM runs in, when it is confined to one.
+    ///
+    /// `None` means unconfined — and, in a record written before this field
+    /// existed, means the same, because a record that predates it can no
+    /// longer be asked.
+    #[serde(default)]
+    pub jail: Option<JailRecord>,
+}
+
+/// The jail a running VMM is in, as the process that put it there knew it.
+///
+/// Recorded rather than derived, because neither half survives the spawn:
+/// a jailer unshares its mount namespace and pivots into the chroot, so
+/// `/proc/<pid>/root` reads back as `/` from outside and the confinement
+/// cannot be observed at all; and re-deriving the root instead — from an
+/// [`IsolationSpec`]'s `chroot_base` and the adopting process's own config
+/// — names a different directory the moment that config differs from the
+/// one the VM was booted with.
+///
+/// What follows from getting it wrong is not a wrong path but a wrong VM:
+/// an adopter that concludes "unconfined" rebuilds the VM as one, and every
+/// operation that needs the jail — reaching the guest, checkpointing it —
+/// is then refused or aimed outside it (CORE-155).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JailRecord {
+    /// The chroot the VMM is confined to, as the host names it.
+    pub root: PathBuf,
+    /// The uid the VMM runs as.
+    pub uid: u32,
+    /// The gid the VMM runs as.
+    pub gid: u32,
 }
 
 /// What may change when a checkpoint is restored into a new VM.
@@ -494,6 +525,11 @@ mod tests {
             process: Some(ProcessRecord {
                 pid: 4242,
                 api_socket: Some("/run/arcbox/vm-1/api.sock".into()),
+                jail: Some(JailRecord {
+                    root: "/srv/jailer/firecracker/vm-1/root".into(),
+                    uid: 123,
+                    gid: 456,
+                }),
             }),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -506,5 +542,16 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(in_process.process, None);
+
+        // A record written before the jail was recorded still loads, and
+        // says what it can: a process, confined to nothing it can name.
+        let older: VmRecord = serde_json::from_value(serde_json::json!({
+            "id": "vm-3",
+            "driver": "fc",
+            "runtime_dir": "/run/arcbox/vm-3",
+            "process": { "pid": 7, "api_socket": "/run/arcbox/vm-3/api.sock" },
+        }))
+        .unwrap();
+        assert_eq!(older.process.unwrap().jail, None);
     }
 }

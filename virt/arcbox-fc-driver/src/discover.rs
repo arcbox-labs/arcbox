@@ -11,10 +11,18 @@
 //! All three read `/proc`, so nothing is adopted off Linux: an unverified
 //! pid is a VM this driver would later signal, and Firecracker needs KVM
 //! anyway.
+//!
+//! Identity is all `/proc` is asked for. What the VM *is* — its control
+//! socket, the jail it is confined to — comes off the record, because a
+//! jailer that has pivoted into its chroot leaves `/proc/<pid>/root`
+//! reading `/` to everyone outside it (CORE-149, CORE-155). The one place
+//! the jail is still consulted is a `--api-sock` read off the command
+//! line, which is chroot-relative and needs a root to be made absolute
+//! against.
 
 use std::path::{Path, PathBuf};
 
-use arcbox_vm_driver::{IsolationSpec, VmRecord};
+use arcbox_vm_driver::VmRecord;
 
 use crate::config::FcDriverConfig;
 
@@ -25,10 +33,6 @@ pub struct Found {
     pub pid: u32,
     /// The API socket as the host connects to it.
     pub api_socket: PathBuf,
-    /// The confinement the process runs under, as far as `/proc` tells:
-    /// jailed (uid, gid and chroot base read back; namespaces and cgroup
-    /// unknown) or not.
-    pub isolation: IsolationSpec,
 }
 
 /// The Firecracker `record` names, if one is still running.
@@ -41,34 +45,18 @@ pub fn find(config: &FcDriverConfig, record: &VmRecord) -> Option<Found> {
         .map(|p| p.pid)
         .filter(|pid| identity.matches(*pid))
         .or_else(|| identity.scan_proc())?;
-    let jail_root = jail_root_of(pid);
+    // The jail the record names, else whatever `/proc` will admit to —
+    // which for a jailer that has already pivoted is nothing.
+    let jail_root = record
+        .process
+        .as_ref()
+        .and_then(|process| process.jail.as_ref())
+        .map(|jail| jail.root.clone())
+        .or_else(|| jail_root_of(pid));
     let api_socket = recorded_socket
         .or_else(|| cmdline_api_socket(pid, jail_root.as_deref()))
         .unwrap_or_else(|| record.runtime_dir.join("firecracker.sock"));
-    let isolation = match jail_root {
-        Some(root) => {
-            let (uid, gid) = process_ids(pid).unwrap_or((0, 0));
-            // {chroot_base}/{exec}/{id}/root → chroot_base.
-            let chroot_base = root.ancestors().nth(3).map_or_else(
-                || PathBuf::from(crate::jail::DEFAULT_CHROOT_BASE),
-                Path::to_path_buf,
-            );
-            IsolationSpec::Jailer {
-                uid,
-                gid,
-                chroot_base,
-                netns: None,
-                new_pid_ns: false,
-                cgroup: None,
-            }
-        }
-        None => IsolationSpec::None,
-    };
-    Some(Found {
-        pid,
-        api_socket,
-        isolation,
-    })
+    Some(Found { pid, api_socket })
 }
 
 /// True when `pid` is alive and (on Linux) named like a Firecracker binary.
@@ -125,27 +113,6 @@ fn cmdline_api_socket(pid: u32, jail_root: Option<&Path>) -> Option<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (pid, jail_root);
-        None
-    }
-}
-
-/// The real uid and gid of `pid`, from `/proc/<pid>/status`.
-fn process_ids(pid: u32) -> Option<(u32, u32)> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u32>().ok())
-        };
-        Some((field("Uid:")?, field("Gid:")?))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
         None
     }
 }
@@ -286,6 +253,7 @@ mod tests {
             process: Some(arcbox_vm_driver::ProcessRecord {
                 pid: std::process::id(),
                 api_socket: None,
+                jail: None,
             }),
         };
         assert!(find(&FcDriverConfig::new("/opt/fc/firecracker"), &record).is_none());
@@ -300,6 +268,7 @@ mod tests {
             process: Some(arcbox_vm_driver::ProcessRecord {
                 pid: u32::try_from(i32::MAX - 1).unwrap(),
                 api_socket: None,
+                jail: None,
             }),
         };
         assert!(find(&FcDriverConfig::new("/opt/fc/firecracker"), &record).is_none());
