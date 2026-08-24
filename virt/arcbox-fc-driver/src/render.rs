@@ -42,11 +42,15 @@ const VSOCK_NAME: &str = "firecracker.vsock";
 
 /// Where a VM's files live from the host's and Firecracker's points of
 /// view: the runtime dir, the jail if any, and the sockets in them.
+///
+/// Paths and nothing else. How the VMM is *confined* — the netns it enters,
+/// the cgroup it joins, the ids it drops to — is the spawn's business and
+/// travels with [`spawn_plan`](Self::spawn_plan); what a layout keeps of it
+/// is the [`Jail`] those paths hang off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLayout {
     id: VmId,
     runtime_dir: PathBuf,
-    isolation: IsolationSpec,
     jail: Option<Jail>,
 }
 
@@ -59,13 +63,6 @@ impl VmLayout {
         config: &FcDriverConfig,
         runtime_dir: &Path,
     ) -> Result<Self> {
-        // The id is a directory name here — the jail is `{base}/{exec}/{id}/
-        // root` — so `.` and `..` would name another VM's jail, or the base
-        // itself. The port refuses them at the id; a layout is built from
-        // whatever id it is handed, so the same rule is checked here too.
-        if !is_plain_component(id.as_str()) {
-            return Err(unsupported(&format!("vm id `{id}` must be a plain name")));
-        }
         let jail = match isolation {
             IsolationSpec::None => None,
             IsolationSpec::Jailer {
@@ -84,10 +81,22 @@ impl VmLayout {
                 )));
             }
         };
+        Self::of(id, jail, runtime_dir)
+    }
+
+    /// The layout of VM `id` in `jail`, with `runtime_dir` as its scratch
+    /// space.
+    fn of(id: &VmId, jail: Option<Jail>, runtime_dir: &Path) -> Result<Self> {
+        // The id is a directory name here — the jail is `{base}/{exec}/{id}/
+        // root` — so `.` and `..` would name another VM's jail, or the base
+        // itself. The port refuses them at the id; a layout is built from
+        // whatever id it is handed, so the same rule is checked here too.
+        if !is_plain_component(id.as_str()) {
+            return Err(unsupported(&format!("vm id `{id}` must be a plain name")));
+        }
         Ok(Self {
             id: id.clone(),
             runtime_dir: runtime_dir.to_path_buf(),
-            isolation: isolation.clone(),
             jail,
         })
     }
@@ -100,11 +109,6 @@ impl VmLayout {
     /// The per-VM scratch directory the driver was given.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
-    }
-
-    /// The confinement the layout was built for.
-    pub fn isolation(&self) -> &IsolationSpec {
-        &self.isolation
     }
 
     /// The jail, when the VM runs under the jailer.
@@ -146,11 +150,15 @@ impl VmLayout {
         }
     }
 
-    /// The process to spawn for this VM.
-    pub fn spawn_plan(&self) -> SpawnPlan {
+    /// The process to spawn for this VM under `isolation`.
+    ///
+    /// `isolation` is the same one the layout was built from — it carries
+    /// the rest of the confinement (netns, cgroup, PID namespace), which
+    /// names no path and so is not a layout's to keep.
+    pub fn spawn_plan(&self, isolation: &IsolationSpec) -> SpawnPlan {
         let mode = match &self.jail {
             Some(jail) => SpawnMode::Jailer {
-                isolation: self.isolation.clone(),
+                isolation: isolation.clone(),
                 jail_root: jail.root.clone(),
             },
             None => SpawnMode::Direct {
