@@ -16,14 +16,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arcbox_vm_driver::{ProcessRecord, Result, VmHandle, VmRecord};
+use arcbox_vm_driver::{JailRecord, ProcessRecord, Result, VmHandle, VmRecord};
 use fc_sdk::Client;
 use fc_sdk::types::{FullVmConfiguration, InstanceInfo, InstanceInfoState};
 
 use crate::api;
-use crate::config::FcDriverConfig;
 use crate::discover::Found;
 use crate::handle::{FcHandle, FcProcessHandle};
+use crate::jail::Jail;
 use crate::listener::VsockEndpoint;
 use crate::process::FcProcess;
 use crate::render::VmLayout;
@@ -43,17 +43,22 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(2);
 /// the recorded pid may have been recycled and the VM found by the `/proc`
 /// scan instead, and the API socket may have come off its command line.
 pub(crate) async fn rebuild(
-    config: &FcDriverConfig,
     found: Found,
     record: &VmRecord,
     api_timeout: Duration,
 ) -> Result<Box<dyn VmHandle>> {
-    let layout = VmLayout::new(&record.id, &found.isolation, config, &record.runtime_dir)?;
+    let jail = recorded_jail(record);
+    let layout = VmLayout::adopted(
+        &record.id,
+        jail.clone().map(Jail::from),
+        &record.runtime_dir,
+    )?;
     let process = Arc::new(FcProcess::adopt(found.pid, found.api_socket.clone()));
     let record = VmRecord {
         process: Some(ProcessRecord {
             pid: found.pid,
             api_socket: Some(found.api_socket.clone()),
+            jail,
         }),
         ..record.clone()
     };
@@ -81,6 +86,21 @@ pub(crate) async fn rebuild(
     )))
 }
 
+/// The jail the record names, which is where the VM is confined — or
+/// nothing, both for a VM that runs unconfined and for a record written
+/// before the jail was recorded.
+///
+/// The second case is the pre-CORE-155 behaviour, kept because it is all
+/// such a record supports: the jail cannot be recovered from the process
+/// (`discover`), and recomputing one from this process's configuration
+/// would aim a `shutdown`'s jail removal at a directory nothing checked.
+fn recorded_jail(record: &VmRecord) -> Option<JailRecord> {
+    record
+        .process
+        .as_ref()
+        .and_then(|process| process.jail.clone())
+}
+
 /// The instance's state and its devices — what a full handle is built from.
 async fn describe(client: &Client) -> crate::error::Result<(InstanceInfo, FullVmConfiguration)> {
     let info = api::describe(client).await?;
@@ -91,10 +111,10 @@ async fn describe(client: &Client) -> crate::error::Result<(InstanceInfo, FullVm
 /// The fallback, and the warning that says why: the VM stays a process
 /// this driver can kill, and nothing more.
 ///
-/// The layout still comes along. Where the VM runs is read off the process,
-/// not asked of the API, so an unreachable API costs the handle its devices
-/// — never the disks staged into its area, nor its ability to take that
-/// area down with the VM.
+/// The layout still comes along. Where the VM runs is what the record says,
+/// not something asked of the API, so an unreachable API costs the handle
+/// its devices — never the disks staged into its area, nor its ability to
+/// take that area down with the VM.
 fn process_only(
     process: Arc<FcProcess>,
     record: VmRecord,
@@ -110,7 +130,7 @@ fn process_only(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use arcbox_vm_driver::{IsolationSpec, ShutdownMode, VmId, VmState};
+    use arcbox_vm_driver::{ShutdownMode, VmId, VmState};
 
     use super::*;
     use crate::NAME;
@@ -118,8 +138,13 @@ mod tests {
     use crate::process::UNKNOWN_EXIT;
 
     /// A `sleep` child standing in for the orphan, its `Found`, and the
-    /// record the sweep would hand over — a stale pid, no socket.
-    fn orphan(api_socket: PathBuf, runtime_dir: &Path) -> (tokio::process::Child, Found, VmRecord) {
+    /// record the sweep would hand over — a stale pid, no socket, and
+    /// `jail` as the caller wants it.
+    fn orphan(
+        api_socket: PathBuf,
+        runtime_dir: &Path,
+        jail: Option<JailRecord>,
+    ) -> (tokio::process::Child, Found, VmRecord) {
         let child = tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -127,7 +152,6 @@ mod tests {
         let found = Found {
             pid: child.id().unwrap(),
             api_socket,
-            isolation: IsolationSpec::None,
         };
         let record = VmRecord {
             id: VmId::new("box").unwrap(),
@@ -136,13 +160,10 @@ mod tests {
             process: Some(ProcessRecord {
                 pid: u32::try_from(i32::MAX - 1).unwrap(),
                 api_socket: None,
+                jail,
             }),
         };
         (child, found, record)
-    }
-
-    fn config() -> FcDriverConfig {
-        FcDriverConfig::new("/opt/fc/firecracker")
     }
 
     /// Kills through the handle and proves the child was reaped by it.
@@ -157,9 +178,9 @@ mod tests {
     #[tokio::test]
     async fn an_orphan_whose_api_socket_is_missing_is_adopted_by_its_process() {
         let dir = tempfile::tempdir().unwrap();
-        let (child, found, record) = orphan(dir.path().join("absent.sock"), dir.path());
+        let (child, found, record) = orphan(dir.path().join("absent.sock"), dir.path(), None);
         let pid = found.pid;
-        let vm = rebuild(&config(), found, &record, API_TIMEOUT)
+        let vm = rebuild(found, &record, API_TIMEOUT)
             .await
             .expect("a verified process is adopted whatever its api does");
         assert_eq!(vm.state(), VmState::Running);
@@ -189,10 +210,10 @@ mod tests {
                 });
             }
         });
-        let (child, found, record) = orphan(socket, dir.path());
+        let (child, found, record) = orphan(socket, dir.path(), None);
         let bound = Duration::from_millis(300);
         let started = tokio::time::Instant::now();
-        let vm = rebuild(&config(), found, &record, bound)
+        let vm = rebuild(found, &record, bound)
             .await
             .expect("a wedged api does not fail the adopt");
         assert!(
@@ -223,10 +244,8 @@ mod tests {
             "GET /vm/config" => (200, devices.clone()),
             other => panic!("the driver called {other} unexpectedly"),
         });
-        let (child, found, record) = orphan(fc.socket().to_path_buf(), dir.path());
-        let vm = rebuild(&config(), found, &record, API_TIMEOUT)
-            .await
-            .expect("adopt");
+        let (child, found, record) = orphan(fc.socket().to_path_buf(), dir.path(), None);
+        let vm = rebuild(found, &record, API_TIMEOUT).await.expect("adopt");
         assert_eq!(fc.calls(), ["GET /", "GET /vm/config"]);
         // The full handle: the paused state and the vsock device read back.
         assert_eq!(vm.state(), VmState::Quiesced);
@@ -234,6 +253,64 @@ mod tests {
         let listener = vm.vsock_listener().unwrap().listen(51).await.unwrap();
         assert!(dir.path().join("source/firecracker.vsock_51").exists());
         drop(listener);
+        kill_through(&*vm, child).await;
+    }
+
+    /// A jailed VM must come back jailed. Nothing about the live process
+    /// says so — the jailer has pivoted, and `/proc/<pid>/root` reads `/`
+    /// — so the record is the only witness, and an adopt that ignores it
+    /// rebuilds the VM as direct-mode: the guest is then dialled at the
+    /// in-chroot path as if it were a host path, and a checkpoint, which
+    /// needs the chroot, is refused outright (CORE-155).
+    #[tokio::test]
+    async fn a_jailed_vmm_is_adopted_into_the_jail_its_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        // An abbreviation of the real `{base}/{exec}/{id}/root`, kept to
+        // the one level that carries meaning. Shallow because the listener
+        // below binds `<root>/run/firecracker.vsock_51` and macOS caps
+        // `sun_path` at 104 bytes, of which `$TMPDIR` alone spends ~59 —
+        // the full shape would buy realism at the cost of the test binding
+        // at all. But not flat: `host_view` only joins onto the root, while
+        // `Jail::remove` deletes `root.parent()`, so the shutdown in
+        // `kill_through` takes whatever sits one level up. Here that is a
+        // per-VM directory, as in the real layout; with the root directly
+        // in the scratch dir it would be FakeFc's socket and
+        // `record.runtime_dir` too.
+        let root = dir.path().join("j/root");
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        // Firecracker reports the vsock at the path it sees from inside the
+        // chroot; the host reaches it under the jail root.
+        let fc = FakeFc::start(dir.path(), |route, _| match route {
+            "GET /" => (
+                200,
+                r#"{"app_name":"fake","id":"box","state":"Running","vmm_version":"1.10.1"}"#.into(),
+            ),
+            "GET /vm/config" => (
+                200,
+                r#"{"vsock":{"guest_cid":3,"uds_path":"/run/firecracker.vsock"}}"#.into(),
+            ),
+            other => panic!("the driver called {other} unexpectedly"),
+        });
+        // This process's own ids: binding a listener in the jail chowns it
+        // to them, which only root may do across users.
+        let jail = JailRecord {
+            root: root.clone(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+        };
+        let (child, found, record) =
+            orphan(fc.socket().to_path_buf(), dir.path(), Some(jail.clone()));
+
+        let vm = rebuild(found, &record, API_TIMEOUT).await.expect("adopt");
+
+        // Checkpointable, which only a jailed VM is.
+        assert!(vm.checkpoint().is_some());
+        // The vsock resolves inside the jail, not at the host's `/run`.
+        let listener = vm.vsock_listener().unwrap().listen(51).await.unwrap();
+        assert!(root.join("run/firecracker.vsock_51").exists());
+        drop(listener);
+        // And the jail travels on, so the next adopt starts from it too.
+        assert_eq!(vm.record().process.unwrap().jail, Some(jail));
         kill_through(&*vm, child).await;
     }
 }

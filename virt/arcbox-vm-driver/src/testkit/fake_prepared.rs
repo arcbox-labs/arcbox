@@ -15,7 +15,9 @@ use super::lock;
 use crate::capability::{
     CheckpointImage, CheckpointKind, Prepare, PreparedVm, Staging, VsockListen, VsockListener,
 };
-use crate::driver::{ExitStatus, ProcessRecord, RestoreSpec, VmHandle, VmRecord, VmState};
+use crate::driver::{
+    ExitStatus, JailRecord, ProcessRecord, RestoreSpec, VmHandle, VmRecord, VmState,
+};
 use crate::error::{Error, Result};
 use crate::spec::{IsolationSpec, VmId, VmSpec};
 
@@ -43,6 +45,7 @@ impl Preparer {
             process: Some(ProcessRecord {
                 pid: self.0.next_pid(),
                 api_socket: Some(runtime_dir.join("api.sock")),
+                jail: jail_of(id, isolation),
             }),
         };
         PreparedFake {
@@ -53,6 +56,28 @@ impl Preparer {
             record,
             phase: Mutex::new(Phase::Prepared),
         }
+    }
+}
+
+/// The jail a fake VMM would be confined to: `{chroot_base}/{id}`, the
+/// simplest layout that is a *path* rather than a repeat of the spec.
+///
+/// The fake records one because a real driver does, and because a record
+/// that loses it is a VM adopted back as unconfined (CORE-155) — a contract
+/// check can only see that if the fake has a jail to lose.
+fn jail_of(id: &VmId, isolation: &IsolationSpec) -> Option<JailRecord> {
+    match isolation {
+        IsolationSpec::None => None,
+        IsolationSpec::Jailer {
+            uid,
+            gid,
+            chroot_base,
+            ..
+        } => Some(JailRecord {
+            root: chroot_base.join(id.as_str()),
+            uid: *uid,
+            gid: *gid,
+        }),
     }
 }
 

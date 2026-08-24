@@ -326,6 +326,15 @@ pub trait Adopt: Send + Sync {
     ///
     /// `Ok(None)` means nothing survived — a stale record, a dead pid — which
     /// is an outcome, not an absence of the capability.
+    ///
+    /// The handle is rebuilt from what the record says, not from what the
+    /// live process can be made to admit: a VMM's control socket and the
+    /// jail it is confined to
+    /// ([`ProcessRecord::api_socket`](crate::ProcessRecord::api_socket),
+    /// [`JailRecord`](crate::JailRecord)) are both invisible from outside
+    /// once it is running. A record that carries neither — one written
+    /// before they existed — is adopted as best the driver can, which for a
+    /// jailed VM is a handle that can only kill it.
     async fn adopt(&self, record: &VmRecord) -> Result<Option<Box<dyn VmHandle>>>;
 
     /// Removes the host area of the VM `record` names, which is gone.
@@ -339,7 +348,11 @@ pub trait Adopt: Send + Sync {
     ///
     /// `isolation` is what the VM was configured to run under, because
     /// nothing can be read back off a process that is gone. A driver that
-    /// confines nothing has no area to remove and succeeds.
+    /// confines nothing has no area to remove and succeeds. Where the
+    /// record names the area itself
+    /// ([`JailRecord`](crate::JailRecord)) that is the better answer —
+    /// `isolation` describes what *this* process would have built, which is
+    /// the same area only while the configuration has not moved under it.
     ///
     /// Already removed is success: a startup sweep runs this on every
     /// journal it does not keep, and may find what an earlier sweep

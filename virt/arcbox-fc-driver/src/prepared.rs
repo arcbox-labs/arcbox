@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arcbox_vm_driver::{
-    CheckpointImage, Error, ExitStatus, IsolationSpec, PreparedVm, ProcessRecord, RestoreSpec,
-    Result, Staging, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen, VsockListener,
+    CheckpointImage, Error, ExitStatus, IsolationSpec, JailRecord, PreparedVm, ProcessRecord,
+    RestoreSpec, Result, Staging, VmHandle, VmId, VmRecord, VmSpec, VmState, VsockListen,
+    VsockListener,
 };
 use async_trait::async_trait;
 use fc_sdk::VmBuilder;
@@ -82,6 +83,7 @@ impl FcPrepared {
                 process: Some(ProcessRecord {
                     pid: process.pid(),
                     api_socket: Some(plan.api_socket.clone()),
+                    jail: layout.jail().map(JailRecord::from),
                 }),
             };
             let vsock = VsockEndpoint::new(layout.vsock_host_uds());

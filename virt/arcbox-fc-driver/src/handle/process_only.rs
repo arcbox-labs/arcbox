@@ -11,9 +11,9 @@
 //! `Graceful` shutdown, whose ctrl-alt-del is an API call, kills at once.
 //!
 //! Staging is offered, though: where a VM's files live is a property of
-//! how its VMM was launched, which the adopt read off the process itself,
-//! so an unreachable API costs this handle the VM's devices and never the
-//! disks staged into its area.
+//! how its VMM was launched, which the record carries, so an unreachable
+//! API costs this handle the VM's devices and never the disks staged into
+//! its area.
 
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ pub struct FcProcessHandle {
     record: VmRecord,
     /// The area this VM runs in, and the layout that names paths in it.
     /// Reachable without the API: where the VMM was launched is a property
-    /// of the launch, which the adopt read off the process itself.
+    /// of the launch, which its record carries.
     staging: JailStaging,
 }
 
@@ -138,7 +138,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use arcbox_vm_driver::{IsolationSpec, ProcessRecord};
+    use arcbox_vm_driver::{IsolationSpec, JailRecord, ProcessRecord};
 
     use super::*;
     use crate::NAME;
@@ -170,17 +170,18 @@ mod tests {
         let pid = child.id().unwrap();
         let socket = PathBuf::from("/nonexistent/arcbox-fc-driver/api.sock");
         let id = VmId::new("box").unwrap();
+        let layout = VmLayout::new(&id, isolation, &FcDriverConfig::new(FC_BINARY), runtime_dir)
+            .expect("a layout for the adopted vm");
         let record = VmRecord {
-            id: id.clone(),
+            id,
             driver: NAME.to_owned(),
             runtime_dir: runtime_dir.to_path_buf(),
             process: Some(ProcessRecord {
                 pid,
                 api_socket: Some(socket.clone()),
+                jail: layout.jail().map(JailRecord::from),
             }),
         };
-        let layout = VmLayout::new(&id, isolation, &FcDriverConfig::new(FC_BINARY), runtime_dir)
-            .expect("a layout for the adopted vm");
         let process = Arc::new(FcProcess::adopt(pid, socket));
         (FcProcessHandle::new(process, record, layout), child)
     }

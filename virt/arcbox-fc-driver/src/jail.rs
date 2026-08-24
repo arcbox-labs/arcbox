@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use arcbox_vm_driver::{Error, Result};
+use arcbox_vm_driver::{Error, JailRecord, Result};
 use nix::unistd::{Gid, Uid, chown};
 use tracing::warn;
 
@@ -29,6 +29,26 @@ pub struct Jail {
     pub uid: u32,
     /// The gid the VMM runs as.
     pub gid: u32,
+}
+
+impl From<&Jail> for JailRecord {
+    fn from(jail: &Jail) -> Self {
+        Self {
+            root: jail.root.clone(),
+            uid: jail.uid,
+            gid: jail.gid,
+        }
+    }
+}
+
+impl From<JailRecord> for Jail {
+    fn from(record: JailRecord) -> Self {
+        Self {
+            root: record.root,
+            uid: record.uid,
+            gid: record.gid,
+        }
+    }
 }
 
 impl Jail {

@@ -60,8 +60,8 @@ pub use capability::{
     PreparedVm, Staging, Vsock, VsockListen, VsockListener,
 };
 pub use driver::{
-    DriverCapabilities, ExitStatus, IoMode, NestedVirt, ProcessRecord, RestoreSpec, ShutdownMode,
-    VmDriver, VmEvent, VmHandle, VmRecord, VmState, VsockConn,
+    DriverCapabilities, ExitStatus, IoMode, JailRecord, NestedVirt, ProcessRecord, RestoreSpec,
+    ShutdownMode, VmDriver, VmEvent, VmHandle, VmRecord, VmState, VsockConn,
 };
 pub use error::{Error, Result};
 pub use spec::{
