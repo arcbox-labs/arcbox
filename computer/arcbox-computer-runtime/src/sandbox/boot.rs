@@ -151,6 +151,10 @@ pub struct StagedRootfs {
 /// slot id for pre-warmed slots). `journal` persists the caller's crash
 /// record whenever CoW resources appear or disappear, so reconciliation
 /// can always identify them.
+#[allow(
+    clippy::result_large_err,
+    reason = "the failure hands back the half-built sandbox's resources; boxing it is a refactor of its own"
+)]
 pub async fn stage_rootfs_cow_or_copy(
     cow_manager: &CowManager,
     staging: &dyn Staging,

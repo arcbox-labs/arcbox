@@ -639,7 +639,7 @@ mod agent {
         // extension is backward compatible.
         let mut payload = [0u8; 32];
         let timings = steps.iter().copied().chain([resolv_us, handler_us]);
-        for (slot, ms) in payload[8..].chunks_exact_mut(4).zip(timings) {
+        for (slot, ms) in payload[8..].as_chunks_mut::<4>().0.iter_mut().zip(timings) {
             slot.copy_from_slice(&ms.to_le_bytes());
         }
         let _ = write_frame(&mut conn, MSG_EXIT, &payload);
