@@ -8,13 +8,15 @@
 //!
 //! ## Prerequisites
 //!
-//! All tests are `#[ignore]` and require three environment variables:
+//! All tests are `#[ignore]` and require the three environment variables
+//! below; the jailed ones need a fourth:
 //!
 //! | Variable    | Description                                       |
 //! |-------------|---------------------------------------------------|
 //! | `FC_BINARY` | Path to the `firecracker` binary                  |
 //! | `FC_KERNEL` | Path to the kernel image (`vmlinux`)              |
 //! | `FC_ROOTFS` | Path to the root filesystem image (`*.ext4`)      |
+//! | `FC_JAILER` | Path to the `jailer` binary; the jailed tests skip without it |
 //!
 //! `FC_ROOTFS` must have the `vm-agent` binary at `/sbin/vm-agent`; the
 //! default `boot_args` use `init=/sbin/vm-agent` so the agent runs as PID 1.
@@ -43,8 +45,9 @@ mod common;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use arcbox_agent::config::{AdapterConfig, GuestConfig};
+use arcbox_agent::config::{AdapterConfig, GuestConfig, JailerProcess};
 use arcbox_agent::sandbox::{block_tools, node_environment};
+use arcbox_computer_runtime::config::JailerConfig;
 use arcbox_computer_runtime::{
     DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RuntimeConfig, SandboxEvent,
     SandboxManager, SandboxNetworkSpec, SandboxSpec, SandboxState,
@@ -56,12 +59,44 @@ use arcbox_computer_runtime::{
 
 /// Build a GuestConfig from env vars. Returns `None` to skip the test.
 fn try_config(data_dir: &str) -> Option<GuestConfig> {
+    config_in(data_dir, Confinement::Direct)
+}
+
+/// How the VMMs a config boots are confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confinement {
+    /// Firecracker as this process, unconfined.
+    Direct,
+    /// Firecracker under the jailer, in a per-VM chroot — production's
+    /// shape, and the only one in which a checkpoint or a restore is
+    /// possible.
+    Jailed,
+}
+
+/// [`try_config`] in `confinement`. `None` when the environment does not
+/// name what that mode needs — `FC_JAILER` on top of the three for a jail.
+fn config_in(data_dir: &str, confinement: Confinement) -> Option<GuestConfig> {
     let binary = std::env::var("FC_BINARY").ok()?;
     let kernel = std::env::var("FC_KERNEL").ok()?;
     let rootfs = std::env::var("FC_ROOTFS").ok()?;
+    let jailer_binary = match confinement {
+        Confinement::Direct => None,
+        Confinement::Jailed => Some(std::env::var("FC_JAILER").ok()?),
+    };
+    // Under the test's own data dir rather than `/srv/jailer`, so a run
+    // leaves nothing behind on the host it borrowed.
+    let jailer = jailer_binary.as_ref().map(|_| JailerConfig {
+        uid: 0,
+        gid: 0,
+        chroot_base_dir: Some(format!("{data_dir}/jail")),
+        netns: None,
+        new_pid_ns: false,
+        cgroup_version: None,
+        parent_cgroup: None,
+    });
     let runtime = RuntimeConfig {
         firecracker: FirecrackerConfig {
-            jailer: None,
+            jailer,
             data_dir: data_dir.to_owned(),
             // Direct mode cannot restore (and so never pools); keep the
             // e2e run free of background pre-warm spawns regardless.
@@ -92,7 +127,10 @@ fn try_config(data_dir: &str) -> Option<GuestConfig> {
         runtime,
         adapters: AdapterConfig {
             binary,
-            jailer: None,
+            jailer: jailer_binary.map(|binary| JailerProcess {
+                binary,
+                resource_limits: vec![],
+            }),
             log_level: Some("Error".into()),
             no_seccomp: true,
             seccomp_filter: None,
@@ -436,16 +474,36 @@ fn firecracker_alive(pid: i32) -> bool {
 #[tokio::test]
 #[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables, root, and vm-agent in rootfs"]
 async fn e2e_sandbox_outlives_its_manager_and_is_adopted() {
+    outlives_its_manager_and_is_adopted(Confinement::Direct).await;
+}
+
+/// The same, with the VMM in a jail — production's shape, and the one an
+/// adopt cannot work out for itself: a jailer pivots into its chroot, so
+/// `/proc/<pid>/root` reads `/` from outside and nothing the next process
+/// can observe says the VM is confined at all.
+///
+/// It is a separate test rather than a knob on the one above because the
+/// two modes fail differently, and because CORE-155 shipped precisely
+/// while adoption was only ever exercised unjailed: an adopted jailed VM
+/// came back as direct-mode, alive but unreachable — the exec below is
+/// what catches that.
+#[tokio::test]
+#[ignore = "requires FC_BINARY/FC_JAILER/FC_KERNEL/FC_ROOTFS environment variables, root, and vm-agent in rootfs"]
+async fn e2e_jailed_sandbox_outlives_its_manager_and_is_adopted() {
+    outlives_its_manager_and_is_adopted(Confinement::Jailed).await;
+}
+
+async fn outlives_its_manager_and_is_adopted(confinement: Confinement) {
     if !common::is_root() {
-        eprintln!("SKIP e2e_sandbox_outlives_its_manager_and_is_adopted — requires root");
+        eprintln!("SKIP outlives_its_manager_and_is_adopted({confinement:?}) — requires root");
         return;
     }
 
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_owned();
-    let Some(cfg) = try_config(data_dir.to_str().unwrap()) else {
+    let Some(cfg) = config_in(data_dir.to_str().unwrap(), confinement) else {
         eprintln!(
-            "SKIP e2e_sandbox_outlives_its_manager_and_is_adopted — FC_BINARY/FC_KERNEL/FC_ROOTFS not set"
+            "SKIP outlives_its_manager_and_is_adopted({confinement:?}) — FC_BINARY/FC_KERNEL/FC_ROOTFS (and FC_JAILER when jailed) not set"
         );
         return;
     };
