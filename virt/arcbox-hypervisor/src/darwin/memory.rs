@@ -140,11 +140,10 @@ impl DarwinMemory {
         let mut hash = FNV_OFFSET;
 
         // Process 8 bytes at a time for better performance.
-        let chunks = data.chunks_exact(8);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<8>();
 
         for chunk in chunks {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            let word = u64::from_le_bytes(*chunk);
             hash ^= word;
             hash = hash.wrapping_mul(FNV_PRIME);
         }

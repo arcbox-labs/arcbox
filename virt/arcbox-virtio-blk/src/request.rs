@@ -69,7 +69,7 @@ pub fn parse_range_list(
         )));
     }
     let mut ranges = Vec::with_capacity(bytes.len() / RANGE_ENTRY_SIZE);
-    for chunk in bytes.chunks_exact(RANGE_ENTRY_SIZE) {
+    for chunk in bytes.as_chunks::<RANGE_ENTRY_SIZE>().0 {
         ranges.push(DiscardWriteZeroesRange {
             sector: u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
             num_sectors: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),

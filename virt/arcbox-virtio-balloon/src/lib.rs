@@ -330,8 +330,8 @@ impl VirtioDevice for VirtioBalloon {
 /// guest cannot affect host memory outside the guest RAM mapping.
 fn handle_pfn_list(buf: &[u8], ram_base: *mut u8, ram_len: usize, gpa_base: usize) -> u32 {
     let mut handled = 0u32;
-    for chunk in buf.chunks_exact(4) {
-        let pfn = u32::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in buf.as_chunks::<4>().0 {
+        let pfn = u32::from_le_bytes(*chunk);
         let gpa = (u64::from(pfn)) << BALLOON_PFN_SHIFT;
         let Some(offset) = (gpa as usize).checked_sub(gpa_base) else {
             tracing::warn!("virtio-balloon: PFN {pfn:#x} below ram base");
