@@ -31,6 +31,10 @@ pub struct FcPrepared {
     /// names every path in it. Shared in shape — not in value — with the
     /// handle a boot returns, which builds its own from the same layout.
     staging: JailStaging,
+    /// What the VMM was spawned under, kept to hold the boot or restore
+    /// that follows to the same confinement ([`Self::require_same_identity`]).
+    /// The layout keeps only the paths this implies.
+    isolation: IsolationSpec,
     process: Arc<FcProcess>,
     record: VmRecord,
     /// Where guest dial-outs land: the layout's vsock socket, until a
@@ -62,7 +66,7 @@ impl FcPrepared {
         if let IsolationSpec::Jailer { chroot_base, .. } = isolation {
             tokio::fs::create_dir_all(chroot_base).await?;
         }
-        let plan = layout.spawn_plan();
+        let plan = layout.spawn_plan(isolation);
         let spawned = async {
             let child = spawn::spawn(&plan, &config).await?;
             debug_assert_eq!(
@@ -84,6 +88,7 @@ impl FcPrepared {
             Ok(Self {
                 config: Arc::clone(&config),
                 staging: JailStaging::new(layout.clone()),
+                isolation: isolation.clone(),
                 process,
                 record,
                 vsock,
@@ -133,7 +138,7 @@ impl FcPrepared {
                 self.record.id
             )));
         }
-        if *isolation != *self.layout().isolation() {
+        if *isolation != self.isolation {
             return Err(Error::InvalidSpec(format!(
                 "spec isolation does not match what vm {} was prepared with",
                 self.record.id
