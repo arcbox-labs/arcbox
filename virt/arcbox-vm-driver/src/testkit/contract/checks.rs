@@ -169,6 +169,13 @@ pub async fn restore_yields_a_live_vm(h: &dyn ContractHarness) {
 
 /// `detach` leaves the VM running for `adopt` to pick up; after that VM
 /// is gone, `adopt` reports `None`.
+///
+/// An adopted VM is the same VM, not merely a live pid: it answers on the
+/// same vsock and offers whatever the driver claims it can do. Both are
+/// asserted because a driver that loses how its VMM is confined — a fact
+/// no live process reveals, so one only the record carries — rebuilds it
+/// unconfined, and an unconfined rebuild of a jailed VM is exactly a
+/// running pid that can no longer be reached or checkpointed (CORE-155).
 pub async fn detach_then_adopt_round_trip(h: &dyn ContractHarness) {
     let driver = h.driver();
     let vm = boot(h, "adopt").await;
@@ -193,6 +200,19 @@ pub async fn detach_then_adopt_round_trip(h: &dyn ContractHarness) {
         .expect("the detached vm survived");
     assert_eq!(*adopted.id(), record.id);
     assert_eq!(adopted.state(), VmState::Running);
+    assert_eq!(
+        adopted.checkpoint().is_some(),
+        driver.capabilities().checkpoint,
+        "an adopted vm offers what this driver claims it can do"
+    );
+    if let Some(port) = h.dial_port() {
+        let vsock = adopted.vsock().expect("an adopted vm keeps its vsock");
+        let conn = tokio::time::timeout(DEADLINE, vsock.dial(port))
+            .await
+            .expect("dial the adopted guest before the deadline")
+            .expect("dial the adopted guest");
+        drop(conn);
+    }
     adopted.shutdown(ShutdownMode::Kill).await.expect("kill");
     assert!(
         adopt
