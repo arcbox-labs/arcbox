@@ -23,7 +23,7 @@ use crate::lifecycle::tasks::resume::restore_paused;
 use crate::lifecycle::tasks::{TaskFailure, TaskResult};
 use crate::sandbox::reconcile::{JournaledLease, SandboxStateRecord, write_state_record};
 use crate::sandbox::record::SandboxProvisionOutcome;
-use crate::sandbox::{journaled_api_socket, journaled_pid, pool};
+use crate::sandbox::{journaled_pid, journaled_vmm, pool};
 
 impl ComputerFlows {
     /// The restore proper: claim a pre-warmed slot or prepare and stage a
@@ -105,7 +105,7 @@ impl ComputerFlows {
                 )
                 .map(|record| {
                     record
-                        .with_api_socket(failure.prepared.as_deref().and_then(journaled_api_socket))
+                        .with_vmm(failure.prepared.as_deref().and_then(journaled_vmm))
                         .with_pool_slot(pool_slot_id.as_deref())
                 })
                 .and_then(|record| write_state_record(&vm_dir, &record));

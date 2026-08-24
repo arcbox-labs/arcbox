@@ -37,6 +37,7 @@ use crate::lifecycle::actor::{
 use crate::lifecycle::event::{Provision, RestoreOrigin};
 use crate::lifecycle::flows::{BootLaunch, ComputerFlows, ComputerServices, Launch, RestoreLaunch};
 use crate::lifecycle::runtime::{ComputerRuntime, Runtime};
+use crate::sandbox::reconcile::JournaledVmm;
 use crate::snapshot::{SnapshotCatalog, SnapshotMeta};
 use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::template_catalog::TemplateCatalog;
@@ -615,17 +616,18 @@ pub(crate) fn journaled_pid(prepared: &dyn PreparedVm) -> Option<i32> {
         .and_then(|process| i32::try_from(process.pid).ok())
 }
 
-/// The VMM's API socket as the crash journal records it: what lets the next
-/// process adopt this VM instead of killing it.
+/// The VMM as the crash journal records it — its API socket and its jail —
+/// which is what lets the next process adopt this VM instead of killing it.
 ///
-/// The driver knows the path because it spawned the VMM there. Nothing else
-/// can work it out afterwards — see
-/// [`SandboxStateRecord::api_socket`](crate::sandbox::reconcile::SandboxStateRecord::api_socket).
-pub(crate) fn journaled_api_socket(prepared: &dyn PreparedVm) -> Option<PathBuf> {
-    prepared
-        .record()
-        .process
-        .and_then(|process| process.api_socket)
+/// The driver knows both because it spawned the VMM that way. Nothing else
+/// can work either out afterwards: see
+/// [`SandboxStateRecord::api_socket`](crate::sandbox::reconcile::SandboxStateRecord::api_socket)
+/// and [`SandboxStateRecord::jail`](crate::sandbox::reconcile::SandboxStateRecord::jail).
+pub(crate) fn journaled_vmm(prepared: &dyn PreparedVm) -> Option<JournaledVmm> {
+    prepared.record().process.map(|process| JournaledVmm {
+        api_socket: process.api_socket,
+        jail: process.jail.map(Into::into),
+    })
 }
 
 /// The isolation every sandbox VMM runs under: the jailer's, when one is
