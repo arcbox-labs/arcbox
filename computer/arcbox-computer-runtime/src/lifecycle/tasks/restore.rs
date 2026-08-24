@@ -104,6 +104,10 @@ pub struct RestoreFailure {
 /// Every failure returns [`RestoreFailure`] rather than unwinding here: a
 /// pre-commit restore failure is rolled back by force-removing the whole
 /// reservation, which is the caller's transaction to end.
+#[allow(
+    clippy::result_large_err,
+    reason = "the failure hands back the half-built sandbox's resources; boxing it is a refactor of its own"
+)]
 pub async fn restore_vm(inputs: RestoreVm<'_>) -> std::result::Result<RestoredVm, RestoreFailure> {
     let RestoreVm {
         new_id,

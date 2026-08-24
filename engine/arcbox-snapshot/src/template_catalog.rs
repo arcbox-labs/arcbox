@@ -330,7 +330,7 @@ impl TemplateCatalog {
             .ok_or_else(|| SnapshotError::TemplateNotFound(reference.to_string()))?;
         let removed: Vec<TemplateEntry> = match version {
             None => {
-                let mut entries: Vec<_> = record.versions.drain(..).collect();
+                let mut entries = std::mem::take(&mut record.versions);
                 entries.extend(record.draft.take());
                 self.remove_record(name)?;
                 entries

@@ -117,7 +117,6 @@ mod linux {
     ///
     /// Must only be used with `Command::pre_exec` (it runs post-fork,
     /// pre-exec); `slave` must remain open in the parent until after spawn.
-    #[must_use]
     pub fn child_terminal_setup(
         slave: libc::c_int,
         run_as: Option<RunAs>,

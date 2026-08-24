@@ -90,6 +90,10 @@ impl SandboxManager {
     /// template's lifetime from the user checkpoint. Files are reflinked
     /// where the filesystem supports it (the data dir is Btrfs), so the copy
     /// is cheap; the origin's rootfs stays pinned through the copied meta.
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "one of the async template operations; whether this one awaits today is an implementation detail"
+    )]
     pub async fn promote_snapshot_to_template(
         &self,
         source_snapshot_id: &str,

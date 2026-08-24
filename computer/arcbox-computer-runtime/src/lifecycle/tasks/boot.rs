@@ -142,6 +142,10 @@ pub async fn wait_for_agent(
     clippy::too_many_arguments,
     reason = "boot owns one exact sandbox generation and its handoff signal"
 )]
+#[allow(
+    clippy::result_large_err,
+    reason = "the failure hands back the half-built sandbox's resources; boxing it is a refactor of its own"
+)]
 pub async fn do_boot(
     id: &str,
     spec: &SandboxSpec,

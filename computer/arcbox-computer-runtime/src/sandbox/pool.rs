@@ -152,6 +152,10 @@ struct StagedSlot {
     image: CheckpointImage,
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the failure hands back the half-built sandbox's resources; boxing it is a refactor of its own"
+)]
 async fn stage_slot(
     driver: &dyn VmDriver,
     config: &RuntimeConfig,
