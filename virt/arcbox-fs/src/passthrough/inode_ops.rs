@@ -135,8 +135,8 @@ impl PassthroughFs {
 
         // Set owner
         if uid.is_some() || gid.is_some() {
-            let uid = uid.map_or(-1_i32 as libc::uid_t, |u| u);
-            let gid = gid.map_or(-1_i32 as libc::gid_t, |g| g);
+            let uid = uid.unwrap_or(-1_i32 as libc::uid_t);
+            let gid = gid.unwrap_or(-1_i32 as libc::gid_t);
             let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| FsError::InvalidPath("invalid path".to_string()))?;
             let ret = unsafe { libc::chown(path_cstr.as_ptr(), uid, gid) };
