@@ -185,12 +185,9 @@ impl<'a> Identity<'a> {
     #[cfg(target_os = "linux")]
     fn identifies(&self, proc_dir: PathBuf) -> bool {
         let by_cmdline = std::fs::read(proc_dir.join("cmdline"))
-            .ok()
-            .is_some_and(|bytes| cmdline_matches(&bytes, self.id, &self.socket));
+            .is_ok_and(|bytes| cmdline_matches(&bytes, self.id, &self.socket));
         let by_jail = self.jail_tail.as_ref().is_some_and(|tail| {
-            std::fs::read_link(proc_dir.join("root"))
-                .ok()
-                .is_some_and(|root| root.ends_with(tail))
+            std::fs::read_link(proc_dir.join("root")).is_ok_and(|root| root.ends_with(tail))
         });
         by_cmdline || by_jail
     }
