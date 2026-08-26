@@ -248,6 +248,14 @@ impl Fixture {
         self.dir.path().join("sandboxes").join(id)
     }
 
+    /// A computer's durable lifecycle record.
+    pub fn record_path(&self, id: &str) -> PathBuf {
+        self.dir
+            .path()
+            .join("sandbox-records")
+            .join(format!("{id}.json"))
+    }
+
     /// A computer's copy-on-write overlay file, as the probe names it
     /// ([`Setup::with_cow_probe`] fixtures only — the probe assembles no
     /// device, so the file exists once the test writes it).

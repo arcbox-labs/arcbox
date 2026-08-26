@@ -197,6 +197,20 @@ impl SandboxManager {
             .join(&new_id);
         let mut restore_spec = request.spec.clone();
         restore_spec.id = Some(new_id.clone());
+        // The request owns the new computer's identity and initial workload;
+        // the snapshot owns the provenance a later checkpoint must record.
+        // Keep the effective spec aligned with what this restore actually
+        // loads so adoption and chained checkpoints can reconstruct it.
+        if let Some(kernel) = &snap_meta.kernel_path {
+            restore_spec.kernel.clone_from(kernel);
+        }
+        if let Some(rootfs) = &snap_meta.rootfs_path {
+            restore_spec.rootfs.clone_from(rootfs);
+        }
+        if let Some(geometry) = snap_meta.geometry {
+            restore_spec.vcpus = geometry.vcpus;
+            restore_spec.memory_mib = geometry.memory_mib;
+        }
         let reservation = super::reserve_actor(
             &self.computers,
             &new_id,
