@@ -336,6 +336,10 @@ match_same_arms = "allow"
 needless_pass_by_value = "allow"
 unused_self = "allow"
 unused_async = "allow"
+# 1.98 split the async-family half out of `unused_async` above. Same call:
+# whether one member of an async surface awaits today is an implementation
+# detail, and de-asyncing it would encode that in a public signature.
+unused_async_trait_impl = "allow"
 too_many_lines = "allow"
 return_self_not_must_use = "allow"
 struct_excessive_bools = "allow"
