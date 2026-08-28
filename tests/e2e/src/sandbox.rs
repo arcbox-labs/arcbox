@@ -54,6 +54,42 @@ const READY_TIMEOUT: Duration = Duration::from_secs(360);
 /// rootfs build inside the guest).
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often a wait loop re-reads the state it is waiting for.
+///
+/// This is the resolution of any phase whose span contains such a loop —
+/// directly, or inside a scenario function it calls — and it biases those
+/// phases upward: the phase is reported as whichever tick first observes it.
+/// Phases made of single calls (`daemon_ready`, `sandbox_create`,
+/// `sandbox_file_io`, `sandbox_restore`, `template_build`, `connect_json`,
+/// the `sandbox_exec_*` family) contain no loop and are unaffected.
+///
+/// At the 500 ms this used to be, the `sandbox_ready` bucket boundary sat at
+/// ~1.53 s — directly on top of the distribution — so the same unchanged code
+/// reported 1508 ms on one run and 2011 ms on the next, and looked *stable*
+/// at both, because a bucket has no variance. Measured 2026-08-19 against
+/// `ce4f4e78` and `86ac9e12`: the true values were 1398 ms and
+/// 1327-1462 ms, i.e. indistinguishable, while the coarse readings differed
+/// by 500 ms.
+///
+/// Consequence to keep in mind: for a phase that does contain a loop,
+/// **numbers recorded before this change are not comparable with numbers
+/// after it**, and the gap depends on where the true value fell inside a
+/// bucket — same-day pairing: `sandbox_ready` 1508 -> 1398,
+/// `template_create` 1568 -> 1321. Re-baseline those rather than subtracting
+/// a correction, and do not read a delta on a loop-free phase as this.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The same, for a loop whose observation runs a command *inside* the
+/// sandbox being timed.
+///
+/// Neither interval observes anything host-local — `Inspect` is an RPC that
+/// crosses to the manager in the System VM. The difference is what happens
+/// at the far end: a guest `exec` starts a process in the nested VM under
+/// test, which costs tens of milliseconds and adds load to the very thing
+/// the phase is measuring. Polling it at [`POLL_INTERVAL`] would not observe
+/// sooner; it would only make the measurement worse.
+const GUEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub struct SandboxSmokeConfig {
     pub skip_build: bool,
     pub keep_test_dir: bool,
@@ -335,7 +371,7 @@ async fn drive_sandboxes(
             if Instant::now() > deadline {
                 bail!("initial cmd never ran (last_exited_at still unset)");
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
     let info = inspect(&mut sandboxes, "smoke1").await?;
@@ -870,7 +906,7 @@ async fn template_catalog_scenario(
         if Instant::now() > deadline {
             bail!("template defaults not observable in the guest: {out:?}");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(GUEST_POLL_INTERVAL).await;
     }
     metrics.record("template_create", create_started.elapsed().as_secs_f64());
     info!("bare-name create resolved the published version and applied its default cmd + env");
@@ -1753,7 +1789,7 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         {
             Err(status) if status.code() == tonic::Code::NotFound => break,
             Ok(_) | Err(_) if Instant::now() < reap_deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             Ok(info) => bail!(
                 "sandbox never TTL-reaped (state: {:?})",
@@ -1771,7 +1807,7 @@ async fn expose_cleanup_scenario(sandboxes: &mut SandboxServiceClient<Channel>) 
         match std::net::TcpListener::bind(("127.0.0.1", host_port)) {
             Ok(_) => break,
             Err(_) if Instant::now() < release_deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             Err(error) => {
                 bail!("host port {host_port} never released after the TTL reap: {error}")
@@ -2381,7 +2417,7 @@ async fn wait_for_state(
                 info.state()
             );
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
