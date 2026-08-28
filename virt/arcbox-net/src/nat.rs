@@ -149,8 +149,7 @@ impl NatNetwork {
     pub fn allocate_specific(&self, ip: Ipv4Addr) -> bool {
         self.allocator
             .lock()
-            .ok()
-            .is_some_and(|mut a| a.allocate_specific(ip))
+            .is_ok_and(|mut a| a.allocate_specific(ip))
     }
 
     /// Releases an IP address back to the pool.
@@ -163,10 +162,7 @@ impl NatNetwork {
     /// Checks if an IP address is available.
     #[must_use]
     pub fn is_available(&self, ip: Ipv4Addr) -> bool {
-        self.allocator
-            .lock()
-            .ok()
-            .is_some_and(|a| a.is_available(ip))
+        self.allocator.lock().is_ok_and(|a| a.is_available(ip))
     }
 
     /// Returns the number of allocated addresses.

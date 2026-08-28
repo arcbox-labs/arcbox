@@ -129,8 +129,7 @@ fn install_managed_binary(config: &AgentConfig) -> Result<PathBuf> {
     let managed = crate::update::managed_binary(config);
     if current
         .canonicalize()
-        .ok()
-        .is_some_and(|c| managed.canonicalize().is_ok_and(|m| c == m))
+        .is_ok_and(|c| managed.canonicalize().is_ok_and(|m| c == m))
     {
         return Ok(managed);
     }
