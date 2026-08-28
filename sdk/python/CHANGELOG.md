@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/arcboxlabs/arcbox/compare/sdk-python-v0.1.2...sdk-python-v0.1.3) (2026-08-28)
+
+
+### Features
+
+* **computer:** SandboxEvent carries a monotonic sequence number ([#695](https://github.com/arcboxlabs/arcbox/issues/695)) ([b38e943](https://github.com/arcboxlabs/arcbox/commit/b38e94351d07ce5606e340617b4d79b3de13242a))
+* **computer:** storage_bytes meters the retained footprint in every state ([#692](https://github.com/arcboxlabs/arcbox/issues/692)) ([468ed81](https://github.com/arcboxlabs/arcbox/commit/468ed8157aadd1358d9090b83941740d5dfbba62))
+
 ## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/sdk-python-v0.1.1...sdk-python-v0.1.2) (2026-08-11)
 
 
