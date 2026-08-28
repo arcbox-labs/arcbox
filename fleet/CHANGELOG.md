@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.4...fleet-agent-v0.1.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* **ci:** finish the stable-1.98 clippy sweep the macOS job walks ([ef12b7c](https://github.com/arcboxlabs/arcbox/commit/ef12b7c5da0cb686038033992a05a6b1a9bda704))
+
 ## [0.1.4](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.3...fleet-agent-v0.1.4) (2026-08-14)
 
 
