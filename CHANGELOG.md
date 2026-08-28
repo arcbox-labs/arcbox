@@ -5,6 +5,121 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/arcboxlabs/arcbox/compare/v0.7.0...v0.8.0) (2026-08-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **computer:** the runtime stops naming an adapter, and the last two exceptions retire ([#687](https://github.com/arcboxlabs/arcbox/issues/687))
+
+### Features
+
+* **agent:** export each running container's rootfs over NFS ([f2bcd1a](https://github.com/arcboxlabs/arcbox/commit/f2bcd1ab1cbc2bd40f989d5ebd511effd52665af))
+* **agent:** mount container rootfs with nfs-exportable overlay options ([ec679cc](https://github.com/arcboxlabs/arcbox/commit/ec679cc077b559606b9aa29d3f534da5eff0e6e3))
+* **computer:** make a handover a lifecycle transition of its own ([b424490](https://github.com/arcboxlabs/arcbox/commit/b424490752f1d49decdf9b7d779d68249ace04f8))
+* **computer:** SandboxEvent carries a monotonic sequence number ([#695](https://github.com/arcboxlabs/arcbox/issues/695)) ([b38e943](https://github.com/arcboxlabs/arcbox/commit/b38e94351d07ce5606e340617b4d79b3de13242a))
+* **computer:** storage_bytes meters the retained footprint in every state ([#692](https://github.com/arcboxlabs/arcbox/issues/692)) ([468ed81](https://github.com/arcboxlabs/arcbox/commit/468ed8157aadd1358d9090b83941740d5dfbba62))
+* **computer:** the startup sweep adopts a live sandbox instead of killing it ([#674](https://github.com/arcboxlabs/arcbox/issues/674)) ([8e832e5](https://github.com/arcboxlabs/arcbox/commit/8e832e52e29fa8cc2849c9b0f696a1f5257c583b))
+* **fc-driver:** the Firecracker adapter for the VM driver port (R1, part 1) ([#658](https://github.com/arcboxlabs/arcbox/issues/658)) ([4024577](https://github.com/arcboxlabs/arcbox/commit/40245772ac8a34b92d7e2a187914c017595c94f7))
+* **snapshot:** a live sandbox's CoW survives the startup sweep ([#672](https://github.com/arcboxlabs/arcbox/issues/672)) ([2be3830](https://github.com/arcboxlabs/arcbox/commit/2be383070505098af06d023e07626fd3f3e7aed7))
+* **snapshot:** add a util-linux BlockTools backend ([6dfa93b](https://github.com/arcboxlabs/arcbox/commit/6dfa93b7cf684c25d89ece510e4f3e2936aeab74))
+* **tap-net:** add an nftables PacketFilter backend ([fb8f4cd](https://github.com/arcboxlabs/arcbox/commit/fb8f4cd88fce36e04a0f96011b941763ae221a81))
+* **vm-driver:** a guest network can adopt a lease whose guest still runs ([#670](https://github.com/arcboxlabs/arcbox/issues/670)) ([8fbca3f](https://github.com/arcboxlabs/arcbox/commit/8fbca3f1ac386c4ff4ec90a87afe44ae50602464))
+* **vm-driver:** a prepared VM can stage its own files (R3, PR-G1) ([#676](https://github.com/arcboxlabs/arcbox/issues/676)) ([e4d168a](https://github.com/arcboxlabs/arcbox/commit/e4d168aee53498a60ec2f57375da05cb40695197))
+* **vm-driver:** add the VM port crate (R0 of the VM stack redesign) ([#656](https://github.com/arcboxlabs/arcbox/issues/656)) ([1c2800c](https://github.com/arcboxlabs/arcbox/commit/1c2800c2eb47d02a19317d0bda9e4f482e5049b4))
+* **vm-driver:** close the three GuestNetwork gaps the manager conversion needs (R2, part 2) ([#667](https://github.com/arcboxlabs/arcbox/issues/667)) ([e0b0c12](https://github.com/arcboxlabs/arcbox/commit/e0b0c1257c007f65e6f7c07367fc245436bfc840))
+* **vm-driver:** the process record names the jail its VMM runs in ([595376f](https://github.com/arcboxlabs/arcbox/commit/595376ff6a0eaf0020f8e92104dc47137e8b622c))
+* **vm:** make the dmsetup search list configuration ([#653](https://github.com/arcboxlabs/arcbox/issues/653)) ([ddf66b8](https://github.com/arcboxlabs/arcbox/commit/ddf66b8b7b095c4b7127e2437d1278c69bbb82be))
+* **xtask:** check-layers, a cargo-metadata gate for the layer rules ([#655](https://github.com/arcboxlabs/arcbox/issues/655)) ([97a4328](https://github.com/arcboxlabs/arcbox/commit/97a43284bb04ae2c5fdcf8556788f2e89e97a880))
+
+
+### Bug Fixes
+
+* a startup read that cannot parse one record holds it instead of bricking the host ([#684](https://github.com/arcboxlabs/arcbox/issues/684)) ([ce4f4e7](https://github.com/arcboxlabs/arcbox/commit/ce4f4e78d4abf54bf0e26bbe7ff3786119453838))
+* **agent:** close four gaps in the live-export watcher ([663c94f](https://github.com/arcboxlabs/arcbox/commit/663c94faebc911af7815faa7b1a15c324932087b))
+* **agent:** supervise the watcher without a check-then-act window ([0a70beb](https://github.com/arcboxlabs/arcbox/commit/0a70beb4e628c17fff18318cebc94de5f0f6ef8e))
+* **ci:** finish the stable-1.98 clippy sweep the macOS job walks ([ef12b7c](https://github.com/arcboxlabs/arcbox/commit/ef12b7c5da0cb686038033992a05a6b1a9bda704))
+* **ci:** master builds again under the current stable clippy ([db671a9](https://github.com/arcboxlabs/arcbox/commit/db671a97ed2635b3449c0560bad582e128e22e2a))
+* **clippy:** appease stable 1.98 lints the macOS job reaches ([35cfa59](https://github.com/arcboxlabs/arcbox/commit/35cfa59ce3da01805ba289b5ab337c2f25fd87eb))
+* **computer:** drop the guest agent before the handover, not after ([005c5ba](https://github.com/arcboxlabs/arcbox/commit/005c5bafc8bd3ede4aea4cbe17c7f284226a819f))
+* **computer:** journal the jail so an adopted Computer stays jailed ([cd0bdb5](https://github.com/arcboxlabs/arcbox/commit/cd0bdb561f952b9249a21aefdca15edfc0e8cd0b))
+* **computer:** journal the socket on every path that holds a VMM ([c46ad8b](https://github.com/arcboxlabs/arcbox/commit/c46ad8b8df8f861020ffbd1def40ddbb5789ad37))
+* **computer:** journal the VMM's socket so an adopt can reach it ([b193d05](https://github.com/arcboxlabs/arcbox/commit/b193d0525c07f238c8c64fe63605692dc8aa87ea))
+* **computer:** keep a handed-over computer out of three paths that still reached it ([38f3a6d](https://github.com/arcboxlabs/arcbox/commit/38f3a6df2de1beffca422e54ee02a2b257fb15fc))
+* **computer:** let the handover answer for itself, and bound its port call ([910bd1f](https://github.com/arcboxlabs/arcbox/commit/910bd1fd15adaca6c49cda0250e70beaf6e0945f))
+* **computer:** make a refused handover legible in the failure it is reported through ([732730c](https://github.com/arcboxlabs/arcbox/commit/732730cd5f1ebcccef19015aa503dafb0fa7571d))
+* **computer:** make one handover pass not cost the guests behind it ([4ea4a9f](https://github.com/arcboxlabs/arcbox/commit/4ea4a9fc7787892ff2b9e2e812ddde035cca4782))
+* **computer:** refuse a sandbox id the jailer will not exec ([#680](https://github.com/arcboxlabs/arcbox/issues/680)) ([b5bac73](https://github.com/arcboxlabs/arcbox/commit/b5bac730bbfee418d7365ff14a698563b54f435a))
+* **computer:** route detach_all through the per-computer actor ([773f67c](https://github.com/arcboxlabs/arcbox/commit/773f67ce54ed1e3726b52b6691a98726579e7086))
+* **e2e:** assert both overlay options land on one mount ([a8b08c3](https://github.com/arcboxlabs/arcbox/commit/a8b08c318ba0015b7da53c80d94e77badf28f1f1))
+* **e2e:** preserve the data dir when readiness fails ([c9d7874](https://github.com/arcboxlabs/arcbox/commit/c9d7874f81948512021438ada2787d2bdbe89b27))
+* **fc-driver:** adopt yields a kill-able handle even when the orphan's API is dead ([#666](https://github.com/arcboxlabs/arcbox/issues/666)) ([bb02640](https://github.com/arcboxlabs/arcbox/commit/bb026403b78be408227a3dd21b3942af35883757))
+* **snapshot:** attach loop devices the way busybox losetup actually works ([#665](https://github.com/arcboxlabs/arcbox/issues/665)) ([59655de](https://github.com/arcboxlabs/arcbox/commit/59655def6b378b4bf6f5d9eb6a0e96b4e9281468))
+* **snapshot:** fail a CoW setup whose device has no node ([507517e](https://github.com/arcboxlabs/arcbox/commit/507517e8ef756cebfdd70bb8d33a2cdbcf6c439b))
+* **snapshot:** make the dm node exist where udev will not make it ([522cc84](https://github.com/arcboxlabs/arcbox/commit/522cc84fa38080dbaea9a7134171c4f973b3dca3))
+* **snapshot:** reclaim the device when a setup fails before its node ([7c96ce1](https://github.com/arcboxlabs/arcbox/commit/7c96ce15ed1de287f62f524732961583086cf52a))
+* **tap-net:** resolve the doc links off Linux, and tighten two test helpers ([ce8a07f](https://github.com/arcboxlabs/arcbox/commit/ce8a07f558cfae6e1dd0c57ac03639003b818153))
+* **vm-driver:** refuse path-shaped ids and make the restore contract check distinguishing ([#661](https://github.com/arcboxlabs/arcbox/issues/661)) ([7f016f1](https://github.com/arcboxlabs/arcbox/commit/7f016f1cda090cdbd79a0d29415d4d0fe659a48e))
+* **xtask:** a dependency carrying the crate's own name is not a layer edge ([#662](https://github.com/arcboxlabs/arcbox/issues/662)) ([fd9daec](https://github.com/arcboxlabs/arcbox/commit/fd9daec7d8a08fd5c74d895b8cbcc2574031ae62))
+
+
+### Code Refactoring
+
+* **agent:** author the containerd config as TOML, not a Rust string ([d2be452](https://github.com/arcboxlabs/arcbox/commit/d2be452b9218e8497b75247eca7498a0e3ce1083))
+* **computer:** extract the GuestAgent port (R3, PR-D) ([#673](https://github.com/arcboxlabs/arcbox/issues/673)) ([e7756d7](https://github.com/arcboxlabs/arcbox/commit/e7756d73ea09a377d2c40a9158efe74cde22b36c))
+* **computer:** move the sandbox runtime to computer/arcbox-computer-runtime (R3, part 2) ([#671](https://github.com/arcboxlabs/arcbox/issues/671)) ([cdfcbc5](https://github.com/arcboxlabs/arcbox/commit/cdfcbc5b3c2d5522d60eb9b0eb462502323e3bfe))
+* **computer:** refuse a handed-over computer at the door, not per command ([18d8c53](https://github.com/arcboxlabs/arcbox/commit/18d8c53eb51a8032c041377c527659ba4a657907))
+* **computer:** the computer lifecycle as a statig state machine (R3, PR-E) ([#675](https://github.com/arcboxlabs/arcbox/issues/675)) ([c7b5d08](https://github.com/arcboxlabs/arcbox/commit/c7b5d082003d9fdd37b98e60ed7542919acb15e5))
+* **computer:** the manager drives one actor per computer (R3, PR-F2) ([#678](https://github.com/arcboxlabs/arcbox/issues/678)) ([ab5f401](https://github.com/arcboxlabs/arcbox/commit/ab5f401200603c698ab4331e98a3ac57b8c75894))
+* **computer:** the per-computer lifecycle actor and its sub-tasks (R3, PR-F1) ([#677](https://github.com/arcboxlabs/arcbox/issues/677)) ([d1c77ea](https://github.com/arcboxlabs/arcbox/commit/d1c77eae8b0be0505689adc265d2370049f3c679))
+* **computer:** the runtime stages through the port, and a jail goes with its grip (R3, PR-G2) ([#681](https://github.com/arcboxlabs/arcbox/issues/681)) ([a2ba44f](https://github.com/arcboxlabs/arcbox/commit/a2ba44f490b70c17febd1e0389e405e1abf6e902))
+* **computer:** the runtime stops building its own VMM; the guest agent composes ([#685](https://github.com/arcboxlabs/arcbox/issues/685)) ([80513be](https://github.com/arcboxlabs/arcbox/commit/80513be28b7843867831dd9c5d3d46dcc4912d8d))
+* **computer:** the runtime stops naming an adapter, and the last two exceptions retire ([#687](https://github.com/arcboxlabs/arcbox/issues/687)) ([86ac9e1](https://github.com/arcboxlabs/arcbox/commit/86ac9e128cfb38faed9dc914e352404df4a674e3))
+* **computer:** the sweep and pause reach a VM's area through the port ([#686](https://github.com/arcboxlabs/arcbox/issues/686)) ([54c78f0](https://github.com/arcboxlabs/arcbox/commit/54c78f041ba0058e7022276bef3b8463a4e78946))
+* **fc:** a layout is built from a jail, not an isolation spec ([f3b0788](https://github.com/arcboxlabs/arcbox/commit/f3b0788ae0a9ad16b0e71e0de421b6fa72318357))
+* **snapshot:** one file per BlockTools implementation ([331db6e](https://github.com/arcboxlabs/arcbox/commit/331db6eb6290cee2c65ef6c2ec22dbe434397179))
+* **snapshot:** put block-device tooling behind a BlockTools seam ([#650](https://github.com/arcboxlabs/arcbox/issues/650)) ([e9055a5](https://github.com/arcboxlabs/arcbox/commit/e9055a5ac607669816e65982df3e656d5fef4e8d))
+* **tap-net:** make the packet-filter seam ready for a second backend ([7c378f5](https://github.com/arcboxlabs/arcbox/commit/7c378f5dc03e2eb79d986caf4f6fd80ee337ca03))
+* **tap-net:** move the sandbox TAP network into its own crate behind GuestNetwork ([#663](https://github.com/arcboxlabs/arcbox/issues/663)) ([c1b16a8](https://github.com/arcboxlabs/arcbox/commit/c1b16a88e02535c096526b00265903e83a2e3b42))
+* **vm:** attach guest networks through the driver port's GuestNetwork (R2, part 3) ([#669](https://github.com/arcboxlabs/arcbox/issues/669)) ([2e810aa](https://github.com/arcboxlabs/arcbox/commit/2e810aa3506a69874762d9d1bad7ad78e795d0ec))
+* **vm:** extract the runtime's pure core (R3, part 1) ([#668](https://github.com/arcboxlabs/arcbox/issues/668)) ([b4015b7](https://github.com/arcboxlabs/arcbox/commit/b4015b72df6e9aa4d833c683adf848d77a82f6c6))
+* **vm:** move the sandbox rootfs builder into arcbox-vm with composer-supplied paths ([#652](https://github.com/arcboxlabs/arcbox/issues/652)) ([054015f](https://github.com/arcboxlabs/arcbox/commit/054015fa4c78413e8a5964e03feba9bea1d7b2a6))
+* **vm:** put the invariant translation's netfilter rendering behind a PacketFilter seam ([#651](https://github.com/arcboxlabs/arcbox/issues/651)) ([25ab5a9](https://github.com/arcboxlabs/arcbox/commit/25ab5a9fb2b512f13a5381ec689af5e0cc3eb67e))
+* **vm:** reach the guest agent through the driver port's Vsock capability ([#657](https://github.com/arcboxlabs/arcbox/issues/657)) ([e5c75d5](https://github.com/arcboxlabs/arcbox/commit/e5c75d5cca6258fb62cf10ce0df1565d4f4ffb09))
+* **vm:** split vm-agent and its wire vocabulary out of arcbox-vm ([#649](https://github.com/arcboxlabs/arcbox/issues/649)) ([fda85db](https://github.com/arcboxlabs/arcbox/commit/fda85db99068135df9130445c55fc587beb5934e))
+* **vm:** the sandbox manager owns its VMs through the driver port (R1, part 2) ([#664](https://github.com/arcboxlabs/arcbox/issues/664)) ([86fb360](https://github.com/arcboxlabs/arcbox/commit/86fb3602486fd342d8a93e4b58901b129690cb6f))
+
+
+### Tests
+
+* **agent:** adoption is exercised jailed, the mode the bug lived in ([286fc55](https://github.com/arcboxlabs/arcbox/commit/286fc55672fddb0472b9f6507128a5007bca6771))
+* **api:** ignore the dockerhub org icon lookup CI runners cannot resolve ([55b384b](https://github.com/arcboxlabs/arcbox/commit/55b384b9193d9e564b33efe208dcc7ad5d63b0ff))
+* **computer:** drive the manager real flows over the fakes (R3, PR-F3) ([#682](https://github.com/arcboxlabs/arcbox/issues/682)) ([d5f69dc](https://github.com/arcboxlabs/arcbox/commit/d5f69dcc130d91f0e15e17ef50f6b5c059925665))
+* **computer:** make the block-tools skips fail where both userlands exist ([5c22782](https://github.com/arcboxlabs/arcbox/commit/5c227829d35371b6af713e152aeff620e07dcaa1))
+* **snapshot:** cover the block-tools error paths nothing reached ([07c345f](https://github.com/arcboxlabs/arcbox/commit/07c345f1aea2db3a969219e9e59fa154a31f6c50))
+* **snapshot:** wait out the ETXTBSY window for every stand-in binary ([26955a1](https://github.com/arcboxlabs/arcbox/commit/26955a1309dfeb8d28f8b7348a7647fbd9b4c948))
+* **tap-net:** prove the nftables rendering against a real kernel ([9db4510](https://github.com/arcboxlabs/arcbox/commit/9db4510770364a8d01f125cf88b09bdbc9491b56))
+* **vm-driver:** an adopted vm has to be usable, not merely alive ([7de86bd](https://github.com/arcboxlabs/arcbox/commit/7de86bd5ad51ff9ccf59579bb3f5f67f5be6f4b0))
+
+
+### Documentation
+
+* **computer:** describe the computer runtime crate and what binds only it ([9de0396](https://github.com/arcboxlabs/arcbox/commit/9de0396aa97750775c3b8b59e332fb445c3c64d8))
+* **docker:** correct two stale compatibility claims ([#647](https://github.com/arcboxlabs/arcbox/issues/647)) ([876f70a](https://github.com/arcboxlabs/arcbox/commit/876f70a388aa449a0f86a52b1e6fa8a73c650d02))
+* **engine:** say what the discovery probe prevents, not what it does ([5497046](https://github.com/arcboxlabs/arcbox/commit/5497046be9e0972714c91ca7abaad36145e649c3))
+* **snapshot:** name what losetup's " (lost)" marker actually means ([4bbe07e](https://github.com/arcboxlabs/arcbox/commit/4bbe07e77ec8c2bd8dac8b23008c2a7b1ebf4c40))
+
+
+### Styles
+
+* **e2e:** rustfmt the overlay options probe docker args ([95b37f3](https://github.com/arcboxlabs/arcbox/commit/95b37f3100b389e8ba4a4a7dbb4d8baea5467497))
+
+
+### Miscellaneous Chores
+
+* **assets:** move host CLI and guest runtime to Docker 29.7.2 ([#634](https://github.com/arcboxlabs/arcbox/issues/634)) ([a215d91](https://github.com/arcboxlabs/arcbox/commit/a215d917da63cc77f62c97ea6830b55ccf0e85cf))
+* **assets:** pin boot bundle 0.8.6 (patched containerd) ([#654](https://github.com/arcboxlabs/arcbox/issues/654)) ([db44b71](https://github.com/arcboxlabs/arcbox/commit/db44b716ed56c88ccd852c572cc7d9f91ad6ed3d))
+
 ## [0.7.0](https://github.com/arcboxlabs/arcbox/compare/v0.6.9...v0.7.0) (2026-08-15)
 
 
