@@ -6,7 +6,7 @@
 //! - stop a running daemon (`abctl daemon stop`)
 //! - inspect daemon status (`abctl daemon status`)
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use arcbox_constants::{
     container_network::ContainerNetwork,
     paths::{ArcboxProfile, HostLayout},
@@ -20,8 +20,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{sleep, timeout, Instant};
 use tracing::warn;
+
+#[path = "resolve_daemon.rs"]
+mod resolve_daemon;
 
 /// Arguments for the daemon command.
 #[derive(Debug, Args)]
@@ -397,19 +400,8 @@ impl SpawnLock {
 
 fn resolve_daemon_binary() -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
-
-    if let Some(parent) = current_exe.parent() {
-        let sibling = parent.join("arcbox-daemon");
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-
-    if let Some(path) = find_in_path("arcbox-daemon") {
-        return Ok(path);
-    }
-
-    bail!("Failed to locate `arcbox-daemon` next to `abctl` or in PATH");
+    resolve_daemon::resolve_daemon_binary_from(&current_exe, find_in_path)
+        .map_err(anyhow::Error::msg)
 }
 
 fn find_in_path(binary: &str) -> Option<PathBuf> {
@@ -561,8 +553,8 @@ fn send_sigterm(pid: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonAction, DaemonArgs, SpawnLock, build_daemon_args, read_lock_file,
-        wait_for_lock_handoff,
+        build_daemon_args, read_lock_file, wait_for_lock_handoff, DaemonAction, DaemonArgs,
+        SpawnLock,
     };
     use arcbox_constants::paths::ArcboxProfile;
     use std::ffi::OsString;
