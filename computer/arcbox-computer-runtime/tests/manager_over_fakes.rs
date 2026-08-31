@@ -866,6 +866,125 @@ async fn a_checkpoint_restores_onto_a_fresh_address() {
     assert_eq!(fixture.run(&clone, &["/bin/hello"]).await, b"hi");
 }
 
+/// Adoption reconstructs the computer from its durable record, so that
+/// record must retain every input a later checkpoint writes into its restore
+/// contract. The checkpoint must be restorable after the process that booted
+/// the origin has handed it over.
+#[tokio::test]
+async fn an_adopted_computers_checkpoint_restores() {
+    let mut fixture = Fixture::jailed().await;
+    fixture.agent().on(&["/bin/hello"], Reply::stdout(b"hi"));
+    let id = fixture.ready("origin").await;
+
+    fixture.manager.detach_all().await.unwrap();
+    fixture = fixture.restart().await;
+    fixture.await_state(&id, SandboxState::Ready).await;
+
+    let checkpoint = fixture
+        .manager
+        .checkpoint_sandbox(&id, "adopted".into(), HashMap::new())
+        .await
+        .unwrap();
+    let (clone, _) = fixture
+        .manager
+        .restore_sandbox(RestoreSandboxSpec {
+            id: Some("adopted-clone".into()),
+            snapshot_id: checkpoint.snapshot_id,
+            network_override: true,
+            ..RestoreSandboxSpec::default()
+        })
+        .await
+        .unwrap();
+
+    fixture.await_state(&clone, SandboxState::Ready).await;
+    assert_eq!(fixture.run(&clone, &["/bin/hello"]).await, b"hi");
+}
+
+/// Version-one records written before checkpoint provenance was retained
+/// remain readable and adoptable. Their lost paths cannot be reconstructed
+/// safely, so checkpoint refuses before publishing an unrestorable image.
+#[tokio::test]
+async fn an_adopted_computer_with_a_legacy_record_refuses_checkpoint() {
+    let mut fixture = Fixture::jailed().await;
+    let id = fixture.ready("legacy").await;
+    fixture.manager.detach_all().await.unwrap();
+
+    let record_path = fixture.record_path(&id);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["version"], 1);
+    record["effective_spec"]["kernel"] = serde_json::Value::String(String::new());
+    record["effective_spec"]["rootfs"] = serde_json::Value::String(String::new());
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    fixture = fixture.restart().await;
+    fixture.await_state(&id, SandboxState::Ready).await;
+    let error = fixture
+        .manager
+        .checkpoint_sandbox(&id, "legacy".into(), HashMap::new())
+        .await
+        .expect_err("the record has no safe restore provenance");
+    assert!(
+        matches!(&error, VmmError::Other(message) if message.contains("no kernel path")),
+        "unexpected checkpoint refusal: {error}"
+    );
+    assert!(
+        fixture
+            .manager
+            .list_checkpoints(Some(&id))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A restored computer inherits the source snapshot's restore provenance.
+/// Its own checkpoint must therefore remain restorable rather than losing
+/// the kernel, rootfs and geometry when the restore request supplies only
+/// identity fields.
+#[tokio::test]
+async fn a_restored_computers_checkpoint_restores_again() {
+    let fixture = Fixture::jailed().await;
+    fixture.agent().on(&["/bin/hello"], Reply::stdout(b"hi"));
+    let origin = fixture.ready("origin").await;
+    let first = fixture
+        .manager
+        .checkpoint_sandbox(&origin, "first".into(), HashMap::new())
+        .await
+        .unwrap();
+    let (first_clone, _) = fixture
+        .manager
+        .restore_sandbox(RestoreSandboxSpec {
+            id: Some("first-clone".into()),
+            snapshot_id: first.snapshot_id,
+            network_override: true,
+            ..RestoreSandboxSpec::default()
+        })
+        .await
+        .unwrap();
+    fixture.await_state(&first_clone, SandboxState::Ready).await;
+
+    let second = fixture
+        .manager
+        .checkpoint_sandbox(&first_clone, "second".into(), HashMap::new())
+        .await
+        .unwrap();
+    let (second_clone, _) = fixture
+        .manager
+        .restore_sandbox(RestoreSandboxSpec {
+            id: Some("second-clone".into()),
+            snapshot_id: second.snapshot_id,
+            network_override: true,
+            ..RestoreSandboxSpec::default()
+        })
+        .await
+        .unwrap();
+
+    fixture
+        .await_state(&second_clone, SandboxState::Ready)
+        .await;
+    assert_eq!(fixture.run(&second_clone, &["/bin/hello"]).await, b"hi");
+}
+
 /// A capture that fails and leaves the guest running is an error the
 /// caller can retry: the computer stays Ready with everything it holds.
 #[tokio::test]
@@ -1182,7 +1301,8 @@ async fn a_detached_computer_is_adopted_by_the_next_process_and_serves_an_exec()
     );
 }
 
-/// An adopted computer running on a copied rootfs pauses like any other.
+/// An adopted computer running on a copied rootfs pauses and resumes like
+/// one this process booted.
 ///
 /// Its disk lives in the VM's area and this process holds no prepared VM to
 /// reach in with, so until the handle grew a staging accessor the pause was
@@ -1194,20 +1314,10 @@ async fn a_detached_computer_is_adopted_by_the_next_process_and_serves_an_exec()
 ///
 /// The area is reachable from the handle now: the disk comes out ahead of
 /// the kill and lands where a resume looks for it.
-///
-/// The resume itself does not yet complete, for a reason of its own that
-/// this pause used to hide: the durable record redacts a computer's boot
-/// inputs when it reaches `Ready` (`redact_runtime_inputs`), so an adopted
-/// computer's `spec.kernel` is empty, and every checkpoint it takes records
-/// no kernel path for the staging that follows to bring in. That is a gap
-/// in adoption, not in pause — a *Checkpoint* of an adopted computer is
-/// unrestorable for the same reason, with no pause involved — and it is
-/// asserted here as it behaves: the resume fails, the computer is left back
-/// at `Paused`, and its retained disk is where the pause put it, so nothing
-/// is lost and a retry has something to succeed with.
 #[tokio::test]
-async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
+async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_resumes_with_its_disk() {
     let mut fixture = Fixture::jailed().await;
+    fixture.agent().on(&["/bin/hello"], Reply::stdout(b"hi"));
     let id = fixture.ready("handed-over").await;
 
     fixture.manager.detach_all().await.unwrap();
@@ -1224,17 +1334,14 @@ async fn an_adopted_computer_on_a_copied_rootfs_pauses_and_keeps_its_disk() {
     );
 
     fixture.settle_network_cleanups().await;
-    let error = fixture
+    fixture
         .manager
         .resume_sandbox(&id, pause_reason::RESUME)
         .await
-        .expect_err("an adopted computer's checkpoint records no kernel to stage");
-    assert!(
-        matches!(&error, VmmError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
-        "the kernel path the checkpoint recorded is empty, so staging it is ENOENT: {error}"
-    );
-    fixture.await_state(&id, SandboxState::Paused).await;
-    assert!(parked.exists(), "a failed resume leaves the disk parked");
+        .unwrap();
+    fixture.await_state(&id, SandboxState::Ready).await;
+    assert!(!parked.exists(), "resume moved the parked disk into the vm");
+    assert_eq!(fixture.run(&id, &["/bin/hello"]).await, b"hi");
 }
 
 /// Nothing this process does may reach a VM it has handed over (CORE-145).

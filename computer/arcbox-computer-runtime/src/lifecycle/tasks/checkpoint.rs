@@ -92,6 +92,16 @@ fn checkpoint_source(
             actual: inst.state.to_string(),
         });
     }
+    if inst.spec.kernel.is_empty() {
+        return Err(VmmError::FailedPrecondition(format!(
+            "sandbox {sandbox_id} cannot be checkpointed: its durable record has no kernel path"
+        )));
+    }
+    if inst.spec.rootfs.is_empty() {
+        return Err(VmmError::FailedPrecondition(format!(
+            "sandbox {sandbox_id} cannot be checkpointed: its durable record has no rootfs path"
+        )));
+    }
     let handle = inst.handle.clone().ok_or_else(|| VmmError::WrongState {
         id: sandbox_id.clone(),
         expected: format!("{expected_state} (VM handle available)"),

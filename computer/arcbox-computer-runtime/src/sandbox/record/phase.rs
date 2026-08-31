@@ -239,8 +239,9 @@ impl SandboxRecord {
     }
 
     fn redact_runtime_inputs(&mut self) {
-        self.effective_spec.kernel.clear();
-        self.effective_spec.rootfs.clear();
+        // A successor reconstructs an adopted computer from this record,
+        // and its next checkpoint records these paths as the restore
+        // provenance. They outlive boot even though the inputs below do not.
         self.effective_spec.boot_args.clear();
         self.effective_spec.cmd.clear();
         self.effective_spec.env.clear();
@@ -481,6 +482,42 @@ mod tests {
         for (transition, phase) in projections {
             assert_eq!(transition.phase(), phase, "{transition:?}");
         }
+    }
+
+    #[test]
+    fn ready_records_keep_checkpoint_provenance_and_redact_consumed_inputs() {
+        let mut record = SandboxRecord::new(
+            "box",
+            "key",
+            SandboxSpec {
+                id: Some("box".into()),
+                kernel: "/assets/vmlinux".into(),
+                rootfs: "/assets/rootfs.ext4".into(),
+                boot_args: "console=ttyS0".into(),
+                cmd: vec!["/bin/work".into()],
+                env: std::collections::HashMap::from([("TOKEN".into(), "secret".into())]),
+                working_dir: "/work".into(),
+                user: "1000".into(),
+                ttl_seconds: 60,
+                ssh_public_key: Some("ssh-ed25519 key".into()),
+                ..SandboxSpec::default()
+            },
+        );
+        record
+            .apply(SandboxTransition::Starting(outcome()))
+            .unwrap();
+        record.apply(SandboxTransition::Ready).unwrap();
+
+        assert_eq!(record.effective_spec.kernel, "/assets/vmlinux");
+        assert_eq!(record.effective_spec.rootfs, "/assets/rootfs.ext4");
+        assert!(record.effective_spec.boot_args.is_empty());
+        assert!(record.effective_spec.cmd.is_empty());
+        assert!(record.effective_spec.env.is_empty());
+        assert!(record.effective_spec.working_dir.is_empty());
+        assert!(record.effective_spec.user.is_empty());
+        assert_eq!(record.effective_spec.ttl_seconds, 0);
+        assert_eq!(record.effective_spec.ssh_public_key, None);
+        assert!(record.ttl_deadline.is_some());
     }
 
     #[test]
