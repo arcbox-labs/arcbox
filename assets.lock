@@ -23,30 +23,30 @@ manifest_sha256 = "326d7e100c885280570bdfa9edd08d852e99f9efd9a4149c1a5c46370003e
 [[tools]]
 name = "docker"
 group = "docker"
-version = "29.7.2"
-arch.arm64.sha256 = "b8683ed19d1f06048a496f9b8429e2c71d0b088d475b7487c054ea3666c02a3c"
-arch.x86_64.sha256 = "fb1f1aa7ac7af4364165b9eadfda92e96c8ced508fca74f53079719891367438"
+version = "29.8.0"
+arch.arm64.sha256 = "3f37afe51f8f53f224192099a76a454a62eb6100d426738da17fdf8472cf4b5f"
+arch.x86_64.sha256 = "aeb74337d43dc9f863d056760e156daa71f9462ffdc0f836a14f1528fa1f0f13"
 
 [[tools]]
 name = "docker-buildx"
 group = "docker"
-version = "0.36.1"
-arch.arm64.sha256 = "214cdc36788602862dbc82b523d58648b4585c7b0ff95218b0817c44db5573d7"
-arch.x86_64.sha256 = "52a39ee4012d18f83373656712102ebda55656121dcdabbbb1ccfbd41b7debe8"
+version = "0.37.0"
+arch.arm64.sha256 = "4cf78bb790f96f576522af0db716c7c25e8937a71c3303a165ff90d5105170ff"
+arch.x86_64.sha256 = "9d5a359608ffddbc9049eb0a8128db798a1fcc30cbfb2e451cb49ab99cbe0635"
 
 [[tools]]
 name = "docker-compose"
 group = "docker"
-version = "5.4.0"
-arch.arm64.sha256 = "bc3d1fd4c01e3af9b481fc5ea153ea7c006c77eb39be78e9af3e2e8ebecc0d61"
-arch.x86_64.sha256 = "59fc378c6832c7c8d628d4d38a4e2bebcad579b21d1d380e9b8872961fe3da83"
+version = "5.5.1"
+arch.arm64.sha256 = "998735c9b6fe68a4f05895e6ea73d71ad06f9fc7046383ad89e47346781b6af5"
+arch.x86_64.sha256 = "a264d61e824bf08a78867e59cdf32eb09f0aee9ecdf9f6ebfa43f76dc52880f1"
 
 [[tools]]
 name = "docker-credential-osxkeychain"
 group = "docker"
-version = "0.9.8"
-arch.arm64.sha256 = "6fae515ffbc74f395af1b51c6f079ddb57895ed9e428e0bea3f6aff64e916b22"
-arch.x86_64.sha256 = "0575a404c4ead8b5135a2482ece4dd142bde3cbd319433697e212bbea0afb100"
+version = "0.9.9"
+arch.arm64.sha256 = "3585188b1df1c3568ae536999eddb48ad2c781b3cf07a2f7d7181262d045820c"
+arch.x86_64.sha256 = "1be33ae30c8c80277bea3364d0d71afad411fa22e88bcabf3375550b989fd272"
 
 [[tools]]
 name = "pstramp"
@@ -58,6 +58,6 @@ arch.x86_64.sha256 = "eb3cc921de1aed02348821f4a653705a33b012b6a1da7466e577673c5c
 [[tools]]
 name = "kubectl"
 group = "kubernetes"
-version = "1.36.3"
-arch.arm64.sha256 = "fc8582acde13869a606730a79379d6515f30c68afcced0b5ac8789d5d002b7d6"
-arch.x86_64.sha256 = "158b3b46cf74e8b6bd9b1d7cd30f665e3efb2bc1ec3c843ec925bcfdd2930de0"
+version = "1.37.0"
+arch.arm64.sha256 = "583beedaebe422e71d3f1a96acef8b1fef86ea2f09a45ad01aa6c9ce287c1380"
+arch.x86_64.sha256 = "d5276c0f4fde77fc446070290f345944a7f1fda153df6b960e5fde93b7a9bccd"
