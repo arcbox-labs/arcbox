@@ -1081,6 +1081,7 @@ mod tests {
         let runner = crate::runner::RunnerSupervisor::new(
             events,
             None,
+            crate::joblog::JobLogs::nowhere(),
             Backends::new(false, None, None, None, agent_state.clone()),
             agent_state.clone(),
             Handover::new(agent_state.clone()),
@@ -1228,6 +1229,7 @@ mod tests {
         let runner = crate::runner::RunnerSupervisor::new(
             events,
             None,
+            crate::joblog::JobLogs::nowhere(),
             Backends::new(false, None, None, None, agent_state.clone()),
             agent_state.clone(),
             Handover::new(agent_state),

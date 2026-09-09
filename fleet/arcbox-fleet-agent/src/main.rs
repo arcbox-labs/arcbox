@@ -37,6 +37,7 @@ mod fsutil;
 mod handover;
 mod host;
 mod interop;
+mod joblog;
 #[cfg(test)]
 mod mock_daemon;
 mod reexec;
@@ -242,6 +243,9 @@ fn main() -> Result<()> {
         foreground: true,
         ..LogConfig::default()
     });
+    // Collect expired job logs on every invocation, so an agent that stops
+    // running jobs (or crashed mid-job) still stops holding onto them.
+    joblog::JobLogs::new(&config.data_dir.join("log")).sweep();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

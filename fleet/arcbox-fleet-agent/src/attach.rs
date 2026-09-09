@@ -28,6 +28,7 @@ use crate::config::AgentConfig;
 use crate::credentials::Credential;
 use crate::handover::{Handover, Reason};
 use crate::host;
+use crate::joblog::JobLogs;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
 use crate::update;
@@ -143,6 +144,7 @@ pub fn spawn_supervisor(
     let supervisor = RunnerSupervisor::new(
         egress_tx,
         config.runner_script.clone(),
+        JobLogs::new(&config.data_dir.join("log")),
         backends,
         state,
         handover,
@@ -1125,6 +1127,7 @@ mod tests {
         RunnerSupervisor::new(
             events,
             None,
+            crate::joblog::JobLogs::nowhere(),
             Backends::fixed(Vec::new(), state.clone()),
             state.clone(),
             Handover::new(state),

@@ -9,26 +9,57 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-/// Write `bytes` to `path`, owner-only (`0600`) from creation — every
-/// supported target (macOS, Linux) is Unix.
-fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
+/// Open `path` owner-only (`0600`) from creation — every supported target
+/// (macOS, Linux) is Unix. `truncate` picks between replacing the file's
+/// contents and appending to them.
+fn open_owner_only(path: &Path, truncate: bool) -> Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(truncate)
+        .append(!truncate)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
-    // `mode` only takes effect when this call creates the file; a leftover temp
-    // from a crashed run keeps its old mode, so fchmod the open handle as a
-    // backstop (operating on the fd, never racing a path lookup).
+    // `mode` only takes effect when this call creates the file; a leftover file
+    // from an earlier or umask-lenient run keeps its old mode, so fchmod the
+    // open handle as a backstop (operating on the fd, never racing a path
+    // lookup).
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    Ok(file)
+}
+
+/// Open `path` for appending, owner-only (`0600`), creating it if absent.
+/// Append rather than truncate so a second open never destroys what the
+/// first wrote.
+pub fn open_append_owner_only(path: &Path) -> Result<std::fs::File> {
+    open_owner_only(path, false)
+}
+
+/// Write `bytes` to `path`, owner-only (`0600`) from creation.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = open_owner_only(path, true)?;
     file.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Create `dir` (and its parents) owner-only (`0700`).
+///
+/// The chmod is unconditional rather than creation-only so a directory left
+/// behind by an older or umask-lenient run gets the same traversal barrier
+/// `control::serve` applies at startup — the headless `quick enroll`
+/// persists into the data dir without ever running `serve`.
+pub fn ensure_owner_only_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))
 }
 
 /// Serialize `value` as pretty JSON and write it to `path` atomically:
@@ -38,17 +69,8 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
 /// read, and it preserves the temp file's mode so a secret is never briefly
 /// world-readable at the final path.
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-        // Owner-only like the file below, and unconditional (not just on
-        // creation) so a dir left behind by an older or umask-lenient run
-        // gets the same traversal barrier `control::serve` applies at
-        // startup — the headless `quick enroll` persists here without `serve`.
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 0700 {}", parent.display()))?;
+        ensure_owner_only_dir(parent)?;
     }
     let json = serde_json::to_vec_pretty(value).context("serializing to JSON")?;
     let mut tmp = path.as_os_str().to_owned();

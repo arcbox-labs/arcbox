@@ -28,12 +28,13 @@ use command_group::AsyncCommandGroup;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::backends::Backends;
 use crate::docker::RunSpec;
 use crate::handover::Handover;
 use crate::host;
+use crate::joblog::{JobLog, JobLogs};
 use crate::state::AgentState;
 
 /// Watchdog on a VM job's runtime: GitHub concludes jobs at 6 h, so a
@@ -191,6 +192,8 @@ struct Inner {
     /// Path to the installed runner's entry point (`run.sh`). `None` when
     /// only Docker-based execution is configured.
     runner_script: Option<PathBuf>,
+    /// Where each job's combined stdout/stderr is written.
+    job_logs: JobLogs,
     /// The live backend registry: the runtimes behind each advertised
     /// capability and the `(os, arch)` → backend routing, read per offer so
     /// routing always agrees with what is currently advertised.
@@ -237,6 +240,7 @@ impl RunnerSupervisor {
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
         runner_script: Option<PathBuf>,
+        job_logs: JobLogs,
         backends: Arc<Backends>,
         state: AgentState,
         handover: Arc<Handover>,
@@ -247,6 +251,7 @@ impl RunnerSupervisor {
                 outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
                 runner_script,
+                job_logs,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 handover,
@@ -520,6 +525,7 @@ impl RunnerSupervisor {
         cancel: CancellationToken,
     ) {
         let job_id = order.job_id.clone();
+        let log = self.open_job_log(&job_id);
         match backend {
             Backend::Docker => self.run_docker_job(&job_id, &order, &token, cancel).await,
             // A windows capability is host_runner-backed on the wire (it IS
@@ -527,14 +533,36 @@ impl RunnerSupervisor {
             // interop boundary), but its process management is different
             // enough to be its own path — see `crate::interop`.
             Backend::HostRunner if order.os == "windows" => {
-                self.run_interop_job(&job_id, &order, &token, cancel).await;
+                self.run_interop_job(&job_id, &order, &token, log, cancel)
+                    .await;
             }
-            Backend::HostRunner => self.run_host_job(&job_id, &order, &token, cancel).await,
+            Backend::HostRunner => {
+                self.run_host_job(&job_id, &order, &token, log, cancel)
+                    .await;
+            }
             Backend::Vm => self.run_vm_job(&job_id, &order, &token, cancel).await,
             // Never advertised, so admit() never routes here; reject
             // defensively rather than panic if it ever slips through.
             Backend::Unspecified => {
                 self.reject_start(&job_id, &token, "backend not supported by this agent");
+            }
+        }
+        // The job's own log is complete now, so this is the cheapest place to
+        // collect expired ones — including any a crashed run left behind.
+        self.inner.job_logs.sweep();
+    }
+
+    /// Open this job's log, or run without one. A log that cannot be opened
+    /// (a full or read-only disk) is worth a warning, never a failed job.
+    fn open_job_log(&self, job_id: &str) -> Option<JobLog> {
+        match self.inner.job_logs.open(job_id) {
+            Ok(log) => {
+                debug!(job_id, path = %log.path().display(), "capturing runner output");
+                Some(log)
+            }
+            Err(e) => {
+                warn!(job_id, error = %e, "cannot open a job log; runner output will not be kept");
+                None
             }
         }
     }
@@ -654,6 +682,7 @@ impl RunnerSupervisor {
         job_id: &str,
         order: &ProvisionRunner,
         token: &str,
+        log: Option<JobLog>,
         cancel: CancellationToken,
     ) {
         // Invariant: a windows capability is only advertised when the
@@ -668,7 +697,7 @@ impl RunnerSupervisor {
         // on degraded interop and must not make the agent deaf to
         // CancelRunner — mirror the VM startup path.
         let spawned = {
-            let spawn = std::pin::pin!(interop.spawn(&order.encoded_jit_config));
+            let spawn = std::pin::pin!(interop.spawn(&order.encoded_jit_config, log));
             tokio::select! {
                 result = spawn => Some(result),
                 () = cancel.cancelled() => None,
@@ -734,6 +763,7 @@ impl RunnerSupervisor {
         job_id: &str,
         order: &ProvisionRunner,
         token: &str,
+        log: Option<JobLog>,
         cancel: CancellationToken,
     ) {
         let Some(runner_script) = &self.inner.runner_script else {
@@ -741,7 +771,7 @@ impl RunnerSupervisor {
             return;
         };
 
-        let mut command = runner_command(runner_script, &order.encoded_jit_config);
+        let mut command = runner_command(runner_script, &order.encoded_jit_config, log.is_some());
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -749,6 +779,18 @@ impl RunnerSupervisor {
                 return;
             }
         };
+        // Both pipes drain into the job's log for the lifetime of the runner.
+        // Detached: they end at EOF when the process group goes away, which a
+        // cancel's group kill guarantees.
+        if let Some(log) = log {
+            if let Some(stdout) = child.inner().stdout.take() {
+                let log = log.clone();
+                tokio::spawn(async move { log.pump(stdout).await });
+            }
+            if let Some(stderr) = child.inner().stderr.take() {
+                tokio::spawn(async move { log.pump(stderr).await });
+            }
+        }
 
         // group_spawn is synchronous, but cancellation is handled on another
         // runtime thread. Arbitrate through the slot before accepting.
@@ -994,9 +1036,28 @@ impl RunnerSupervisor {
 /// point (`run.sh`); no `.current_dir()` is set because the wrapper script
 /// locates its own sibling files via `$0`'s dirname, not the caller's
 /// working directory.
-fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Command {
+/// The runner invocation. Output is never inherited — it either flows to
+/// the job's log (`capture`, the normal case) or to `/dev/null`, because
+/// inheriting put every concurrent job's output in one stream with nothing
+/// attributable. `capture` must be false when no log could be opened: a
+/// piped stream nobody drains fills its pipe and blocks the runner.
+fn runner_command(
+    script: &Path,
+    encoded_jit_config: &str,
+    capture: bool,
+) -> tokio::process::Command {
+    let sink = if capture {
+        std::process::Stdio::piped
+    } else {
+        std::process::Stdio::null
+    };
     let mut command = tokio::process::Command::new(script);
-    command.arg("--jitconfig").arg(encoded_jit_config);
+    command
+        .arg("--jitconfig")
+        .arg(encoded_jit_config)
+        .stdin(std::process::Stdio::null())
+        .stdout(sink())
+        .stderr(sink());
     command
 }
 
@@ -1057,6 +1118,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            JobLogs::nowhere(),
             Backends::fixed(capabilities, state.clone()),
             state,
             Arc::clone(&handover),
@@ -1092,6 +1154,7 @@ mod tests {
     /// reject — `handle_provision` reads real `host::telemetry()`.
     fn windows_supervisor_with_rx(
         interop: Option<InteropRunner>,
+        job_logs: JobLogs,
     ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
         let (events, rx) = mpsc::channel(8);
         let state = AgentState::new(&crate::settings::PersistedSettings {
@@ -1104,8 +1167,14 @@ mod tests {
             interop,
             state.clone(),
         );
-        let sup =
-            RunnerSupervisor::new(events, None, backends, state.clone(), Handover::new(state));
+        let sup = RunnerSupervisor::new(
+            events,
+            None,
+            job_logs,
+            backends,
+            state.clone(),
+            Handover::new(state),
+        );
         (sup, rx)
     }
 
@@ -1125,7 +1194,11 @@ mod tests {
     #[tokio::test]
     async fn windows_offer_runs_through_the_interop_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let powershell = interop_stub(dir.path(), "powershell", "echo 'WINPID=4242'\nexit 0");
+        let powershell = interop_stub(
+            dir.path(),
+            "powershell",
+            "echo 'WINPID=4242'\necho 'runner on stdout'\necho 'runner on stderr' >&2\nexit 0",
+        );
         let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
         let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
@@ -1133,7 +1206,7 @@ mod tests {
         // concurrently forking test can hold it open for writing until its
         // own exec) so the spawn inside handle_provision can't hit it.
         for _ in 0..100 {
-            match interop.spawn("dGVzdA==").await {
+            match interop.spawn("dGVzdA==", None).await {
                 Ok(mut job) => {
                     let _ = job.wait().await;
                     break;
@@ -1142,7 +1215,8 @@ mod tests {
             }
         }
 
-        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+        let logs = JobLogs::new(dir.path());
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop), logs.clone());
 
         sup.handle_provision(ProvisionRunner {
             job_id: "rjob_win".to_owned(),
@@ -1179,6 +1253,25 @@ mod tests {
             Some(attach_request::Msg::RunnerExited(e)) => assert_eq!(e.job_id, "rjob_win"),
             other => panic!("expected RunnerExited, got {other:?}"),
         }
+
+        // Both of the runner's streams land in the job's own log. The pumps
+        // are detached, so this polls rather than reading once.
+        let log_path = dir.path().join("jobs").join("rjob_win.log");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if contents.contains("runner on stdout") && contents.contains("runner on stderr") {
+                    assert!(
+                        !contents.contains("WINPID="),
+                        "the handshake line is wrapper protocol, not runner output: {contents}"
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both streams reached the job log");
     }
 
     /// A cancel that arrives while the interop spawn is still in the WINPID
@@ -1196,7 +1289,7 @@ mod tests {
         let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
         let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
-        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop), JobLogs::new(dir.path()));
 
         sup.handle_provision(ProvisionRunner {
             job_id: "rjob_win".to_owned(),
@@ -1235,7 +1328,7 @@ mod tests {
     /// ghost job.
     #[tokio::test]
     async fn windows_offer_without_interop_is_rejected() {
-        let (sup, mut rx) = windows_supervisor_with_rx(None);
+        let (sup, mut rx) = windows_supervisor_with_rx(None, JobLogs::nowhere());
 
         sup.handle_provision(ProvisionRunner {
             job_id: "rjob_win".to_owned(),
@@ -1386,6 +1479,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            JobLogs::nowhere(),
             Backends::fixed(
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
@@ -1412,6 +1506,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            JobLogs::nowhere(),
             Backends::fixed(
                 vec![capability("darwin", "arm64", Backend::HostRunner)],
                 state.clone(),
@@ -1822,6 +1917,7 @@ mod tests {
         RunnerSupervisor::new(
             events,
             None,
+            JobLogs::nowhere(),
             Backends::fixed(Vec::new(), drained.clone()),
             drained.clone(),
             Handover::new(drained.clone()),
@@ -1837,6 +1933,7 @@ mod tests {
         RunnerSupervisor::new(
             events,
             None,
+            JobLogs::nowhere(),
             Backends::fixed(Vec::new(), torn_down.clone()),
             torn_down.clone(),
             Handover::new(torn_down.clone()),

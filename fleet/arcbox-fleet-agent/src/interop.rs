@@ -30,6 +30,8 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, warn};
 
+use crate::joblog::JobLog;
+
 /// Fixed Windows locations of the interop tools, translated through
 /// `wslpath` at startup so a non-default automount root still resolves.
 /// Windows PowerShell 5.1 ships with every Windows 10/11 install (unlike
@@ -162,17 +164,33 @@ impl InteropRunner {
     /// side and carries the PID that can cancel it. Any failure past the
     /// spawn reaps the relay before returning, so an error never leaks a
     /// process.
-    pub async fn spawn(&self, encoded_jit_config: &str) -> Result<InteropJob> {
+    pub async fn spawn(&self, encoded_jit_config: &str, log: Option<JobLog>) -> Result<InteropJob> {
         validate_jit_config(&self.script, encoded_jit_config)?;
 
-        let mut child = tokio::process::Command::new(&self.powershell)
+        let mut command = tokio::process::Command::new(&self.powershell);
+        command
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(wrapper_command(&self.script, encoded_jit_config))
             .stdin(Stdio::null())
+            // stdout is always piped — the `WINPID=` handshake is read from
+            // it. stderr is piped only when there is a log to drain it into:
+            // a piped stream nobody reads fills its pipe and blocks the
+            // runner, so with no log it stays inherited-free by going to the
+            // null device instead.
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawning the interop wrapper")?;
+            .stderr(if log.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .kill_on_drop(true);
+        let mut child = command.spawn().context("spawning the interop wrapper")?;
+
+        if let Some(log) = log.clone() {
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move { log.pump(stderr).await });
+            }
+        }
 
         let stdout = child
             .stdout
@@ -187,7 +205,10 @@ impl InteropRunner {
                         .parse::<u32>()
                         .with_context(|| format!("malformed handshake line {line:?}"));
                 }
-                debug!(line, "interop wrapper output before handshake");
+                // Runner output, not handshake: it belongs in the job's log
+                // like everything after the handshake. The `WINPID=` line
+                // itself does not — that is this wrapper's protocol.
+                log_line(log.as_ref(), &line).await;
             }
             bail!("interop wrapper exited without reporting WINPID");
         };
@@ -206,11 +227,13 @@ impl InteropRunner {
         // Keep the pipe drained for the rest of the job — the runner's
         // output flows through the wrapper's console — so a chatty runner
         // can never fill the pipe and wedge itself. Ends at EOF when the
-        // relay exits; detaching the handle is deliberate.
+        // relay exits; detaching the handle is deliberate. Reassembled into
+        // lines rather than copied verbatim, because the handshake above has
+        // to scan this same stream by line.
         tokio::spawn(async move {
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => debug!(line, "windows runner output"),
+                    Ok(Some(line)) => log_line(log.as_ref(), &line).await,
                     Ok(None) => break,
                     Err(e) => {
                         debug!(error = %e, "windows runner output stream failed");
@@ -226,6 +249,16 @@ impl InteropRunner {
             taskkill: self.taskkill.clone(),
             kill_timeout: KILL_TIMEOUT,
         })
+    }
+}
+
+/// Append one line of wrapper output to the job's log, restoring the
+/// newline `next_line` stripped. Without a log the line is debug-level
+/// only, which is where all of this output used to go.
+async fn log_line(log: Option<&JobLog>, line: &str) {
+    match log {
+        Some(log) => log.write(format!("{line}\n").as_bytes()).await,
+        None => debug!(line, "windows runner output"),
     }
 }
 
@@ -435,7 +468,7 @@ mod tests {
     /// spawns long-existing Windows binaries, never freshly written ones.
     async fn spawn_retrying(runner: &InteropRunner, jit: &str) -> Result<InteropJob> {
         for _ in 0..100 {
-            match runner.spawn(jit).await {
+            match runner.spawn(jit, None).await {
                 Err(e) if format!("{e:#}").contains("Text file busy") => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -589,7 +622,7 @@ mod tests {
         std::fs::write(&staged, "@echo off\r\nping -n 60 127.0.0.1 >NUL\r\n").unwrap();
 
         let runner = InteropRunner::new(&script).await.expect("probe");
-        let mut job = runner.spawn("dGVzdA==").await.expect("spawn");
+        let mut job = runner.spawn("dGVzdA==", None).await.expect("spawn");
         assert!(job.windows_pid() > 0);
 
         let start = tokio::time::Instant::now();
