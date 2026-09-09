@@ -8,12 +8,19 @@ use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, RemoveContainerOptions, WaitContainerOptions,
+    CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
+    WaitContainerOptions,
 };
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::host;
+use crate::joblog::JobLog;
+
+/// How long teardown waits for a container's log stream to end after the
+/// container has. Generous for a stream that is already closing; short
+/// enough that a wedged daemon cannot hold a job's in-flight slot.
+const LOG_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything the Docker runner needs to execute one job.
 pub struct RunSpec<'a> {
@@ -26,6 +33,9 @@ pub struct RunSpec<'a> {
     /// Image to run this job in — the live-settable `linux_runner_image`, read
     /// fresh by the caller for each job rather than fixed at construction.
     pub runner_image: &'a str,
+    /// Where the container's combined output is captured. `None` runs the
+    /// job without a log rather than failing it.
+    pub log: Option<JobLog>,
 }
 
 /// A container that has been created and started. Held by the caller while the
@@ -37,6 +47,10 @@ pub struct RunningContainer {
     client: Docker,
     id: String,
     guard: ContainerGuard,
+    /// The task copying the container's log stream into the job's log.
+    /// Awaited by [`remove`](Self::remove) before teardown, since removing
+    /// the container ends the stream.
+    log_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningContainer {
@@ -61,8 +75,28 @@ impl RunningContainer {
 
     /// Remove the (exited) container, awaited. Failures are logged, not
     /// propagated: the job itself already concluded.
+    ///
+    /// The log stream is drained first: it ends when the container does, and
+    /// removing the container tears it down mid-copy — losing exactly the
+    /// tail output that says why a job failed.
     pub async fn remove(self) {
-        let Self { client, id, guard } = self;
+        let Self {
+            client,
+            id,
+            guard,
+            log_task,
+        } = self;
+        if let Some(mut task) = log_task {
+            // Bounded: a docker daemon that never closes the stream must not
+            // wedge teardown, which holds the job's in-flight slot open.
+            if tokio::time::timeout(LOG_DRAIN_GRACE, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                warn!(container = %id, "container log stream did not end; dropping its tail");
+            }
+        }
         guard.defuse();
         let options = RemoveContainerOptions {
             force: true,
@@ -281,8 +315,42 @@ impl DockerRunner {
 
         Ok(RunningContainer {
             client: self.client.clone(),
+            log_task: spec.log.map(|log| self.capture_logs(&id, log)),
             id,
             guard,
+        })
+    }
+
+    /// Copy the container's combined output into the job's log until the
+    /// stream ends, which it does when the container exits.
+    ///
+    /// `tail: "all"` is explicit: this attaches after `start_container`, and
+    /// the default of the last few lines would drop everything the runner
+    /// wrote in between. The container is created without a TTY, so the
+    /// stream arrives demultiplexed and every variant's payload — stdout and
+    /// stderr alike — goes to the same place, in arrival order.
+    fn capture_logs(&self, id: &str, log: JobLog) -> tokio::task::JoinHandle<()> {
+        let mut stream = self.client.logs(
+            id,
+            Some(LogsOptions {
+                follow: true,
+                stdout: true,
+                stderr: true,
+                tail: "all".to_owned(),
+                ..Default::default()
+            }),
+        );
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => log.write(chunk.as_ref()).await,
+                    Err(e) => {
+                        debug!(container = %id, error = %e, "container log stream ended");
+                        return;
+                    }
+                }
+            }
         })
     }
 

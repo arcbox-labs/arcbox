@@ -527,7 +527,10 @@ impl RunnerSupervisor {
         let job_id = order.job_id.clone();
         let log = self.open_job_log(&job_id);
         match backend {
-            Backend::Docker => self.run_docker_job(&job_id, &order, &token, cancel).await,
+            Backend::Docker => {
+                self.run_docker_job(&job_id, &order, &token, log, cancel)
+                    .await;
+            }
             // A windows capability is host_runner-backed on the wire (it IS
             // the host's pre-installed runner, reached across the WSL
             // interop boundary), but its process management is different
@@ -540,7 +543,7 @@ impl RunnerSupervisor {
                 self.run_host_job(&job_id, &order, &token, log, cancel)
                     .await;
             }
-            Backend::Vm => self.run_vm_job(&job_id, &order, &token, cancel).await,
+            Backend::Vm => self.run_vm_job(&job_id, &order, &token, log, cancel).await,
             // Never advertised, so admit() never routes here; reject
             // defensively rather than panic if it ever slips through.
             Backend::Unspecified => {
@@ -578,6 +581,7 @@ impl RunnerSupervisor {
         job_id: &str,
         order: &ProvisionRunner,
         token: &str,
+        log: Option<JobLog>,
         cancel: CancellationToken,
     ) {
         // A vm capability is only advertised while the registry's VM slot
@@ -596,6 +600,7 @@ impl RunnerSupervisor {
                 job_id,
                 encoded_jit_config: &order.encoded_jit_config,
                 runner_image: &runner_image,
+                log,
             }));
             tokio::select! {
                 result = start => Some(result),
@@ -832,6 +837,7 @@ impl RunnerSupervisor {
         job_id: &str,
         order: &ProvisionRunner,
         token: &str,
+        log: Option<JobLog>,
         cancel: CancellationToken,
     ) {
         // A Docker-backed capability is only advertised while the registry's
@@ -852,6 +858,7 @@ impl RunnerSupervisor {
                 encoded_jit_config: &order.encoded_jit_config,
                 arch: &order.arch,
                 runner_image: &runner_image,
+                log,
             }));
             tokio::select! {
                 result = start => Some(result),
