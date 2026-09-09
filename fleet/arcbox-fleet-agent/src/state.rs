@@ -685,6 +685,7 @@ mod tests {
             job_id: id.to_owned(),
             os: "darwin".to_owned(),
             arch: "arm64".to_owned(),
+            log_path: String::new(),
         }
     }
 

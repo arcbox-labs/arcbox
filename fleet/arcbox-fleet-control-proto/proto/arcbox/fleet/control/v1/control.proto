@@ -182,6 +182,10 @@ message InFlightJob {
   string job_id = 1;
   string os = 2;
   string arch = 3;
+  // Absolute path of the file this job's combined stdout/stderr is being
+  // written to. Empty when the agent could not open one (a full or
+  // read-only disk), which does not stop the job.
+  string log_path = 4;
 }
 
 message OfferVerdict {

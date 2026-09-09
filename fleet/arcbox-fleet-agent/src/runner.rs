@@ -319,10 +319,18 @@ impl RunnerSupervisor {
                     self.inner
                         .in_flight
                         .insert(job_id.clone(), JobSlot::new(cancel.clone()));
+                    // Opened here, not in the spawned task, so the path
+                    // published below is one that exists: a client is told
+                    // where the output is, or told there is none.
+                    let log = self.open_job_log(&job_id);
                     self.inner.state.add_in_flight(control_proto::InFlightJob {
                         job_id,
                         os: order.os.clone(),
                         arch: order.arch.clone(),
+                        log_path: log
+                            .as_ref()
+                            .map(|log| log.path().display().to_string())
+                            .unwrap_or_default(),
                     });
                     let sup = self.clone();
                     tokio::spawn(async move {
@@ -332,7 +340,7 @@ impl RunnerSupervisor {
                             inner: sup.inner.clone(),
                             job_id: order.job_id.clone(),
                         };
-                        sup.run_job(order, backend, token, cancel).await;
+                        sup.run_job(order, backend, token, log, cancel).await;
                     });
                     return;
                 }
@@ -522,10 +530,10 @@ impl RunnerSupervisor {
         order: ProvisionRunner,
         backend: Backend,
         token: String,
+        log: Option<JobLog>,
         cancel: CancellationToken,
     ) {
         let job_id = order.job_id.clone();
-        let log = self.open_job_log(&job_id);
         match backend {
             Backend::Docker => {
                 self.run_docker_job(&job_id, &order, &token, log, cancel)
@@ -1579,6 +1587,7 @@ mod tests {
             job_id: "rjob_a".to_owned(),
             os: "darwin".to_owned(),
             arch: "arm64".to_owned(),
+            log_path: String::new(),
         });
         {
             let _guard = ReleaseGuard {

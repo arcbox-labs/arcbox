@@ -53,6 +53,32 @@ impl JobLogs {
         }
     }
 
+    /// Where the logs live, for a caller that reports the location.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Every log present, newest first, as `(job_id, path)`. A missing
+    /// directory reads as empty — the pre-first-job case, not an error.
+    pub fn list(&self) -> Vec<(String, PathBuf)> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut logs: Vec<(SystemTime, String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let job_id = path.file_stem()?.to_str()?.to_owned();
+                let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+                Some((modified, job_id, path))
+            })
+            .collect();
+        logs.sort_unstable_by_key(|log| std::cmp::Reverse(log.0));
+        logs.into_iter()
+            .map(|(_, job_id, path)| (job_id, path))
+            .collect()
+    }
+
     /// A directory nothing is ever written to, for tests that build a
     /// supervisor but never start a runner. `sweep` treats the missing
     /// directory as the normal pre-first-job case, so nothing here touches
@@ -318,6 +344,26 @@ mod tests {
         let contents = std::fs::read_to_string(log.path()).unwrap();
         assert!(contents.contains("log truncated at 256 MiB"), "{contents}");
         assert!(!contents.contains('@'), "output past the cap was written");
+    }
+
+    /// `jobs` prints what `list` returns, so newest-first is the contract:
+    /// the log you want is almost always the last one written.
+    #[test]
+    fn list_is_newest_first_and_empty_before_the_first_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = logs(dir.path());
+        assert!(logs.list().is_empty());
+
+        logs.open("rjob_older").unwrap();
+        logs.open("rjob_newer").unwrap();
+        let older = logs.dir.join("rjob_older.log");
+        std::fs::File::open(&older)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+
+        let ids: Vec<String> = logs.list().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["rjob_newer", "rjob_older"]);
     }
 
     #[test]
