@@ -38,6 +38,7 @@ use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info, warn};
 
 use crate::host;
+use crate::joblog::JobLog;
 
 /// Guest login and runner location — the ArcBox macOS runner image contract
 /// (see the module doc).
@@ -79,6 +80,9 @@ pub struct RunSpec<'a> {
     /// Base image the guest boots from — the live-settable
     /// `macos_runner_image`, read fresh by the caller for each job.
     pub runner_image: &'a str,
+    /// Where the guest session's combined output is captured. `None` runs
+    /// the job without a log rather than failing it.
+    pub log: Option<JobLog>,
 }
 
 /// The stream part of an image reference: `"tahoe-base@2026.07.03"` →
@@ -261,6 +265,7 @@ impl VmRunner {
                 name: name.clone(),
                 ssh,
                 channel,
+                log: spec.log.clone(),
             })
         }
         .await;
@@ -394,6 +399,7 @@ pub struct RunningVm {
     name: String,
     ssh: SshHandle<SshClient>,
     channel: russh::Channel<russh::client::Msg>,
+    log: Option<JobLog>,
 }
 
 impl RunningVm {
@@ -406,9 +412,15 @@ impl RunningVm {
         let mut code = None;
         while let Some(msg) = self.channel.wait().await {
             match msg {
-                // Runner output stays in the disposable guest; nothing to
-                // collect here.
-                ChannelMsg::Data { .. } | ChannelMsg::ExtendedData { .. } => {}
+                // The guest is destroyed when the job ends, so this session
+                // is the only chance to keep its output. `Data` is the
+                // runner's stdout, `ExtendedData` its stderr; both go to the
+                // job's log in arrival order.
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    if let Some(log) = &self.log {
+                        log.write(&data).await;
+                    }
+                }
                 ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
                 _ => {}
             }
@@ -427,6 +439,7 @@ impl RunningVm {
             name,
             ssh,
             channel,
+            log: _,
         } = self;
         guard.defuse();
         drop(channel);
@@ -531,6 +544,7 @@ mod tests {
                     job_id: "itest",
                     encoded_jit_config: "",
                     runner_image: "tahoe-base",
+                    log: None,
                 },
                 "/usr/bin/true",
             )

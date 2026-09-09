@@ -37,6 +37,7 @@ mod fsutil;
 mod handover;
 mod host;
 mod interop;
+mod joblog;
 #[cfg(test)]
 mod mock_daemon;
 mod reexec;
@@ -59,6 +60,7 @@ use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_control_proto::v1::fleet_image_service_client::FleetImageServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
+use arcbox_fleet_control_proto::v1::fleet_state_service_client::FleetStateServiceClient;
 use arcbox_logging::LogConfig;
 use clap::{Args, Parser, Subcommand};
 use tracing::{info, warn};
@@ -97,6 +99,8 @@ enum Command {
     Serve,
     /// Show the running agent's enrollment/attachment status.
     Status,
+    /// List the jobs running here and the logs of those that already ran.
+    Jobs,
     /// Stop the running agent from accepting new offers; in-flight jobs
     /// finish normally.
     Drain,
@@ -242,6 +246,9 @@ fn main() -> Result<()> {
         foreground: true,
         ..LogConfig::default()
     });
+    // Collect expired job logs on every invocation, so an agent that stops
+    // running jobs (or crashed mid-job) still stops holding onto them.
+    joblog::JobLogs::new(&config.data_dir.join("log")).sweep();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -432,6 +439,10 @@ async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
             }
             Ok(Outcome::Exit)
         }
+        Command::Jobs => {
+            list_jobs(&config).await;
+            Ok(Outcome::Exit)
+        }
         Command::Drain => {
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetLifecycleServiceClient::new(channel);
@@ -598,6 +609,65 @@ fn uninstall_service() -> Result<()> {
         "quick uninstall-service is only implemented for macOS; Linux systemd (user unit) \
          support is planned as a follow-up"
     )
+}
+
+/// Print the jobs running here, then the logs of the ones that already ran.
+///
+/// Only the running half needs the agent — that state lives in the process,
+/// not on disk. The logs do not, so an unreachable socket reports itself and
+/// still lists them: a stopped agent is exactly when its last job's output
+/// is what you came for.
+async fn list_jobs(config: &AgentConfig) {
+    let in_flight = match in_flight_jobs(config).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            println!("running jobs unavailable: {e:#}");
+            Vec::new()
+        }
+    };
+    for job in &in_flight {
+        let log = if job.log_path.is_empty() {
+            "<no log>"
+        } else {
+            &job.log_path
+        };
+        println!("running   {}  {}/{}  {log}", job.job_id, job.os, job.arch);
+    }
+
+    let logs = joblog::JobLogs::new(&config.data_dir.join("log"));
+    let mut finished = 0;
+    for (job_id, path) in logs.list() {
+        if in_flight.iter().any(|job| job.job_id == job_id) {
+            continue;
+        }
+        finished += 1;
+        println!("finished  {job_id}  {}", path.display());
+    }
+    if in_flight.is_empty() && finished == 0 {
+        println!("no jobs (logs are kept in {})", logs.dir().display());
+    }
+}
+
+/// The running agent's in-flight jobs, read as the first `Watch` snapshot —
+/// which the service sends immediately, so there is no separate RPC for a
+/// point-in-time read.
+async fn in_flight_jobs(config: &AgentConfig) -> Result<Vec<control_proto::InFlightJob>> {
+    let channel = control::client::connect_default(config).await?;
+    let mut client = FleetStateServiceClient::new(channel);
+    let mut stream = client
+        .watch(control_proto::WatchRequest {})
+        .await
+        .context("Watch RPC failed")?
+        .into_inner();
+    let response = stream
+        .message()
+        .await
+        .context("Watch stream failed")?
+        .context("Watch stream closed without a snapshot")?;
+    Ok(response
+        .snapshot
+        .map(|snapshot| snapshot.in_flight)
+        .unwrap_or_default())
 }
 
 /// Resolve the enrollment token from its chosen source: a file, an explicit
